@@ -1,5 +1,16 @@
 # moor-sidecar
 
+## 0.5.6
+
+### Patch Changes
+
+- Add configurable MCP request timeout and server startup timeout settings
+  - Consolidate timeout settings into advanced config (`mcpRequestTimeoutMs`, `mcpServerStartTimeoutMs`)
+  - Support dynamic timeout reading without server restart
+  - Range: 5,000–300,000 ms, default 30,000 ms
+  - Update Linux build dependencies and cache settings
+  - Improve CI/CD specifications and installation documentation
+
 ## 0.5.5
 
 ### Patch Changes
