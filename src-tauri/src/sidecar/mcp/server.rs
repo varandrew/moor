@@ -240,6 +240,9 @@ process.stdin.on("data", (chunk) => {
             api_token: "test-token".to_string(),
             version: "test".to_string(),
             port: 19323,
+            mcp_sessions: Arc::new(
+                crate::sidecar::mcp::transport::mcp_session::McpSessionStore::new(),
+            ),
             event_bus,
             server_manager,
         });
