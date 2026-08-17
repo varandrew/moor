@@ -23,7 +23,8 @@ pub async fn handle_mcp_request(
     match *req.method() {
         Method::GET => handle_mcp_get(state, req.headers()).await,
         Method::DELETE => handle_mcp_delete(state, req.headers()).await,
-        _ => handle_mcp_post(state, req).await,
+        Method::POST => handle_mcp_post(state, req).await,
+        _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
 }
 
@@ -54,8 +55,24 @@ async fn handle_mcp_get(state: Arc<AppState>, headers: &HeaderMap) -> Response {
         .get(MCP_SESSION_ID_HEADER)
         .and_then(|v| v.to_str().ok());
 
+    // Anonymous streams have no legitimate use: spec clients always send the
+    // session id obtained from initialize. Allowing them lets LAN clients open
+    // unlimited keep-alive streams.
     let Some(session_id) = session_id else {
-        return sse_keep_alive(stream::pending()).into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {
+                    "code": jsonrpc::INVALID_REQUEST,
+                    "message": "Missing Mcp-Session-Id header"
+                }
+            })
+            .to_string(),
+        )
+            .into_response();
     };
 
     if !state.mcp_sessions.contains(session_id).await {
@@ -115,8 +132,12 @@ async fn handle_mcp_post(state: Arc<AppState>, req: axum::extract::Request) -> R
         return (
             StatusCode::BAD_REQUEST,
             [(header::CONTENT_TYPE, "application/json")],
-            jsonrpc::make_error(jsonrpc::Id::Number(0), jsonrpc::PARSE_ERROR, "Invalid JSON-RPC")
-                .to_string(),
+            jsonrpc::make_error(
+                jsonrpc::Id::Number(0),
+                jsonrpc::PARSE_ERROR,
+                "Invalid JSON-RPC",
+            )
+            .to_string(),
         )
             .into_response();
     }
@@ -139,6 +160,18 @@ async fn handle_mcp_post(state: Arc<AppState>, req: axum::extract::Request) -> R
                 .into_response()
         }
     };
+
+    let method_name = raw_message.get("method").and_then(|m| m.as_str());
+    if method_name != Some("initialize") {
+        if let Some(session_id) = headers
+            .get(MCP_SESSION_ID_HEADER)
+            .and_then(|v| v.to_str().ok())
+        {
+            if !state.mcp_sessions.contains(session_id).await {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+        }
+    }
 
     if raw_message.get("id").is_none() {
         return StatusCode::ACCEPTED.into_response();
@@ -241,8 +274,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_without_session_returns_sse_stream() {
+    async fn put_returns_method_not_allowed() {
         let data_dir = temp_data_dir("get-sse");
+        let app = Router::new()
+            .route("/mcp", axum::routing::any(handle_mcp_request))
+            .with_state(test_state(data_dir.clone()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/mcp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn get_without_session_returns_bad_request() {
+        let data_dir = temp_data_dir("get-no-session");
         let app = Router::new()
             .route("/mcp", axum::routing::any(handle_mcp_request))
             .with_state(test_state(data_dir.clone()));
@@ -259,11 +314,42 @@ mod tests {
             .await
             .expect("request should succeed");
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::CONTENT_TYPE).unwrap(),
-            "text/event-stream"
-        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        assert!(String::from_utf8_lossy(&body).contains("Missing Mcp-Session-Id"));
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn post_with_unknown_session_returns_not_found() {
+        let data_dir = temp_data_dir("post-unknown-session");
+        let app = Router::new()
+            .route("/mcp", axum::routing::any(handle_mcp_request))
+            .with_state(test_state(data_dir.clone()));
+
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json")
+                    .header(MCP_SESSION_ID_HEADER, "forged-session-id")
+                    .body(Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
