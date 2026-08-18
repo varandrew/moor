@@ -11,9 +11,14 @@ use axum::{
     },
 };
 use futures::stream::{self, Stream};
+use futures::StreamExt;
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
+
+/// Total GET SSE stream lifetime; the server closes the stream afterwards and
+/// clients are expected to reconnect (MCP Streamable HTTP spec).
+const SSE_STREAM_MAX_LIFETIME: Duration = Duration::from_secs(30 * 60);
 
 /// Handle incoming MCP Streamable HTTP requests at `/mcp`.
 /// Supports POST JSON-RPC, GET SSE streams, and DELETE session teardown.
@@ -97,7 +102,11 @@ async fn handle_mcp_get(state: Arc<AppState>, headers: &HeaderMap) -> Response {
             .into_response();
     }
 
-    sse_keep_alive(stream::pending()).into_response()
+    // The stream carries no real events today (placeholder keep-alive only),
+    // so ending it at a fixed lifetime loses nothing; clients reconnect per spec.
+    let bounded = stream::pending::<Result<Event, Infallible>>()
+        .take_until(tokio::time::sleep(SSE_STREAM_MAX_LIFETIME));
+    sse_keep_alive(bounded).into_response()
 }
 
 async fn handle_mcp_delete(state: Arc<AppState>, headers: &HeaderMap) -> Response {
