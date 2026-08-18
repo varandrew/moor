@@ -1,4 +1,5 @@
 use crate::sidecar::http::AppState;
+use crate::sidecar::mcp::transport::mcp_session::SESSION_IDLE_TTL_FALLBACK;
 use crate::sidecar::mcp::jsonrpc;
 use axum::{
     body::Body,
@@ -75,7 +76,11 @@ async fn handle_mcp_get(state: Arc<AppState>, headers: &HeaderMap) -> Response {
             .into_response();
     };
 
-    if !state.mcp_sessions.contains(session_id).await {
+    if !state
+        .mcp_sessions
+        .validate_and_touch(session_id, session_idle_ttl(&state).await)
+        .await
+    {
         return (
             StatusCode::NOT_FOUND,
             [(header::CONTENT_TYPE, "application/json")],
@@ -167,7 +172,11 @@ async fn handle_mcp_post(state: Arc<AppState>, req: axum::extract::Request) -> R
             .get(MCP_SESSION_ID_HEADER)
             .and_then(|v| v.to_str().ok())
         {
-            if !state.mcp_sessions.contains(session_id).await {
+            if !state
+                .mcp_sessions
+                .validate_and_touch(session_id, session_idle_ttl(&state).await)
+                .await
+            {
                 return StatusCode::NOT_FOUND.into_response();
             }
         }
@@ -196,7 +205,22 @@ async fn handle_mcp_post(state: Arc<AppState>, req: axum::extract::Request) -> R
 
     let (id, method, params) = parsed;
     let new_session_id = if method == "initialize" {
-        Some(state.mcp_sessions.create().await)
+        match state.mcp_sessions.create().await {
+            Some(id) => Some(id),
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    jsonrpc::make_error(
+                        id,
+                        jsonrpc::INTERNAL_ERROR,
+                        "MCP session capacity reached"
+                    )
+                    .to_string(),
+                )
+                    .into_response();
+            }
+        }
     } else {
         None
     };
@@ -241,6 +265,23 @@ fn build_post_response(
             .body(Body::from(response.to_string()))
             .unwrap()
     }
+}
+
+/// Idle TTL used for session expiry checks (validate + sweep paths).
+async fn session_idle_ttl(_state: &AppState) -> Duration {
+    SESSION_IDLE_TTL_FALLBACK
+}
+
+/// Periodically drops idle sessions so crashed clients don't leak entries.
+pub fn spawn_session_sweeper(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            let ttl = session_idle_ttl(&state).await;
+            state.mcp_sessions.sweep_expired(ttl).await;
+        }
+    });
 }
 
 fn sse_keep_alive<S>(stream: S) -> impl IntoResponse

@@ -102,6 +102,7 @@ pub fn json_error_response(
 }
 
 pub async fn start_server(state: Arc<AppState>, host: &str, port: u16) -> Result<(), String> {
+    crate::sidecar::mcp::transport::streamable_http_server::spawn_session_sweeper(state.clone());
     let addr = format!("{host}:{port}");
     let std_listener =
         crate::bind_listener(host, port).map_err(|e| format!("Failed to bind {addr}: {e}"))?;
