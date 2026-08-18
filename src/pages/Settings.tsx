@@ -18,6 +18,7 @@ import {
   getGeneralSettingRuntimeAction,
   getPortBannerState,
   getSettingsPageLoadState,
+  parseIdleTtlSecondsInput,
   parseTimeoutSecondsInput,
 } from "./settings-state";
 
@@ -245,11 +246,16 @@ function AdvancedSection({
   const [localStartTimeout, setLocalStartTimeout] = useState(
     String(settings.advanced.mcpServerStartTimeoutMs / 1000),
   );
+  const [localSessionIdleTtl, setLocalSessionIdleTtl] = useState(
+    String(settings.advanced.mcpSessionIdleTtlMs / 1000),
+  );
   const [tokenVisible, setTokenVisible] = useState(false);
   const requestTimeoutState = parseTimeoutSecondsInput(localRequestTimeout);
   const startTimeoutState = parseTimeoutSecondsInput(localStartTimeout);
+  const sessionIdleTtlState = parseIdleTtlSecondsInput(localSessionIdleTtl);
   const requestTimeoutErrorId = "request-timeout-error";
   const startTimeoutErrorId = "server-start-timeout-error";
+  const sessionIdleTtlErrorId = "session-idle-ttl-error";
   const portStatus = getAdvancedPortStatus({
     runtimeInfo,
     configuredPort: settings.advanced.sidecarPort,
@@ -260,11 +266,13 @@ function AdvancedSection({
     setLocalPort(String(settings.advanced.sidecarPort));
     setLocalRequestTimeout(String(settings.advanced.mcpRequestTimeoutMs / 1000));
     setLocalStartTimeout(String(settings.advanced.mcpServerStartTimeoutMs / 1000));
+    setLocalSessionIdleTtl(String(settings.advanced.mcpSessionIdleTtlMs / 1000));
   }, [
     settings.advanced.logRetentionDays,
     settings.advanced.sidecarPort,
     settings.advanced.mcpRequestTimeoutMs,
     settings.advanced.mcpServerStartTimeoutMs,
+    settings.advanced.mcpSessionIdleTtlMs,
   ]);
 
   const applyRetention = async () => {
@@ -297,7 +305,7 @@ function AdvancedSection({
     }
   };
 
-  type TimeoutKey = "mcpRequestTimeoutMs" | "mcpServerStartTimeoutMs";
+  type TimeoutKey = "mcpRequestTimeoutMs" | "mcpServerStartTimeoutMs" | "mcpSessionIdleTtlMs";
 
   const applyTimeout = async (
     key: TimeoutKey,
@@ -423,6 +431,45 @@ function AdvancedSection({
               {!startTimeoutState.valid && (
                 <p id={startTimeoutErrorId} className="font-body text-[11px] text-error-warm">
                   {startTimeoutState.message}
+                </p>
+              )}
+            </div>
+          </SettingRow>
+          <SettingRow
+            label="Session Idle TTL"
+            description="Idle expiry for MCP sessions in seconds (300-86400). Idle clients re-initialize on their next request."
+          >
+            <div className="flex flex-col items-end gap-1">
+              <div className="flex items-center gap-2">
+                <Input
+                  type="number"
+                  min={300}
+                  max={86400}
+                  step={1}
+                  value={localSessionIdleTtl}
+                  aria-invalid={!sessionIdleTtlState.valid}
+                  aria-describedby={sessionIdleTtlState.valid ? undefined : sessionIdleTtlErrorId}
+                  onChange={(e) => setLocalSessionIdleTtl(e.target.value)}
+                  className="w-20 h-8 text-center text-xs"
+                />
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={!sessionIdleTtlState.valid}
+                  onClick={() =>
+                    void applyTimeout(
+                      "mcpSessionIdleTtlMs",
+                      sessionIdleTtlState,
+                      "session idle TTL",
+                    )
+                  }
+                >
+                  Apply
+                </Button>
+              </div>
+              {!sessionIdleTtlState.valid && (
+                <p id={sessionIdleTtlErrorId} className="font-body text-[11px] text-error-warm">
+                  {sessionIdleTtlState.message}
                 </p>
               )}
             </div>

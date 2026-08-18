@@ -1,6 +1,8 @@
 import {
   MCP_TIMEOUT_MS_MAX,
   MCP_TIMEOUT_MS_MIN,
+  MCP_SESSION_IDLE_TTL_MS_MAX,
+  MCP_SESSION_IDLE_TTL_MS_MIN,
   type GeneralSettings,
   type SidecarInfo,
 } from "@moor/types";
@@ -22,7 +24,28 @@ export type TimeoutSecondsInputState =
 
 const timeoutSecondsMin = MCP_TIMEOUT_MS_MIN / 1000;
 const timeoutSecondsMax = MCP_TIMEOUT_MS_MAX / 1000;
-const timeoutInputError = `Enter a whole number between ${timeoutSecondsMin} and ${timeoutSecondsMax}.`;
+const idleTtlSecondsMin = MCP_SESSION_IDLE_TTL_MS_MIN / 1000;
+const idleTtlSecondsMax = MCP_SESSION_IDLE_TTL_MS_MAX / 1000;
+
+function parseBoundedSecondsInput(
+  value: string,
+  secondsMin: number,
+  secondsMax: number,
+): TimeoutSecondsInputState {
+  const error = `Enter a whole number between ${secondsMin} and ${secondsMax}.`;
+  if (!/^\d+$/.test(value.trim())) {
+    return { valid: false, message: error };
+  }
+  const seconds = Number(value);
+  if (seconds < secondsMin || seconds > secondsMax) {
+    return { valid: false, message: error };
+  }
+  return { valid: true, milliseconds: seconds * 1000 };
+}
+
+export function parseIdleTtlSecondsInput(value: string): TimeoutSecondsInputState {
+  return parseBoundedSecondsInput(value, idleTtlSecondsMin, idleTtlSecondsMax);
+}
 
 export function getSettingsPageLoadState({
   isLoading,
@@ -87,12 +110,5 @@ export function getGeneralSettingRuntimeAction(
 }
 
 export function parseTimeoutSecondsInput(value: string): TimeoutSecondsInputState {
-  if (!/^\d+$/.test(value.trim())) {
-    return { valid: false, message: timeoutInputError };
-  }
-  const seconds = Number(value);
-  if (seconds < timeoutSecondsMin || seconds > timeoutSecondsMax) {
-    return { valid: false, message: timeoutInputError };
-  }
-  return { valid: true, milliseconds: seconds * 1000 };
+  return parseBoundedSecondsInput(value, timeoutSecondsMin, timeoutSecondsMax);
 }

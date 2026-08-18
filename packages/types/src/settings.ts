@@ -4,6 +4,10 @@ export const MCP_TIMEOUT_MS_MIN = 5_000;
 export const MCP_TIMEOUT_MS_MAX = 300_000;
 export const MCP_TIMEOUT_MS_DEFAULT = 30_000;
 
+export const MCP_SESSION_IDLE_TTL_MS_MIN = 300_000;
+export const MCP_SESSION_IDLE_TTL_MS_MAX = 86_400_000;
+export const MCP_SESSION_IDLE_TTL_MS_DEFAULT = 3_600_000;
+
 export interface GeneralSettings {
   autoStartOnLogin: boolean;
   autoStartServersOnLaunch: boolean;
@@ -23,6 +27,7 @@ export interface AdvancedSettings {
   allowLanMcpAccess: boolean;
   mcpRequestTimeoutMs: number;
   mcpServerStartTimeoutMs: number;
+  mcpSessionIdleTtlMs: number;
 }
 
 export interface Settings {
@@ -58,6 +63,7 @@ export function createDefaultSettings(): Settings {
       allowLanMcpAccess: false,
       mcpRequestTimeoutMs: MCP_TIMEOUT_MS_DEFAULT,
       mcpServerStartTimeoutMs: MCP_TIMEOUT_MS_DEFAULT,
+      mcpSessionIdleTtlMs: MCP_SESSION_IDLE_TTL_MS_DEFAULT,
     },
   };
 }

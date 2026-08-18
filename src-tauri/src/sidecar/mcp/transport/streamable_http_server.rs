@@ -1,5 +1,4 @@
 use crate::sidecar::http::AppState;
-use crate::sidecar::mcp::transport::mcp_session::SESSION_IDLE_TTL_FALLBACK;
 use crate::sidecar::mcp::jsonrpc;
 use axum::{
     body::Body,
@@ -276,9 +275,14 @@ fn build_post_response(
     }
 }
 
-/// Idle TTL used for session expiry checks (validate + sweep paths).
-async fn session_idle_ttl(_state: &AppState) -> Duration {
-    SESSION_IDLE_TTL_FALLBACK
+/// Live session idle TTL from settings; falls back to the default when the
+/// settings store is unreadable, so expiry checks never panic.
+async fn session_idle_ttl(state: &AppState) -> Duration {
+    crate::sidecar::services::settings::get_settings(state.db.as_ref())
+        .map(|settings| Duration::from_millis(settings.advanced.mcp_session_idle_ttl_ms as u64))
+        .unwrap_or(Duration::from_millis(
+            crate::sidecar::services::settings::MCP_SESSION_IDLE_TTL_MS_DEFAULT as u64,
+        ))
 }
 
 /// Periodically drops idle sessions so crashed clients don't leak entries.

@@ -7,10 +7,6 @@ use tokio::time::Instant;
 /// client bug, so new sessions are rejected (503) instead of evicting.
 const MAX_SESSIONS: usize = 128;
 
-/// Fallback idle TTL when settings are unreadable; the live value comes from
-/// `advanced.mcpSessionIdleTtlMs`.
-pub const SESSION_IDLE_TTL_FALLBACK: Duration = Duration::from_secs(60 * 60);
-
 /// Tracks Streamable HTTP MCP sessions with idle-TTL expiry.
 pub struct McpSessionStore {
     sessions: RwLock<HashMap<String, Instant>>,
@@ -79,19 +75,21 @@ impl Default for McpSessionStore {
 mod tests {
     use super::*;
 
+    const TEST_TTL: Duration = Duration::from_secs(60 * 60);
+
     #[tokio::test]
     async fn create_validate_and_remove_session() {
         let store = McpSessionStore::new();
         let id = store.create().await.expect("session created");
         assert!(
             store
-                .validate_and_touch(&id, SESSION_IDLE_TTL_FALLBACK)
+                .validate_and_touch(&id, TEST_TTL)
                 .await
         );
         assert!(store.remove(&id).await);
         assert!(
             !store
-                .validate_and_touch(&id, SESSION_IDLE_TTL_FALLBACK)
+                .validate_and_touch(&id, TEST_TTL)
                 .await
         );
     }
@@ -100,10 +98,10 @@ mod tests {
     async fn expired_session_fails_validation_and_is_dropped() {
         let store = McpSessionStore::new();
         let id = store.create().await.expect("session created");
-        tokio::time::advance(SESSION_IDLE_TTL_FALLBACK + Duration::from_secs(1)).await;
+        tokio::time::advance(TEST_TTL + Duration::from_secs(1)).await;
         assert!(
             !store
-                .validate_and_touch(&id, SESSION_IDLE_TTL_FALLBACK)
+                .validate_and_touch(&id, TEST_TTL)
                 .await
         );
         assert_eq!(store.len().await, 0);
@@ -117,7 +115,7 @@ mod tests {
             .create()
             .await
             .expect("second session created");
-        tokio::time::advance(SESSION_IDLE_TTL_FALLBACK + Duration::from_secs(1)).await;
+        tokio::time::advance(TEST_TTL + Duration::from_secs(1)).await;
         // Refresh the second session so only the first one is idle.
         let mut sessions = store.sessions.write().await;
         let keys: Vec<String> = sessions.keys().cloned().collect();
@@ -128,7 +126,7 @@ mod tests {
         }
         drop(sessions);
 
-        assert_eq!(store.sweep_expired(SESSION_IDLE_TTL_FALLBACK).await, 1);
+        assert_eq!(store.sweep_expired(TEST_TTL).await, 1);
         assert_eq!(store.len().await, 1);
     }
 

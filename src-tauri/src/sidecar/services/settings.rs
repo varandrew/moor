@@ -7,6 +7,9 @@ const SETTINGS_FILE: &str = "settings.json";
 pub const MCP_TIMEOUT_MS_MIN: u32 = 5_000;
 pub const MCP_TIMEOUT_MS_MAX: u32 = 300_000;
 pub const MCP_TIMEOUT_MS_DEFAULT: u32 = 30_000;
+pub const MCP_SESSION_IDLE_TTL_MS_MIN: u32 = 300_000;
+pub const MCP_SESSION_IDLE_TTL_MS_MAX: u32 = 86_400_000;
+pub const MCP_SESSION_IDLE_TTL_MS_DEFAULT: u32 = 3_600_000;
 
 /// Distinguishes client input errors (HTTP 400) from internal failures (HTTP 500).
 #[derive(Debug)]
@@ -48,6 +51,7 @@ pub struct AdvancedSettings {
     pub allow_lan_mcp_access: bool,
     pub mcp_request_timeout_ms: u32,
     pub mcp_server_start_timeout_ms: u32,
+    pub mcp_session_idle_ttl_ms: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -84,6 +88,7 @@ struct PartialAdvancedSettings {
     allow_lan_mcp_access: Option<bool>,
     mcp_request_timeout_ms: Option<u32>,
     mcp_server_start_timeout_ms: Option<u32>,
+    mcp_session_idle_ttl_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -115,6 +120,7 @@ pub fn default_settings() -> Settings {
             allow_lan_mcp_access: false,
             mcp_request_timeout_ms: MCP_TIMEOUT_MS_DEFAULT,
             mcp_server_start_timeout_ms: MCP_TIMEOUT_MS_DEFAULT,
+            mcp_session_idle_ttl_ms: MCP_SESSION_IDLE_TTL_MS_DEFAULT,
         },
     }
 }
@@ -193,6 +199,11 @@ fn settings_to_db_entries(settings: &Settings) -> Result<Vec<(&'static str, Stri
         (
             "advanced.mcpServerStartTimeoutMs",
             serde_json::to_string(&settings.advanced.mcp_server_start_timeout_ms)
+                .map_err(|e| e.to_string())?,
+        ),
+        (
+            "advanced.mcpSessionIdleTtlMs",
+            serde_json::to_string(&settings.advanced.mcp_session_idle_ttl_ms)
                 .map_err(|e| e.to_string())?,
         ),
     ])
@@ -317,6 +328,9 @@ pub fn merge_settings_value(mut base: Settings, value: Value) -> Result<Settings
         if let Some(value) = advanced.mcp_server_start_timeout_ms {
             base.advanced.mcp_server_start_timeout_ms = value;
         }
+        if let Some(value) = advanced.mcp_session_idle_ttl_ms {
+            base.advanced.mcp_session_idle_ttl_ms = value;
+        }
     }
     validate_settings(&base)?;
     Ok(base)
@@ -350,6 +364,13 @@ fn validate_settings(settings: &Settings) -> Result<(), String> {
     {
         return Err(format!(
             "advanced.mcpServerStartTimeoutMs must be between {MCP_TIMEOUT_MS_MIN} and {MCP_TIMEOUT_MS_MAX}"
+        ));
+    }
+    if settings.advanced.mcp_session_idle_ttl_ms < MCP_SESSION_IDLE_TTL_MS_MIN
+        || settings.advanced.mcp_session_idle_ttl_ms > MCP_SESSION_IDLE_TTL_MS_MAX
+    {
+        return Err(format!(
+            "advanced.mcpSessionIdleTtlMs must be between {MCP_SESSION_IDLE_TTL_MS_MIN} and {MCP_SESSION_IDLE_TTL_MS_MAX}"
         ));
     }
     Ok(())
