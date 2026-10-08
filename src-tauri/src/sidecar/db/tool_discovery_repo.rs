@@ -52,6 +52,11 @@ impl<'a> ToolDiscoveryRepository<'a> {
         )
     }
 
+    pub fn find_all(&self) -> Result<Vec<ToolDiscovery>, String> {
+        self.db
+            .query_all("SELECT * FROM tool_discoveries", &[], map_tool_discovery)
+    }
+
     pub fn replace_tools_for_server(
         &self,
         server_id: &str,
