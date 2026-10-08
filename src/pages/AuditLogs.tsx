@@ -1,4 +1,5 @@
-import { useState, Fragment, useMemo } from "react";
+import { useState, Fragment, useMemo, useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -7,6 +8,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs } from "@/components/ui/tabs";
 import { useLogs, useLogInsights } from "@/hooks/useLogs";
 import { useProfiles } from "@/hooks/useProfiles";
+import { logKeys } from "@/lib/query-keys";
 import { StatCard } from "@/components/shared/StatCard";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { PageHeader } from "@/components/shared/PageHeader";
@@ -48,6 +50,7 @@ const WINDOW_OPTIONS: Array<{ value: InsightsWindow; label: string }> = [
 ];
 
 export function AuditLogs() {
+  const queryClient = useQueryClient();
   const [tab, setTab] = useState("insights");
   const [insightsWindow, setInsightsWindow] = useState<InsightsWindow>("7d");
   // from 带毫秒精度，渲染期现算会使 queryKey 每次渲染漂移 → 无限 refetch
@@ -55,17 +58,10 @@ export function AuditLogs() {
     () => ({ from: windowFromDate(insightsWindow) }),
     [insightsWindow],
   );
-  const {
-    insights,
-    loading,
-    error: insightsError,
-    refresh: refreshInsights,
-  } = useLogInsights(insightsParams);
-  const { refresh: refreshLogs } = useLogs();
+  const { insights, loading, error: insightsError } = useLogInsights(insightsParams);
 
   const handleRefresh = () => {
-    refreshInsights();
-    refreshLogs();
+    void queryClient.invalidateQueries({ queryKey: logKeys.all() });
   };
 
   return (
@@ -415,8 +411,14 @@ function sortTools(tools: ToolInsight[], key: ToolSortKey): ToolInsight[] {
 
 function LogEntriesPanel() {
   const [toolFilter, setToolFilter] = useState("");
+  const [debouncedToolFilter, setDebouncedToolFilter] = useState("");
   const [expandedLog, setExpandedLog] = useState<string | null>(null);
-  const { logs } = useLogs(toolFilter ? { tool_name: toolFilter } : undefined);
+  const { logs } = useLogs(debouncedToolFilter ? { tool_name: debouncedToolFilter } : undefined);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedToolFilter(toolFilter), 300);
+    return () => clearTimeout(timer);
+  }, [toolFilter]);
 
   return (
     <div>
