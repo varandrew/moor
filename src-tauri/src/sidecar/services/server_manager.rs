@@ -14,9 +14,8 @@ use crate::sidecar::db::profile_repo::ProfileRepository;
 use crate::sidecar::db::server_repo::{Server, ServerRepository};
 use crate::sidecar::db::tool_discovery_repo::{ToolDiscoveryRepository, ToolInsert};
 use crate::sidecar::db::Database;
-use crate::sidecar::mcp::transport::stdio_client::redact_sensitive_stderr_values;
 use crate::sidecar::services::event_bus::{EventBus, Evt};
-use crate::sidecar::services::server_log;
+use crate::sidecar::services::server_log::{DiagnosticAttempt, ServerDiagnostics};
 use crate::sidecar::services::settings;
 use crate::sidecar::services::tool_catalog::{ToolCatalogService, ToolDetail};
 use serde_json::Value;
@@ -46,7 +45,7 @@ pub struct ServerManager {
     db: Arc<Database>,
     event_bus: Arc<EventBus>,
     connector: Arc<dyn McpConnector>,
-    logs_dir: Option<std::path::PathBuf>,
+    diagnostics: ServerDiagnostics,
 }
 
 #[derive(Clone, Copy)]
@@ -71,13 +70,13 @@ impl ServerManager {
             db,
             event_bus,
             connector,
-            logs_dir: None,
+            diagnostics: ServerDiagnostics::default(),
         }
     }
 
     /// 生产入口:开启 per-server 日志(<logs_dir>/<server_id>.log),测试默认关闭。
     pub fn with_logs_dir(mut self, logs_dir: std::path::PathBuf) -> Self {
-        self.logs_dir = Some(logs_dir);
+        self.diagnostics = ServerDiagnostics::new(logs_dir);
         self
     }
 
@@ -167,7 +166,8 @@ impl ServerManager {
 
     pub async fn start_server(&self, id: &str) -> Result<(), String> {
         let timeouts = self.get_timeout_settings();
-        let (should_wait, start_token, start_deadline, start_timeout_ms) = {
+        let config = self.get_stored_config(id);
+        let (should_wait, start_token, start_deadline, start_timeout_ms, diagnostics) = {
             let mut slots = self.slots.lock().await;
             let Some(slot) = slots.get_mut(id) else {
                 return Err(format!("Server {id} not found"));
@@ -179,6 +179,7 @@ impl ServerManager {
                     slot.start_token,
                     slot.start_deadline,
                     slot.start_timeout_ms,
+                    None,
                 ),
                 _ => {
                     slot.status = ServerStatus::Starting;
@@ -193,6 +194,7 @@ impl ServerManager {
                         slot.start_token,
                         slot.start_deadline,
                         slot.start_timeout_ms,
+                        Some(self.begin_log_attempt(id, config.as_ref().ok())),
                     )
                 }
             }
@@ -206,22 +208,14 @@ impl ServerManager {
 
         self.persist_server_status(id, "starting", None);
 
-        let config = self.get_stored_config(id);
-        // 配置读取失败也要留下 attempt + failure 记录——这恰是最需要诊断的一类失败。
-        let log_path = match &config {
-            Ok(config) => self.begin_log_attempt(id, config),
-            Err(_) => self
-                .logs_dir
-                .as_ref()
-                .and_then(|dir| server_log::begin_attempt(dir, id, "<config unavailable>").ok()),
-        };
+        let diagnostics = diagnostics.expect("A new start must have a diagnostic attempt");
 
         let result =
             match tokio::time::timeout(Duration::from_millis(timeouts.start_ms as u64), async {
                 match config {
                     Ok(config) => {
                         self.connector
-                            .connect(&config, timeouts, log_path.clone())
+                            .connect(&config, timeouts, diagnostics.clone())
                             .await
                     }
                     Err(err) => Err(err),
@@ -269,7 +263,7 @@ impl ServerManager {
                 }
                 self.cache_tools(id, &tools);
                 self.persist_server_status(id, "running", None);
-                self.spawn_death_watcher(id.to_string(), start_token, alive_rx);
+                self.spawn_death_watcher(id.to_string(), start_token, alive_rx, diagnostics);
                 Ok(())
             }
             Err(e) => {
@@ -292,9 +286,7 @@ impl ServerManager {
                         false
                     }
                 };
-                if let Some(path) = &log_path {
-                    let _ = server_log::append_event(path, &format!("Start failed: {public_msg}"));
-                }
+                diagnostics.append_event(&format!("Start failed: {public_msg}"));
                 if should_persist {
                     self.persist_server_status(id, "error", Some(&public_msg));
                     Err(e)
@@ -444,16 +436,12 @@ impl ServerManager {
         server_id: String,
         start_token: u64,
         alive_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        diagnostics: DiagnosticAttempt,
     ) {
         let Some(mut rx) = alive_rx else { return };
         let slots = self.slots.clone();
         let db = self.db.clone();
         let event_bus = self.event_bus.clone();
-        let log_path = self
-            .logs_dir
-            .as_ref()
-            .map(|dir| server_log::log_path(dir, &server_id));
-
         tokio::spawn(async move {
             while rx.changed().await.is_ok() {
                 if !*rx.borrow_and_update() {
@@ -475,9 +463,7 @@ impl ServerManager {
                     }
                     let repo = ServerRepository::new(&db);
                     let _ = repo.update_status(&server_id, "error", Some(&msg));
-                    if let Some(path) = &log_path {
-                        let _ = server_log::append_event(path, &msg);
-                    }
+                    diagnostics.append_event(&msg);
                     event_bus.emit(Evt::ServerStatus {
                         server_id: server_id.clone(),
                         status: "error".into(),
@@ -524,14 +510,16 @@ impl ServerManager {
         })
     }
 
-    /// 启动前截断并写入尝试标记;未配置日志目录或写入失败时返回 None(不影响启动)。
+    /// 启动状态锁内登记 attempt，确保并发启动与日志代次的顺序一致。
     fn begin_log_attempt(
         &self,
         id: &str,
-        config: &StoredServerConfig,
-    ) -> Option<std::path::PathBuf> {
-        let logs_dir = self.logs_dir.as_ref()?;
-        server_log::begin_attempt(logs_dir, id, &config.command_line()).ok()
+        config: Option<&StoredServerConfig>,
+    ) -> DiagnosticAttempt {
+        let command_line = config
+            .map(StoredServerConfig::command_line)
+            .unwrap_or_else(|| "<config unavailable>".to_string());
+        self.diagnostics.begin_attempt(id, &command_line)
     }
 
     fn get_timeout_settings(&self) -> ServerTimeouts {
@@ -559,9 +547,9 @@ pub(crate) struct StoredServerConfig {
 }
 
 impl StoredServerConfig {
-    /// 日志标记用的一行描述(经脱敏):stdio 为完整命令行,http 为 URL。
+    /// 仅供 Server Diagnostics 脱敏后写入的启动描述。
     fn command_line(&self) -> String {
-        let raw = if self.connection_type == "stdio" {
+        if self.connection_type == "stdio" {
             let args = self
                 .args
                 .as_ref()
@@ -578,9 +566,7 @@ impl StoredServerConfig {
                 .to_string()
         } else {
             self.url.clone().unwrap_or_default()
-        };
-        // 命令行 args 与 URL 可能携带凭据,与 stderr 同规则脱敏后再落盘。
-        redact_sensitive_stderr_values(&raw)
+        }
     }
 }
 
@@ -1433,7 +1419,7 @@ process.stdin.on("data", (chunk) => {{
             &'a self,
             _config: &'a StoredServerConfig,
             _timeouts: ServerTimeouts,
-            _log_path: Option<std::path::PathBuf>,
+            _diagnostics: DiagnosticAttempt,
         ) -> BoxedConnectFuture<'a> {
             self.connect_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

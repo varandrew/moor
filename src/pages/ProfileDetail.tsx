@@ -15,19 +15,19 @@ import {
   X,
 } from "lucide-react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
-import { toast } from "sonner";
-import { useProfiles, useProfile, useProfileTools } from "@/hooks/useProfiles";
+import { useProfile, useProfileTools } from "@/hooks/useProfiles";
+import { useProfileGovernance, type ToolSelection } from "@/hooks/useProfileGovernance";
 import { DetailPageHeader } from "@/components/shared/DetailPageHeader";
 import { PageLoading } from "@/components/shared/PageLoading";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { cn } from "@/lib/utils";
-import type { ProfileServerUpsert, ProfileToolGroup, ToolDetail } from "@moor/types";
+import type { ProfileToolGroup, ToolDetail } from "@moor/types";
 
 export function ProfileDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const { updateProfileServer, isUpdatingServer } = useProfiles();
-  const { profile, isLoading: loading, refresh } = useProfile(id);
+  const { setServerEnabled, busy: isUpdatingServer } = useProfileGovernance(id);
+  const { profile, isLoading: loading } = useProfile(id);
 
   if (loading) {
     return <PageLoading message="Loading profile..." />;
@@ -36,16 +36,6 @@ export function ProfileDetail() {
   if (!profile || !id) {
     return <EmptyState icon={FolderOpen} message="Profile not found" />;
   }
-
-  const toggleServer = async (serverId: string, enabled: boolean) => {
-    try {
-      await updateProfileServer({ profileId: id, serverId, updates: { enabled } });
-    } catch {
-      // 失败提示由全局 MutationCache onError 兜底
-      return;
-    }
-    refresh();
-  };
 
   const enabledCount = profile.servers.filter((s) => s.profileServer.enabled).length;
 
@@ -93,7 +83,7 @@ export function ProfileDetail() {
                   <Switch
                     checked={server.profileServer.enabled}
                     disabled={isUpdatingServer}
-                    onCheckedChange={(v) => toggleServer(server.id, v)}
+                    onCheckedChange={(v) => setServerEnabled(server.id, v)}
                   />
                   <div
                     className={cn(
@@ -130,17 +120,9 @@ export function ProfileDetail() {
   );
 }
 
-interface ToolSelection {
-  serverId: string;
-  toolName: string;
-}
-
 function ToolGovernanceCard({ profileId }: { profileId: string }) {
   const { groups, isLoading } = useProfileTools(profileId);
-  const { updateProfileServer, updateProfileServers, isUpdatingServer, isUpdatingServers } =
-    useProfiles();
-  // 快照覆盖语义下，任一写进行中都冻结治理操作，杜绝并发丢更新
-  const governanceBusy = isUpdatingServer || isUpdatingServers;
+  const { setTools, busy: governanceBusy } = useProfileGovernance(profileId);
   const [searchParams, setSearchParams] = useSearchParams();
   const [search, setSearch] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -234,98 +216,31 @@ function ToolGovernanceCard({ profileId }: { profileId: string }) {
     setSelection([...kept, ...added]);
   };
 
-  const restore = async (snapshot: ProfileServerUpsert[], description: string) => {
-    try {
-      await updateProfileServers({ profileId, updates: snapshot });
-    } catch {
-      // 失败提示由全局 MutationCache onError 兜底
-      return;
-    }
-    toast.success(description);
-  };
+  const toggleTool = (group: ProfileToolGroup, toolName: string, enabled: boolean) =>
+    setTools([{ serverId: group.serverId, toolName }], enabled);
 
-  const toggleTool = async (group: ProfileToolGroup, toolName: string, enabled: boolean) => {
-    try {
-      await updateProfileServer({
-        profileId,
-        serverId: group.serverId,
-        updates: {
-          disabledTools: disabledToolsOf(group, (tool) =>
-            tool.toolName === toolName ? enabled : !tool.disabled,
-          ),
-        },
-      });
-    } catch {
-      // 失败提示由全局 MutationCache onError 兜底
-    }
-  };
-
-  const setServerTools = async (group: ProfileToolGroup, enable: boolean) => {
-    const before = disabledToolsOf(group, () => false);
-    try {
-      await updateProfileServer({
-        profileId,
-        serverId: group.serverId,
-        updates: { disabledTools: disabledToolsOf(group, () => enable) },
-      });
-    } catch {
-      return;
-    }
-    toast.success(
+  const setServerTools = (group: ProfileToolGroup, enable: boolean) => {
+    const tools = groups.find((item) => item.serverId === group.serverId)?.tools ?? [];
+    return setTools(
+      tools.map((tool) => ({ serverId: group.serverId, toolName: tool.toolName })),
+      enable,
       enable
         ? `Enabled all tools in ${group.serverName}`
         : `Disabled all tools in ${group.serverName}`,
-      {
-        action: {
-          label: "Undo",
-          onClick: () =>
-            void restore(
-              [{ serverId: group.serverId, disabledTools: before }],
-              `Restored tools in ${group.serverName}`,
-            ),
-        },
-      },
     );
   };
 
   const applySelection = async (enable: boolean) => {
-    if (selection.length === 0) return;
-    // 选中项按 server 分组，各自计算整组 disabledTools 快照（批量接口按 server 全量替换）
-    const byServer = new Map<string, { group: ProfileToolGroup; selected: Set<string> }>();
-    for (const item of selection) {
-      const group = groups.find((g) => g.serverId === item.serverId);
-      if (!group) continue;
-      const entry = byServer.get(item.serverId) ?? { group, selected: new Set<string>() };
-      entry.selected.add(item.toolName);
-      byServer.set(item.serverId, entry);
-    }
-    const before: ProfileServerUpsert[] = [];
-    const updates: ProfileServerUpsert[] = [];
-    for (const { group, selected } of byServer.values()) {
-      before.push({
-        serverId: group.serverId,
-        disabledTools: disabledToolsOf(group, () => false),
-      });
-      updates.push({
-        serverId: group.serverId,
-        disabledTools: disabledToolsOf(group, (tool) =>
-          selected.has(tool.toolName) ? enable : !tool.disabled,
-        ),
-      });
-    }
     const count = selection.length;
-    setSelection([]);
-    try {
-      await updateProfileServers({ profileId, updates });
-    } catch {
-      return;
+    if (
+      await setTools(
+        selection,
+        enable,
+        enable ? `Enabled ${count} tools` : `Disabled ${count} tools`,
+      )
+    ) {
+      setSelection([]);
     }
-    toast.success(enable ? `Enabled ${count} tools` : `Disabled ${count} tools`, {
-      action: {
-        label: "Undo",
-        onClick: () => void restore(before, "Restored previous tool states"),
-      },
-    });
   };
 
   const totalTools = groups.reduce((sum, group) => sum + group.tools.length, 0);
@@ -433,11 +348,6 @@ function ToolGovernanceCard({ profileId }: { profileId: string }) {
 
 function toolRowId(serverId: string, toolName: string) {
   return `tool-${serverId}-${toolName}`;
-}
-
-// 批量接口以 server 为单位整体覆盖禁用清单；isEnabled 判定各工具启用态后统一推导
-function disabledToolsOf(group: ProfileToolGroup, isEnabled: (tool: ToolDetail) => boolean) {
-  return group.tools.filter((tool) => !isEnabled(tool)).map((tool) => tool.toolName);
 }
 
 const toolKey = (tool: { serverId: string; toolName: string }) =>

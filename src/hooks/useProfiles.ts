@@ -1,10 +1,11 @@
+import { invalidateProfileUndo } from "./useProfileGovernance";
 import { useCallback } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, apiPost, apiPut, apiDelete } from "@/lib/api/client";
 import { routes } from "@/lib/api-routes";
 import { serverKeys, profileKeys, logKeys } from "@/lib/query-keys";
 import { useSSEEvent } from "@/contexts/SSEContext";
-import type { Profile, ProfileDetail, ProfileServerUpsert, ProfileToolGroup } from "@moor/types";
+import type { Profile, ProfileDetail, ProfileToolGroup } from "@moor/types";
 
 export function useProfiles() {
   const queryClient = useQueryClient();
@@ -48,6 +49,7 @@ export function useProfiles() {
   const deleteProfile = useMutation({
     mutationFn: (id: string) => apiDelete(routes.profiles.delete(id)).then(() => id),
     onSuccess: (id) => {
+      invalidateProfileUndo(queryClient, id);
       queryClient.setQueryData<Profile[]>(profileKeys.list(), (prev) =>
         prev?.filter((p) => p.id !== id),
       );
@@ -57,48 +59,10 @@ export function useProfiles() {
   const updateProfile = useMutation({
     mutationFn: async ({ id, updates }: { id: string; updates: { name?: string } }) => {
       await apiPut(routes.profiles.update(id), updates);
+      invalidateProfileUndo(queryClient, id);
     },
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: profileKeys.list() });
-    },
-  });
-
-  const updateProfileServer = useMutation({
-    mutationFn: async ({
-      profileId,
-      serverId,
-      updates,
-    }: {
-      profileId: string;
-      serverId: string;
-      updates: { enabled?: boolean; disabledTools?: string[] };
-    }) => {
-      await apiPut(routes.profiles.updateServer(profileId, serverId), updates);
-    },
-    onSuccess: (_data, { profileId, serverId }) => {
-      // disabled_tools 变化影响各 profile 变体的 tools 查询，失效归 hook 负责
-      void queryClient.invalidateQueries({ queryKey: profileKeys.detail(profileId) });
-      void queryClient.invalidateQueries({ queryKey: profileKeys.tools(profileId) });
-      void queryClient.invalidateQueries({ queryKey: serverKeys.toolsRoot(serverId) });
-    },
-  });
-
-  const updateProfileServers = useMutation({
-    mutationFn: async ({
-      profileId,
-      updates,
-    }: {
-      profileId: string;
-      updates: ProfileServerUpsert[];
-    }) => {
-      await apiPut(routes.profiles.bulkServerState(profileId), { updates });
-    },
-    onSuccess: (_data, { profileId, updates }) => {
-      void queryClient.invalidateQueries({ queryKey: profileKeys.detail(profileId) });
-      void queryClient.invalidateQueries({ queryKey: profileKeys.tools(profileId) });
-      for (const update of updates) {
-        void queryClient.invalidateQueries({ queryKey: serverKeys.toolsRoot(update.serverId) });
-      }
     },
   });
 
@@ -119,12 +83,7 @@ export function useProfiles() {
     activateProfile: activateProfile.mutateAsync,
     deleteProfile: deleteProfile.mutateAsync,
     updateProfile: updateProfile.mutateAsync,
-    updateProfileServer: updateProfileServer.mutateAsync,
-    updateProfileServers: updateProfileServers.mutateAsync,
     cloneProfile: cloneProfile.mutateAsync,
-    // 批量接口是快照覆盖语义，进行中禁用控件以防并发写互相覆盖
-    isUpdatingServer: updateProfileServer.isPending,
-    isUpdatingServers: updateProfileServers.isPending,
   };
 }
 

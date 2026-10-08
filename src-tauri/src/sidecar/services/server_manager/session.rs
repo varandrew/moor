@@ -7,6 +7,7 @@ use crate::sidecar::mcp::transport::mcp_client::{
     HttpConnectConfig, McpClient, StdioConnectConfig,
 };
 use crate::sidecar::mcp::transport::stdio_client::build_stdio_environment;
+use crate::sidecar::services::server_log::DiagnosticAttempt;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
@@ -45,7 +46,7 @@ pub trait McpConnector: Send + Sync {
         &'a self,
         config: &'a StoredServerConfig,
         timeouts: ServerTimeouts,
-        log_path: Option<std::path::PathBuf>,
+        diagnostics: DiagnosticAttempt,
     ) -> BoxedConnectFuture<'a>;
 }
 
@@ -59,11 +60,11 @@ impl McpConnector for StdioHttpConnector {
         &'a self,
         config: &'a StoredServerConfig,
         timeouts: ServerTimeouts,
-        log_path: Option<std::path::PathBuf>,
+        diagnostics: DiagnosticAttempt,
     ) -> BoxedConnectFuture<'a> {
         Box::pin(async move {
             match config.connection_type.as_str() {
-                "stdio" => Self::connect_stdio(config, timeouts, log_path).await,
+                "stdio" => Self::connect_stdio(config, timeouts, diagnostics).await,
                 "http" => Self::connect_http(config, timeouts).await,
                 other => Err(format!("Unknown connection type: {other}")),
             }
@@ -75,7 +76,7 @@ impl StdioHttpConnector {
     async fn connect_stdio(
         config: &StoredServerConfig,
         timeouts: ServerTimeouts,
-        log_path: Option<std::path::PathBuf>,
+        diagnostics: DiagnosticAttempt,
     ) -> Result<(Vec<ToolInsert>, Box<dyn McpSession>), String> {
         let command = config
             .command
@@ -109,7 +110,7 @@ impl StdioHttpConnector {
             cwd: config.working_dir.clone(),
             env,
             request_timeout_ms: timeouts.start_ms,
-            log_path,
+            diagnostics,
         })
         .await?;
 

@@ -16,6 +16,7 @@ import { UnsavedChangesDialog } from "@/components/shared/UnsavedChangesDialog";
 import { ToolCategoryBadge } from "@/components/shared/ToolCategoryBadge";
 import { useParams, useNavigate } from "react-router-dom";
 import { ArrowLeft, Play, Square, RefreshCw, Terminal, Pencil, X, Check } from "lucide-react";
+import { useProfileGovernance } from "@/hooks/useProfileGovernance";
 import { useProfiles } from "@/hooks/useProfiles";
 import {
   useServerActions,
@@ -127,8 +128,10 @@ export function ServerDetail() {
     setServerAction,
     clearServerAction,
   });
-  const { profiles, updateProfileServer } = useProfiles();
+  const { profiles } = useProfiles();
   const activeProfile = profiles.find((profile) => profile.isActive);
+
+  const { setTools, busy: governanceBusy } = useProfileGovernance(activeProfile?.id);
 
   const { server, isLoading: loading } = useServer(id);
   const { tools } = useServerTools(id, activeProfile?.id);
@@ -169,19 +172,7 @@ export function ServerDetail() {
 
   const toggleTool = async (toolName: string, enabled: boolean) => {
     if (!activeProfile || !id) return;
-    const disabledTools = new Set(
-      tools.filter((tool) => tool.disabled).map((tool) => tool.toolName),
-    );
-    if (enabled) {
-      disabledTools.delete(toolName);
-    } else {
-      disabledTools.add(toolName);
-    }
-    await updateProfileServer({
-      profileId: activeProfile.id,
-      serverId: id,
-      updates: { disabledTools: Array.from(disabledTools) },
-    });
+    await setTools([{ serverId: id, toolName }], enabled);
   };
 
   const toggleAutoStart = async (value: boolean) => {
@@ -422,7 +413,7 @@ export function ServerDetail() {
                   </div>
                   <Switch
                     checked={!tool.disabled}
-                    disabled={!activeProfile}
+                    disabled={!activeProfile || governanceBusy}
                     onCheckedChange={(v) => toggleTool(tool.toolName, v)}
                   />
                 </div>

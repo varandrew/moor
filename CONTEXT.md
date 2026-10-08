@@ -73,3 +73,11 @@ _Avoid_: import pipeline, the loose parts.
 **Server Status**:
 The pure reducer (frontend) that resolves a Server's displayed status from base query data, optimistic action, SSE `server:status` event, and mutation settle, and derives every cache transition (list + detail channels): start/stop optimistic & failed patches, add/remove list transitions, and the shared SSE merge rule. Canonical implementation: `src/lib/server-status.ts`. The interface is its test surface.
 _Avoid_: server patch utils, status merge, inline cache writes in hooks.
+
+**Profile Tool Governance**:
+管理 Profile 内 Tool 的启禁状态，统一单项、整组和批量操作。同一 Profile 的治理写入按序执行；Undo 恢复操作前的禁用清单，仅在该 Profile 后续写入尚未成功时有效。未发现的 Tool 仍保留其既有禁用状态。
+_Avoid_: 工具快照工具集、页面内禁用清单计算。
+
+**Server Diagnostics**:
+Server Runtime 内按启动尝试归属的诊断记录。统一对生命周期与 stderr 内容脱敏，诊断失败不影响 Server 启动；新启动尝试开始后，旧尝试不得继续写入当前日志。
+_Avoid_: 裸日志路径、各调用方自行降级。

@@ -1,6 +1,7 @@
 use crate::sidecar::db::tool_discovery_repo::ToolInsert;
 use crate::sidecar::mcp::transport::http_client::HttpClientTransport;
 use crate::sidecar::mcp::transport::stdio_client::StdioClientTransport;
+use crate::sidecar::services::server_log::DiagnosticAttempt;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -22,7 +23,7 @@ pub struct StdioConnectConfig {
     pub cwd: Option<String>,
     pub env: HashMap<String, String>,
     pub request_timeout_ms: u32,
-    pub log_path: Option<std::path::PathBuf>,
+    pub diagnostics: DiagnosticAttempt,
 }
 
 pub struct HttpConnectConfig {
@@ -40,7 +41,7 @@ impl McpClient {
             config.cwd.as_deref(),
             config.env,
             Duration::from_millis(config.request_timeout_ms as u64),
-            config.log_path,
+            config.diagnostics,
         )
         .await?;
         let mut client = Self {

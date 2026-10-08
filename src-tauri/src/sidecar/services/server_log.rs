@@ -1,44 +1,138 @@
-// Per-server 启动日志:<logs_dir>/<server_id>.log,每次启动尝试截断重写。
-// 生命周期事件(启动/失败/退出)由 ServerManager 写入;stdio stderr 由
-// StdioClientTransport 追加到同一文件。约定:写入失败一律由调用方 `let _ =`
-// 吞掉——日志绝不能影响 server 启动流程。
-
+// Server Diagnostics 集中管理启动尝试、脱敏和尽力写入；日志失败不影响 Server Runtime。
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+const STDERR_REDACTED: &str = "[REDACTED]";
+
+#[derive(Default)]
+pub struct ServerDiagnostics {
+    logs_dir: Option<PathBuf>,
+    attempts: Mutex<HashMap<String, Weak<Mutex<bool>>>>,
+}
+
+#[derive(Clone)]
+pub struct DiagnosticAttempt {
+    path: Option<PathBuf>,
+    active: Arc<Mutex<bool>>,
+}
+
+impl ServerDiagnostics {
+    pub fn new(logs_dir: PathBuf) -> Self {
+        Self {
+            logs_dir: Some(logs_dir),
+            ..Self::default()
+        }
+    }
+
+    pub fn begin_attempt(&self, server_id: &str, command_line: &str) -> DiagnosticAttempt {
+        let mut attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
+        attempts.retain(|_, attempt| attempt.strong_count() > 0);
+        if let Some(previous) = attempts.get(server_id).and_then(Weak::upgrade) {
+            // 等旧写入完成再失效；新文件截断后，旧 reader 只能更新自己的摘要。
+            *previous.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        }
+        let attempt = DiagnosticAttempt {
+            path: self.logs_dir.as_ref().map(|dir| log_path(dir, server_id)),
+            active: Arc::new(Mutex::new(true)),
+        };
+        if let Some(path) = &attempt.path {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Ok(mut file) = std::fs::File::create(path) {
+                let _ = writeln!(
+                    file,
+                    "[{}] === Start attempt: {} ===",
+                    timestamp(),
+                    redact_sensitive_stderr_values(command_line)
+                );
+            }
+        }
+        attempts.insert(server_id.to_string(), Arc::downgrade(&attempt.active));
+        attempt
+    }
+}
+
+impl DiagnosticAttempt {
+    pub fn append_event(&self, message: &str) {
+        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if *active {
+            self.write(&redact_sensitive_stderr_values(message));
+        }
+    }
+
+    pub fn stderr(&self, line: &str) {
+        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if *active {
+            let redacted = redact_sensitive_stderr_values(line);
+            self.write(&format!("[stderr] {redacted}"));
+            tracing::warn!(target: "mcp::stdio::stderr", "{}", redacted);
+        }
+    }
+
+    fn write(&self, message: &str) {
+        let Some(path) = &self.path else { return };
+        // 每次重开可恢复被用户删除的日志；调用方不承担文件错误。
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "[{}] {}", timestamp(), message);
+        }
+    }
+}
 
 pub fn log_path(logs_dir: &Path, server_id: &str) -> PathBuf {
     logs_dir.join(format!("{server_id}.log"))
 }
 
-/// 截断重建日志文件并写入启动尝试标记,返回文件路径。
-pub fn begin_attempt(
-    logs_dir: &Path,
-    server_id: &str,
-    command_line: &str,
-) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(logs_dir)?;
-    let path = log_path(logs_dir, server_id);
-    let mut file = std::fs::File::create(&path)?;
-    writeln!(
-        file,
-        "[{}] === Start attempt: {} ===",
-        timestamp(),
-        command_line
-    )?;
-    Ok(path)
-}
-
-/// create 兜底:文件可能因 begin_attempt 失败或运行中被删除而缺失,事件不应因此丢失。
-pub fn append_event(path: &Path, message: &str) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path)?;
-    writeln!(file, "[{}] {}", timestamp(), message)
-}
-
-pub fn timestamp() -> String {
+fn timestamp() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+pub fn redact_sensitive_stderr_values(line: &str) -> String {
+    let redacted = sensitive_stderr_key_regex()
+        .replace_all(line, |caps: &regex_lite::Captures<'_>| {
+            format!("{}{}{}", &caps[1], &caps[2], STDERR_REDACTED)
+        });
+    let redacted = authorization_stderr_regex()
+        .replace_all(&redacted, |caps: &regex_lite::Captures<'_>| {
+            format!("{}{}{}", &caps[1], &caps[2], STDERR_REDACTED)
+        });
+    url_userinfo_stderr_regex()
+        .replace_all(&redacted, |caps: &regex_lite::Captures<'_>| {
+            format!("{}{}@", &caps[1], STDERR_REDACTED)
+        })
+        .to_string()
+}
+fn sensitive_stderr_key_regex() -> &'static regex_lite::Regex {
+    static REGEX: OnceLock<regex_lite::Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        regex_lite::Regex::new(
+            r"(?i)\b([A-Za-z0-9_-]*(?:token|password|secret|api[_-]?(?:key|token)|cookie)[A-Za-z0-9_-]*)\b(\s*[:=]\s*)([^\s,;]+)",
+        )
+        .expect("sensitive stderr key regex should compile")
+    })
+}
+
+fn authorization_stderr_regex() -> &'static regex_lite::Regex {
+    static REGEX: OnceLock<regex_lite::Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        regex_lite::Regex::new(r"(?i)\b(authorization)\b(\s*[:=]\s*)([^,;]+)")
+            .expect("authorization stderr regex should compile")
+    })
+}
+
+// URL userinfo(://user:pass@ 或 ://key@)整体脱敏:key=value 正则覆盖不到该凭据形态。
+fn url_userinfo_stderr_regex() -> &'static regex_lite::Regex {
+    static REGEX: OnceLock<regex_lite::Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        regex_lite::Regex::new(r"(?i)(://)([^/@\s]+(?::[^/@\s]*)?)@")
+            .expect("url userinfo stderr regex should compile")
+    })
 }
 
 #[cfg(test)]
@@ -67,9 +161,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, "stale contents from a previous attempt").unwrap();
 
-        let returned = begin_attempt(&dir, "srv1", "npx -y some-mcp").unwrap();
+        let diagnostics = ServerDiagnostics::new(dir.clone());
+        let _attempt = diagnostics.begin_attempt("srv1", "npx -y some-mcp");
 
-        assert_eq!(returned, path);
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("=== Start attempt: npx -y some-mcp ==="));
         assert!(!contents.contains("stale contents"));
@@ -82,8 +176,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = log_path(&dir, "srv2");
 
-        append_event(&path, "Start failed: boom").unwrap();
-        append_event(&path, "exited unexpectedly").unwrap();
+        let diagnostics = ServerDiagnostics::new(dir.clone());
+        let attempt = diagnostics.begin_attempt("srv2", "some-mcp");
+        std::fs::remove_file(&path).unwrap();
+        attempt.append_event("Start failed: boom");
+        attempt.append_event("exited unexpectedly");
 
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("Start failed: boom"));
