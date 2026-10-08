@@ -99,16 +99,14 @@ fn map_audit_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditLogEntry> {
     })
 }
 
-/// nearest-rank 分位数：rank = ceil(q/100 * n)，取第 rank 个值（1-based）。
+/// 已排序数据的 nearest-rank 分位数：rank = ceil(q/100 * n)，取第 rank 个值（1-based）。
 fn percentile_nearest_rank(values: &[f64], q: f64) -> Option<f64> {
     if values.is_empty() {
         return None;
     }
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let rank = ((q / 100.0) * sorted.len() as f64).ceil() as usize;
-    let idx = rank.clamp(1, sorted.len()) - 1;
-    Some(sorted[idx])
+    let rank = ((q / 100.0) * values.len() as f64).ceil() as usize;
+    let idx = rank.clamp(1, values.len()) - 1;
+    Some(values[idx])
 }
 
 pub struct AuditLogRepository<'a> {
@@ -277,7 +275,8 @@ impl<'a> AuditLogRepository<'a> {
             },
         )?;
         for tool in &mut tools {
-            if let Some(vals) = durations.get(&(tool.server_id.clone(), tool.tool_name.clone())) {
+            if let Some(vals) = durations.get_mut(&(tool.server_id.clone(), tool.tool_name.clone())) {
+                vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 tool.p50_ms = percentile_nearest_rank(vals, 50.0);
                 tool.p95_ms = percentile_nearest_rank(vals, 95.0);
             }
@@ -599,6 +598,27 @@ mod tests {
         assert_eq!(tool.p50_ms, Some(30.0));
         assert_eq!(tool.p95_ms, Some(100.0));
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn insights_percentiles_sort_unordered_calls() {
+        let (db, path) = temp_db();
+        let repo = AuditLogRepository::new(&db);
+        for (index, duration) in [100, 10, 40, 20, 30].iter().enumerate() {
+            insert_log(
+                &repo,
+                &format!("unordered-{index}"),
+                "search",
+                None,
+                None,
+                *duration,
+            );
+        }
+
+        let insights = repo.get_insights(None, None).expect("insights");
+        assert_eq!(insights.tools[0].p50_ms, Some(30.0), "{insights:?}");
+        assert_eq!(insights.tools[0].p95_ms, Some(100.0));
         let _ = std::fs::remove_file(path);
     }
 
