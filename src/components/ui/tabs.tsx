@@ -5,9 +5,10 @@ interface TabsProps {
   onValueChange: (value: string) => void;
   tabs: { value: string; label: string }[];
   className?: string;
+  size?: "default" | "sm";
 }
 
-export function Tabs({ value, onValueChange, tabs, className }: TabsProps) {
+export function Tabs({ value, onValueChange, tabs, className, size = "default" }: TabsProps) {
   return (
     <div className={cn("flex gap-1 bg-surface-300/60 rounded-xl p-1 w-fit", className)}>
       {tabs.map((tab) => (
@@ -15,7 +16,8 @@ export function Tabs({ value, onValueChange, tabs, className }: TabsProps) {
           key={tab.value}
           onClick={() => onValueChange(tab.value)}
           className={cn(
-            "font-headline text-sm px-4 py-2 rounded-lg transition-all",
+            "font-headline rounded-lg transition-all",
+            size === "sm" ? "text-xs px-3 py-1.5" : "text-sm px-4 py-2",
             value === tab.value
               ? "bg-surface-100 text-cursor-dark shadow-[0_1px_3px_rgba(0,0,0,0.06)]"
               : "text-[var(--fg-45)] hover:text-[var(--fg-70)]",

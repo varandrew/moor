@@ -1,6 +1,30 @@
 use super::Database;
 use serde::{Deserialize, Serialize};
 
+pub(crate) fn normalize_timestamp(timestamp: &str) -> Result<String, String> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| {
+            value
+                .with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+        })
+        .map_err(|_| "Timestamp must be a valid RFC3339 value".to_string())
+}
+
+pub(crate) fn normalize_time_window(
+    from: Option<&str>,
+    to: Option<&str>,
+) -> Result<(Option<String>, Option<String>), String> {
+    let from = from.map(normalize_timestamp).transpose()?;
+    let to = to.map(normalize_timestamp).transpose()?;
+    if let (Some(from), Some(to)) = (&from, &to) {
+        if from > to {
+            return Err("Time window start must not be after its end".to_string());
+        }
+    }
+    Ok((from, to))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditLogEntry {
@@ -99,16 +123,14 @@ fn map_audit_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditLogEntry> {
     })
 }
 
-/// nearest-rank 分位数：rank = ceil(q/100 * n)，取第 rank 个值（1-based）。
+/// 已排序数据的 nearest-rank 分位数：rank = ceil(q/100 * n)，取第 rank 个值（1-based）。
 fn percentile_nearest_rank(values: &[f64], q: f64) -> Option<f64> {
     if values.is_empty() {
         return None;
     }
-    let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let rank = ((q / 100.0) * sorted.len() as f64).ceil() as usize;
-    let idx = rank.clamp(1, sorted.len()) - 1;
-    Some(sorted[idx])
+    let rank = ((q / 100.0) * values.len() as f64).ceil() as usize;
+    let idx = rank.clamp(1, values.len()) - 1;
+    Some(values[idx])
 }
 
 pub struct AuditLogRepository<'a> {
@@ -129,6 +151,7 @@ impl<'a> AuditLogRepository<'a> {
         limit: Option<u32>,
         offset: Option<u32>,
     ) -> Result<Vec<AuditLogEntry>, String> {
+        let (from, to) = normalize_time_window(from, to)?;
         let mut sql = "SELECT * FROM audit_logs WHERE 1=1".to_string();
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -145,7 +168,7 @@ impl<'a> AuditLogRepository<'a> {
             params.push(Box::new(f.to_string()));
         }
         if let Some(t) = to {
-            sql += " AND timestamp <= ?";
+            sql += " AND timestamp < ?";
             params.push(Box::new(t.to_string()));
         }
 
@@ -174,6 +197,7 @@ impl<'a> AuditLogRepository<'a> {
         duration_ms: i64,
         agent_info: Option<&str>,
     ) -> Result<(), String> {
+        let timestamp = normalize_timestamp(timestamp)?;
         let args_json = arguments.map(|v| serde_json::to_string(v).unwrap_or_default());
         let result_json = result.map(|v| serde_json::to_string(v).unwrap_or_default());
         self.db.run(
@@ -190,6 +214,7 @@ impl<'a> AuditLogRepository<'a> {
         from: Option<&str>,
         to: Option<&str>,
     ) -> Result<LogInsights, String> {
+        let (from, to) = normalize_time_window(from, to)?;
         let mut conditions = String::new();
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(f) = from {
@@ -197,7 +222,7 @@ impl<'a> AuditLogRepository<'a> {
             params.push(Box::new(f.to_string()));
         }
         if let Some(t) = to {
-            conditions += " AND a.timestamp <= ?";
+            conditions += " AND a.timestamp < ?";
             params.push(Box::new(t.to_string()));
         }
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -277,7 +302,8 @@ impl<'a> AuditLogRepository<'a> {
             },
         )?;
         for tool in &mut tools {
-            if let Some(vals) = durations.get(&(tool.server_id.clone(), tool.tool_name.clone())) {
+            if let Some(vals) = durations.get_mut(&(tool.server_id.clone(), tool.tool_name.clone())) {
+                vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 tool.p50_ms = percentile_nearest_rank(vals, 50.0);
                 tool.p95_ms = percentile_nearest_rank(vals, 95.0);
             }
@@ -326,8 +352,9 @@ impl<'a> AuditLogRepository<'a> {
     /// 滚动保留：删除 timestamp 早于 cutoff 的审计行，返回删除行数。
     /// 事务内执行以拿到准确的 affected count。
     pub fn purge_before(&self, cutoff: &str) -> Result<usize, String> {
+        let cutoff = normalize_timestamp(cutoff)?;
         self.db.transaction(|conn| {
-            conn.execute("DELETE FROM audit_logs WHERE timestamp < ?1", [cutoff])
+            conn.execute("DELETE FROM audit_logs WHERE timestamp < ?1", [&cutoff])
                 .map_err(|e| e.to_string())
         })
     }
@@ -396,7 +423,7 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("moor-audit-repo-{ts}.db"));
+        let path = std::env::temp_dir().join(format!("moor-audit-repo-{ts}-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(&path).expect("open db");
         db.run_migrations().expect("migrate");
         (db, path)
@@ -599,6 +626,64 @@ mod tests {
         assert_eq!(tool.p50_ms, Some(30.0));
         assert_eq!(tool.p95_ms, Some(100.0));
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn insights_percentiles_sort_unordered_calls() {
+        let (db, path) = temp_db();
+        let repo = AuditLogRepository::new(&db);
+        for (index, duration) in [100, 10, 40, 20, 30].iter().enumerate() {
+            insert_log(
+                &repo,
+                &format!("unordered-{index}"),
+                "search",
+                None,
+                None,
+                *duration,
+            );
+        }
+
+        let insights = repo.get_insights(None, None).expect("insights");
+        assert_eq!(insights.tools[0].p50_ms, Some(30.0), "{insights:?}");
+        assert_eq!(insights.tools[0].p95_ms, Some(100.0));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn time_windows_preserve_nanosecond_boundaries_and_offsets() {
+        let (db, path) = temp_db();
+        let repo = AuditLogRepository::new(&db);
+        for (id, timestamp) in [
+            ("before", "2026-01-01T00:00:00.999999999Z"),
+            ("start", "2026-01-01T08:00:01+08:00"),
+            ("inside", "2026-01-01T00:00:01.000000001+00:00"),
+            ("end", "2026-01-01T00:00:02Z"),
+        ] {
+            repo.insert(
+                id, timestamp, None, None, "search", None, None, None, 10, None,
+            )
+            .expect("insert");
+        }
+        let from = Some("2026-01-01T00:00:01Z");
+        let to = Some("2026-01-01T08:00:02.000+08:00");
+        let logs = repo.query_logs(None, None, from, to, None, None).unwrap();
+        assert_eq!(
+            logs.iter().map(|log| log.id.as_str()).collect::<Vec<_>>(),
+            ["inside", "start"]
+        );
+        assert_eq!(logs[1].timestamp, "2026-01-01T00:00:01.000000000Z");
+        assert_eq!(repo.get_insights(from, to).unwrap().total_calls, 2);
+        assert!(repo
+            .query_logs(None, None, from, from, None, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(repo.get_insights(from, from).unwrap().total_calls, 0);
+        assert!(repo.get_insights(to, from).is_err());
+        assert!(repo
+            .insert("invalid", "garbage", None, None, "search", None, None, None, 10, None)
+            .is_err());
+        assert_eq!(repo.purge_before("2026-01-01T08:00:01+08:00").unwrap(), 1);
         let _ = std::fs::remove_file(path);
     }
 

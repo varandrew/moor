@@ -159,4 +159,54 @@ mod tests {
         assert!(!is_private_host("localhost:9223"));
         assert!(!is_private_host("172.32.0.1:9223"));
     }
+
+    #[tokio::test]
+    async fn lan_listener_accepts_private_mcp_hosts_and_keeps_api_loopback_only() {
+        let data_dir = std::env::temp_dir().join(format!("moor-lan-{}", uuid::Uuid::new_v4()));
+        let state = AppState::for_test(&data_dir);
+        let listener = crate::bind_listener("0.0.0.0", 0).expect("bind listener");
+        let address = listener.local_addr().unwrap();
+        assert!(address.ip().is_unspecified());
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let (shutdown, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, crate::sidecar::http::create_app(state))
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("serve test gateway");
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/mcp", address.port());
+        for host in ["10.0.0.5", "172.16.0.5", "192.168.1.5", "8.8.8.8"] {
+            let response = client.post(&url)
+                .header("Host", format!("{host}:{}", address.port()))
+                .header("Accept", "application/json")
+                .json(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "LAN test", "version": "1"}}}))
+                .send().await.unwrap();
+            let status = response.status();
+            let value: serde_json::Value = response.json().await.unwrap();
+            if host == "8.8.8.8" {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert_eq!(value["error"]["message"], "Invalid Host header");
+            } else {
+                assert_eq!(status, StatusCode::OK);
+                assert!(value["result"]["serverInfo"].is_object());
+            }
+        }
+        let response = client
+            .get(format!("http://127.0.0.1:{}/api/health", address.port()))
+            .header("Host", format!("192.168.1.5:{}", address.port()))
+            .header("X-Moor-Token", "test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let _: serde_json::Value = response.json().await.unwrap();
+        shutdown.send(()).unwrap();
+        server.await.unwrap();
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
 }

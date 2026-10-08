@@ -1,4 +1,5 @@
-import { useState, Fragment, useMemo } from "react";
+import { useState, Fragment, useMemo, useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -7,6 +8,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs } from "@/components/ui/tabs";
 import { useLogs, useLogInsights } from "@/hooks/useLogs";
 import { useProfiles } from "@/hooks/useProfiles";
+import { logKeys } from "@/lib/query-keys";
 import { StatCard } from "@/components/shared/StatCard";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { PageHeader } from "@/components/shared/PageHeader";
@@ -48,6 +50,7 @@ const WINDOW_OPTIONS: Array<{ value: InsightsWindow; label: string }> = [
 ];
 
 export function AuditLogs() {
+  const queryClient = useQueryClient();
   const [tab, setTab] = useState("insights");
   const [insightsWindow, setInsightsWindow] = useState<InsightsWindow>("7d");
   // from 带毫秒精度，渲染期现算会使 queryKey 每次渲染漂移 → 无限 refetch
@@ -55,17 +58,10 @@ export function AuditLogs() {
     () => ({ from: windowFromDate(insightsWindow) }),
     [insightsWindow],
   );
-  const {
-    insights,
-    loading,
-    error: insightsError,
-    refresh: refreshInsights,
-  } = useLogInsights(insightsParams);
-  const { refresh: refreshLogs } = useLogs();
+  const { insights, loading, error: insightsError } = useLogInsights(insightsParams);
 
   const handleRefresh = () => {
-    refreshInsights();
-    refreshLogs();
+    void queryClient.invalidateQueries({ queryKey: logKeys.all() });
   };
 
   return (
@@ -136,22 +132,12 @@ function InsightsPanel({
     <div className="space-y-6">
       {/* Window selector + sort hint */}
       <div className="flex items-center justify-between gap-3 flex-wrap">
-        <div className="flex gap-1 bg-surface-300/60 rounded-xl p-1">
-          {WINDOW_OPTIONS.map((option) => (
-            <button
-              key={option.value}
-              onClick={() => onWindowChange(option.value)}
-              className={cn(
-                "font-headline text-xs px-3 py-1.5 rounded-lg transition-all",
-                insightsWindow === option.value
-                  ? "bg-surface-100 text-cursor-dark shadow-[0_1px_3px_rgba(0,0,0,0.06)]"
-                  : "text-[var(--fg-45)] hover:text-[var(--fg-70)]",
-              )}
-            >
-              {option.label}
-            </button>
-          ))}
-        </div>
+        <Tabs
+          value={insightsWindow}
+          onValueChange={(value) => onWindowChange(value as InsightsWindow)}
+          tabs={WINDOW_OPTIONS}
+          size="sm"
+        />
         {alertCount > 0 && (
           <Badge variant="error" className="text-[11px]">
             <AlertTriangle className="h-3 w-3 mr-1" />
@@ -415,8 +401,14 @@ function sortTools(tools: ToolInsight[], key: ToolSortKey): ToolInsight[] {
 
 function LogEntriesPanel() {
   const [toolFilter, setToolFilter] = useState("");
+  const [debouncedToolFilter, setDebouncedToolFilter] = useState("");
   const [expandedLog, setExpandedLog] = useState<string | null>(null);
-  const { logs } = useLogs(toolFilter ? { tool_name: toolFilter } : undefined);
+  const { logs } = useLogs(debouncedToolFilter ? { tool_name: debouncedToolFilter } : undefined);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedToolFilter(toolFilter), 300);
+    return () => clearTimeout(timer);
+  }, [toolFilter]);
 
   return (
     <div>

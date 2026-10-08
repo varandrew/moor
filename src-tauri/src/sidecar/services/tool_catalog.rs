@@ -124,20 +124,58 @@ impl ToolCatalogService {
     }
 
     /// 治理面板数据：按 server 分组返回 profile 内全部已发现工具及禁用态。
-    /// 复用 get_tool_details 的 exposed name 冲突消解，保证与 /mcp 目录一致。
+    /// 批量读取工具并复用目录命名规则，保留禁用服务与工具的治理入口。
     /// 读取失败降级为空组——面板是只读视图，不应因单个 server 失败而整体 500。
     pub fn get_profile_tool_groups(db: &Database, profile_id: &str) -> Vec<ProfileToolGroup> {
         let servers = match ProfileRepository::new(db).find_profile_servers(profile_id) {
             Ok(servers) => servers,
             Err(_) => return vec![],
         };
+        let tool_repo = ToolDiscoveryRepository::new(db);
+        let profile_tools = match tool_repo.find_by_profile_id(profile_id) {
+            Ok(tools) => tools,
+            Err(_) => return vec![],
+        };
+        let exposed_names: std::collections::HashMap<_, _> =
+            build_tool_catalog_entries(profile_tools)
+                .into_iter()
+                .map(|entry| ((entry.server_id, entry.tool_name), entry.exposed_name))
+                .collect();
+        let mut discovered_by_server = std::collections::HashMap::<String, Vec<_>>::new();
+        for tool in tool_repo.find_all().unwrap_or_default() {
+            discovered_by_server
+                .entry(tool.server_id.clone())
+                .or_default()
+                .push(tool);
+        }
         servers
             .into_iter()
-            .map(|server| ProfileToolGroup {
-                server_id: server.server.id.clone(),
-                server_name: server.server.name.clone(),
-                server_enabled: server.profile_server.enabled,
-                tools: Self::get_tool_details(db, &server.server.id, Some(profile_id), None),
+            .map(|server| {
+                let server_slug = normalize_server_name(&server.server.name);
+                let tools = discovered_by_server
+                    .remove(&server.server.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|tool| ToolDetail {
+                        exposed_name: exposed_names
+                            .get(&(server.server.id.clone(), tool.tool_name.clone()))
+                            .cloned()
+                            .unwrap_or_else(|| format!("{server_slug}__{}", tool.tool_name)),
+                        disabled: server
+                            .profile_server
+                            .disabled_tools
+                            .contains(&tool.tool_name),
+                        tool_name: tool.tool_name,
+                        description: tool.description,
+                        input_schema: tool.input_schema,
+                    })
+                    .collect();
+                ProfileToolGroup {
+                    server_id: server.server.id,
+                    server_name: server.server.name,
+                    server_enabled: server.profile_server.enabled,
+                    tools,
+                }
             })
             .collect()
     }
@@ -322,6 +360,91 @@ mod tests {
             ]
         );
 
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn profile_groups_preserve_disabled_tools_and_catalog_names() {
+        let db_path = temp_db_path("profile-groups");
+        let db = Database::open(&db_path).expect("open db");
+        db.run_migrations().expect("migrate");
+        let profile_repo = ProfileRepository::new(&db);
+        profile_repo.seed_default().expect("seed profile");
+        for (id, name) in [
+            ("aaaaaaaa1111", "Alpha"),
+            ("aaaaaaaa2222", "Alpha"),
+            ("disabled", "Disabled"),
+            ("unassigned", "Unassigned"),
+            ("empty", "Empty"),
+        ] {
+            insert_server(&db, id, name);
+        }
+        profile_repo
+            .assign_to_active_profile(&[
+                "aaaaaaaa1111".into(),
+                "aaaaaaaa2222".into(),
+                "disabled".into(),
+                "empty".into(),
+            ])
+            .expect("assign servers");
+        let profile_id = profile_repo.find_active_id().unwrap().unwrap();
+        profile_repo
+            .upsert_profile_server(&profile_id, "disabled", Some(false), None)
+            .expect("disable server");
+        profile_repo
+            .upsert_profile_server(
+                &profile_id,
+                "aaaaaaaa2222",
+                None,
+                Some(&vec!["hidden".into()]),
+            )
+            .expect("disable tool");
+        let tool_repo = ToolDiscoveryRepository::new(&db);
+        for id in ["aaaaaaaa1111", "aaaaaaaa2222", "disabled", "unassigned"] {
+            tool_repo
+                .replace_tools_for_server(
+                    id,
+                    &["search", "hidden"].map(|name| ToolInsert {
+                        name: name.into(),
+                        description: Some(name.into()),
+                        input_schema: Some(serde_json::json!({"type": "object"})),
+                    }),
+                )
+                .expect("discover tools");
+        }
+
+        let groups = ToolCatalogService::get_profile_tool_groups(&db, &profile_id);
+        assert_eq!(groups.len(), 5);
+        for group in &groups {
+            let expected = ToolCatalogService::get_tool_details(
+                &db,
+                &group.server_id,
+                Some(&profile_id),
+                None,
+            );
+            assert_eq!(
+                serde_json::to_value(&group.tools).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            assert_eq!(
+                group.server_enabled,
+                !matches!(group.server_id.as_str(), "disabled" | "unassigned")
+            );
+        }
+        let collision = groups
+            .iter()
+            .find(|group| group.server_id == "aaaaaaaa1111")
+            .unwrap();
+        assert!(collision
+            .tools
+            .iter()
+            .any(|tool| tool.exposed_name == "alpha_aaaaaaaa1__search"));
+        assert!(groups
+            .iter()
+            .find(|group| group.server_id == "empty")
+            .unwrap()
+            .tools
+            .is_empty());
         let _ = std::fs::remove_file(db_path);
     }
 

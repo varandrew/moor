@@ -87,8 +87,46 @@ pub fn run_migrations(db: &Database) -> Result<(), String> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     backfill_server_sort_order(db)?;
+    normalize_audit_timestamps(db)?;
 
     Ok(())
+}
+
+fn normalize_audit_timestamps(db: &Database) -> Result<(), String> {
+    db.transaction(|conn| {
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if version >= 1 {
+            return Ok(());
+        }
+        let mut statement = conn
+            .prepare("SELECT id, timestamp FROM audit_logs")
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut updates = Vec::new();
+        for row in rows {
+            let (id, timestamp) = row.map_err(|error| error.to_string())?;
+            let normalized = super::audit_log_repo::normalize_timestamp(&timestamp)
+                .map_err(|error| format!("Cannot migrate audit log {id}: {error}"))?;
+            if timestamp != normalized {
+                updates.push((id, normalized));
+            }
+        }
+        for (id, timestamp) in updates {
+            conn.execute(
+                "UPDATE audit_logs SET timestamp = ?1 WHERE id = ?2",
+                rusqlite::params![timestamp, id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        conn.execute_batch("PRAGMA user_version = 1")
+            .map_err(|error| error.to_string())
+    })
 }
 
 fn ensure_column(db: &Database, table: &str, column: &str, definition: &str) -> Result<(), String> {
@@ -146,6 +184,99 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("moor-migrations-{ts}.db"));
         Database::open(&path).expect("open db")
+    }
+
+    #[test]
+    fn audit_timestamp_migration_preserves_precision_and_time_index() {
+        let db = temp_db();
+        run_migrations(&db).unwrap();
+        db.exec("PRAGMA user_version = 0").unwrap();
+        for (id, timestamp) in [
+            ("offset", "2026-01-01T08:00:00.123456789+08:00"),
+            ("utc", "2026-01-01T00:00:00Z"),
+        ] {
+            db.run(
+                "INSERT INTO audit_logs (id, timestamp, tool_name) VALUES (?1, ?2, 'search')",
+                &[&id, &timestamp],
+            )
+            .unwrap();
+        }
+        run_migrations(&db).unwrap();
+        let timestamps = db
+            .query_all(
+                "SELECT timestamp FROM audit_logs ORDER BY timestamp",
+                &[],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            timestamps,
+            [
+                "2026-01-01T00:00:00.000000000Z",
+                "2026-01-01T00:00:00.123456789Z"
+            ]
+        );
+        assert_eq!(
+            db.query_one("PRAGMA user_version", &[], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            Some(1)
+        );
+        let plan = db.query_all("EXPLAIN QUERY PLAN SELECT * FROM audit_logs WHERE timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp DESC", &[&timestamps[0], &timestamps[1]], |row| row.get::<_, String>(3)).unwrap();
+        assert!(plan
+            .iter()
+            .any(|step| step.contains("idx_audit_logs_timestamp")));
+        run_migrations(&db).unwrap();
+        assert_eq!(
+            db.query_all(
+                "SELECT timestamp FROM audit_logs ORDER BY timestamp",
+                &[],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            timestamps
+        );
+    }
+
+    #[test]
+    fn audit_timestamp_migration_keeps_invalid_history_and_rolls_back_updates() {
+        let db = temp_db();
+        run_migrations(&db).unwrap();
+        db.exec("PRAGMA user_version = 0;
+            INSERT INTO audit_logs (id, timestamp, tool_name) VALUES ('first', '2026-01-01T00:00:00Z', 'search'), ('invalid', 'garbage', 'search');").unwrap();
+        assert!(run_migrations(&db).unwrap_err().contains("invalid"));
+        assert_eq!(
+            db.query_one("PRAGMA user_version", &[], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            db.query_one(
+                "SELECT timestamp FROM audit_logs WHERE id = 'first'",
+                &[],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap()
+            .as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+        db.exec("UPDATE audit_logs SET timestamp = '2026-01-02T00:00:00Z' WHERE id = 'invalid';
+            CREATE TRIGGER reject_timestamp_update BEFORE UPDATE OF timestamp ON audit_logs WHEN NEW.id = 'invalid' BEGIN SELECT RAISE(ABORT, 'Test migration failure'); END;").unwrap();
+        assert!(run_migrations(&db).is_err());
+        assert_eq!(
+            db.query_one(
+                "SELECT timestamp FROM audit_logs WHERE id = 'first'",
+                &[],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap()
+            .as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            db.query_one("PRAGMA user_version", &[], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            Some(0)
+        );
     }
 
     #[test]

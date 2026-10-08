@@ -89,3 +89,44 @@ fn purge_expired(db: &Database) -> usize {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retention_zero_preserves_history_and_setting_changes_take_effect() {
+        let data_dir =
+            std::env::temp_dir().join(format!("moor-retention-{}", uuid::Uuid::new_v4()));
+        let state = crate::sidecar::http::AppState::for_test(&data_dir);
+        let repo = AuditLogRepository::new(&state.db);
+        for (id, timestamp) in [
+            ("old", "2000-01-01T00:00:00Z"),
+            ("recent", &chrono::Utc::now().to_rfc3339()),
+        ] {
+            repo.insert(
+                id, timestamp, None, None, "search", None, None, None, 1, None,
+            )
+            .unwrap();
+        }
+        crate::sidecar::services::settings::update_settings(
+            &state.db,
+            serde_json::json!({"advanced": {"logRetentionDays": 0}}),
+        )
+        .unwrap();
+        assert_eq!(purge_expired(&state.db), 0);
+        assert_eq!(repo.get_stats().unwrap().total_calls, 2);
+        crate::sidecar::services::settings::update_settings(
+            &state.db,
+            serde_json::json!({"advanced": {"logRetentionDays": 30}}),
+        )
+        .unwrap();
+        assert_eq!(purge_expired(&state.db), 1);
+        assert_eq!(
+            repo.query_logs(None, None, None, None, None, None).unwrap()[0].id,
+            "recent"
+        );
+        assert_eq!(purge_expired(&state.db), 0);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+}
