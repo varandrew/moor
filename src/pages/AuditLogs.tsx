@@ -132,22 +132,12 @@ function InsightsPanel({
     <div className="space-y-6">
       {/* Window selector + sort hint */}
       <div className="flex items-center justify-between gap-3 flex-wrap">
-        <div className="flex gap-1 bg-surface-300/60 rounded-xl p-1">
-          {WINDOW_OPTIONS.map((option) => (
-            <button
-              key={option.value}
-              onClick={() => onWindowChange(option.value)}
-              className={cn(
-                "font-headline text-xs px-3 py-1.5 rounded-lg transition-all",
-                insightsWindow === option.value
-                  ? "bg-surface-100 text-cursor-dark shadow-[0_1px_3px_rgba(0,0,0,0.06)]"
-                  : "text-[var(--fg-45)] hover:text-[var(--fg-70)]",
-              )}
-            >
-              {option.label}
-            </button>
-          ))}
-        </div>
+        <Tabs
+          value={insightsWindow}
+          onValueChange={(value) => onWindowChange(value as InsightsWindow)}
+          tabs={WINDOW_OPTIONS}
+          size="sm"
+        />
         {alertCount > 0 && (
           <Badge variant="error" className="text-[11px]">
             <AlertTriangle className="h-3 w-3 mr-1" />
