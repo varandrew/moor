@@ -368,7 +368,6 @@ pub fn run() {
             // Spawn axum server
             let host = host.to_string();
             let sm = server_manager.clone();
-            server_manager.spawn_health_checker();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = sidecar::http::start_server(app_state, &host, port).await {
                     eprintln!("HTTP server error: {e}");
@@ -378,6 +377,8 @@ pub fn run() {
             // Load servers and start auto-start servers
             let start_auto_start_servers = should_start_auto_start_servers_on_launch(&settings);
             tauri::async_runtime::spawn(async move {
+                // 探活任务必须在 Tokio 上下文中启动，Tauri 主线程没有运行时。
+                sm.spawn_health_checker();
                 sm.load_from_db().await;
                 if start_auto_start_servers {
                     sm.start_auto_start_servers().await;
