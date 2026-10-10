@@ -1,7 +1,8 @@
 # Cursor MCP Documentation
 
 > Source: https://cursor.com/docs/mcp
-> Accessed: 2026-08-29
+> Checked: 2026-10-08
+> Applicable version: Current official documentation; version-specific requirements are noted below.
 >
 > Note: This document is an external documentation mirror/reference. Copyright belongs to the original site; content may be outdated, please refer to the official link. Follow the original site's license when citing or redistributing.
 
@@ -64,6 +65,7 @@ Configure custom MCP servers with a JSON file:
 {
   "mcpServers": {
     "my-server": {
+      "type": "stdio",
       "type": "stdio",
       "command": "npx",
       "args": ["-y", "my-mcp-server"],
@@ -184,7 +186,7 @@ MCP configuration files can be placed in several locations:
 | **Project** | Shared with team (version control) | `.cursor/mcp.json` in project root |
 | **Global**  | Personal, all projects             | `~/.cursor/mcp.json`               |
 
-Both files are loaded and merged. Project-level configuration takes precedence.
+Both locations are documented. The current MCP reference does not explicitly establish same-name merge precedence; check the client when entries overlap.
 
 ### Config interpolation
 
@@ -279,3 +281,7 @@ For practical examples of MCP in action:
 - **Web Development guide** — Integrate Linear, Figma, and browser tools into your development workflow
 
 ## FAQ
+
+## Reference notes
+
+The official stdio field table requires `type`, while some examples omit it. Moor emits explicit `type: "stdio"`. Current installation entry points include Customize and Marketplace. Moor scans the user file; project configuration is imported by paste.

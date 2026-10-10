@@ -1,7 +1,8 @@
 # Kimi Code CLI Model Context Protocol (MCP)
 
 > Source: https://www.kimi.com/code/docs/en/kimi-code-cli/customization/mcp.html
-> Accessed: 2026-08-29
+> Checked: 2026-10-08
+> Applicable version: Current official documentation; version-specific requirements are noted below.
 >
 > Note: This document is an external documentation mirror/reference. Copyright belongs to the original site; content may be outdated, please refer to the official link. Follow the original site's license when citing or redistributing.
 
@@ -26,9 +27,9 @@ Entries with the same name: the project-level entry takes precedence and overrid
 
 Run `/mcp-config` in the TUI to interactively add, edit, or delete servers without manually editing the JSON file. Run `/mcp` to view the connection status of all current servers.
 
-Deleting a server from the configuration does not interrupt open sessions: the server stays listed in `/mcp` as `removed`, its tools remain visible there, and calls to them fail with a removal notice, while new sessions do not register the tools at all. Conversely, a server added mid-session — by editing `mcp.json` or installing a plugin — is not registered in already-open sessions; it only joins sessions created later.
+Deleting a server from the configuration does not interrupt open sessions: the server stays listed in `/mcp` as `removed`, its tools remain visible there, and calls to them fail with a removal notice, while new sessions do not register the tools at all. Servers added or enabled through plugins connect immediately in open sessions; inspect `/mcp` for their current state.
 
-When Kimi Code finds project-level MCP servers in an untrusted folder, it shows each server's transport and launch target in the workspace trust prompt. The prompt defaults to `Don't trust`; move to `Trust this folder` and confirm only after reviewing the listed command and arguments or remote URL. Trusting the folder enables the project-level MCP servers for that workspace.
+When Kimi Code finds project-level MCP servers in an untrusted folder, it shows each server's transport and launch target in the workspace trust prompt. The prompt defaults to `Trust this folder`; confirm only after reviewing the listed command and arguments or remote URL. Trusting the folder enables the project-level MCP servers for that workspace.
 
 Structure of `mcp.json`:
 
@@ -70,7 +71,7 @@ You do not have to set the connection timeout or the single tool-call timeout pe
 
 HTTP and SSE servers support providing static credentials via `headers` or `bearerTokenEnvVar`. When OAuth is needed, run `/mcp-config login <server-name>` to complete browser-based authorization.
 
-Plugins can also declare MCP servers in their manifest. Servers declared by a plugin are enabled by default and can be disabled or re-enabled in `/plugins`: disabling or removing stops the tools in open sessions — calls fail with a removal notice — while adding or enabling a server takes effect in new sessions or after `/reload`.
+Plugins can also declare MCP servers in their manifest. Servers declared by a plugin are enabled by default and can be disabled or re-enabled in `/plugins`: disabling or removing stops the tools in open sessions — calls fail with a removal notice — while adding or enabling a server connects it immediately in open sessions.
 
 > **Note**: stdio entries in a project-level `.kimi-code/mcp.json` execute local commands when a session starts. Only enable these in repositories you trust.
 
@@ -100,9 +101,15 @@ When connecting to external MCP servers, be aware of:
 - Verify that tool names and parameters look reasonable in approval requests
 - Keep manual approval for high-risk tools (file writes, command execution, etc.); avoid using `mcp__*` wildcards to allow all tools at once
 
-> **Note**: In YOLO mode, MCP tool calls are automatically approved. Only use this mode when you fully trust the MCP servers you have connected.
+> **Note**: In Ask When Needed mode, MCP tool calls are automatically approved. Only use this mode when you fully trust the MCP servers you have connected.
 
 ## Next steps
 
 - **Plugins** — Declare MCP servers in a plugin manifest to package and distribute them together
 - **Configuration files** — Full field reference for permission rules
+
+## Current version notes
+
+Reference release: https://github.com/MoonshotAI/kimi-code/releases/tag/%40moonshot-ai/kimi-code%402.1.1 (2.1.1, 2026-09-24).
+
+`deferred: true` enables experimental deferred tool loading. Adding or enabling plugin MCP servers connects them immediately in open sessions. The workspace trust default is Trust this folder. Headers remain static; use `bearerTokenEnvVar` for bearer credentials from the environment. Moor does not preserve deferred loading or client permission rules when converting.

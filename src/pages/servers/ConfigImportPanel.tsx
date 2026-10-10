@@ -1,3 +1,5 @@
+import { ErrorBanner } from "@/components/shared/ErrorBanner";
+import { useTranslation } from "@/contexts/LocaleContext";
 import { lazy, Suspense } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -34,6 +36,7 @@ export function ConfigImportPanel({
   showJsonImport,
   onCloseJsonImport,
 }: ConfigImportPanelProps) {
+  const { t, text } = useTranslation();
   const {
     scanCandidates,
     selectedImports,
@@ -61,7 +64,7 @@ export function ConfigImportPanel({
         <Card className="animate-scale-in border-[var(--fg-08)]">
           <CardHeader className="pb-3">
             <div className="flex items-center justify-between">
-              <CardTitle className="text-base">Import MCP JSON</CardTitle>
+              <CardTitle className="text-base">{t("Import MCP JSON")}</CardTitle>
               <Button
                 variant="ghost"
                 size="icon"
@@ -85,7 +88,7 @@ export function ConfigImportPanel({
                 disabled={!jsonImport.trim()}
               >
                 <WandSparkles className="h-3.5 w-3.5 mr-2" />
-                Format JSON
+                {t("Format JSON")}
               </Button>
             </div>
             <Suspense
@@ -114,27 +117,25 @@ export function ConfigImportPanel({
                 ) : (
                   <Check className="h-4 w-4 text-success-muted" />
                 )}
-                <p className="font-body text-xs text-[var(--fg-55)]">{jsonImportStatus}</p>
+                <p className="font-body text-xs text-[var(--fg-55)]">{text(jsonImportStatus)}</p>
               </div>
             )}
             {jsonImportErrors.length > 0 && (
               <div className="rounded-lg border border-error-warm/20 bg-error-warm/8 px-3 py-2">
                 {jsonImportErrors.map((error) => (
-                  <p key={error} className="font-body text-xs text-error-warm">
-                    {error}
-                  </p>
+                  <ErrorBanner key={error} message={error} />
                 ))}
               </div>
             )}
             <div className="flex justify-end gap-2">
               <Button variant="outline" onClick={onCloseJsonImport}>
-                Cancel
+                {t("Cancel")}
               </Button>
               <Button
                 onClick={() => void parseJson()}
                 disabled={!jsonImport.trim() || jsonImportDiagnostics.length > 0}
               >
-                Preview Import
+                {t("Preview Import")}
               </Button>
             </div>
           </CardContent>
@@ -146,7 +147,7 @@ export function ConfigImportPanel({
         <Card className="animate-scale-in">
           <CardHeader className="pb-3">
             <div className="flex items-center justify-between">
-              <CardTitle className="text-base">Config Import</CardTitle>
+              <CardTitle className="text-base">{t("Config Import")}</CardTitle>
               <Button
                 variant="ghost"
                 size="icon"
@@ -161,31 +162,38 @@ export function ConfigImportPanel({
             {scanStatus && (
               <div className="flex items-center gap-2 py-2">
                 <Check className="h-4 w-4 text-success-muted" />
-                <p className="font-body text-sm text-[var(--fg-55)]">{scanStatus}</p>
+                <div className="font-body text-sm text-[var(--fg-55)]">
+                  {typeof scanStatus === "string" ? (
+                    <ErrorBanner message={scanStatus} />
+                  ) : (
+                    t(scanStatus.key, scanStatus.params)
+                  )}
+                </div>
               </div>
             )}
             {hasStaticAuthorizationHeader && (
               <div className="flex items-start gap-2 rounded-lg border border-gold/20 bg-gold/8 px-3 py-2">
                 <AlertTriangle className="h-4 w-4 text-gold shrink-0 mt-0.5" />
                 <p className="font-body text-xs leading-relaxed text-[var(--fg-55)]">
-                  Static Authorization headers are stored in Moor's local SQLite database. Prefer{" "}
-                  <code className="font-mono">{"{env:VAR_NAME}"}</code> when possible.
+                  {t(
+                    "Static Authorization headers are stored in Moor's local SQLite database. Prefer",
+                  )}{" "}
+                  <code className="font-mono">{"{env:VAR_NAME}"}</code>
+                  {t("when possible.")}
                 </p>
               </div>
             )}
             {importPreview && importPreview.errors.length > 0 && (
               <div className="rounded-lg border border-error-warm/20 bg-error-warm/8 px-3 py-2">
                 {importPreview.errors.map((error) => (
-                  <p key={error} className="font-body text-xs text-error-warm">
-                    {error}
-                  </p>
+                  <ErrorBanner key={error} message={error} />
                 ))}
               </div>
             )}
             {importPreview && importPreview.unsupported.length > 0 && (
               <div className="rounded-lg border border-[var(--fg-08)] bg-surface-300/40 px-3 py-2">
                 <p className="font-headline text-xs text-[var(--fg-55)] mb-1.5">
-                  Unsupported ({importPreview.unsupported.length})
+                  {t("Unsupported ({count})", { count: importPreview.unsupported.length })}
                 </p>
                 <div className="space-y-1">
                   {importPreview.unsupported.map((server) => (
@@ -203,8 +211,9 @@ export function ConfigImportPanel({
             {importPreview && importPreview.duplicates.length > 0 && (
               <div className="rounded-lg border border-[var(--fg-08)] bg-surface-300/30 px-3 py-2">
                 <p className="font-body text-xs text-[var(--fg-48)]">
-                  Skipping {importPreview.duplicates.length} duplicate server
-                  {importPreview.duplicates.length > 1 ? "s" : ""} by name.
+                  {t("Skipping {count} duplicate servers by name.", {
+                    count: importPreview.duplicates.length,
+                  })}
                 </p>
               </div>
             )}
@@ -233,7 +242,7 @@ export function ConfigImportPanel({
                   onClick={() => void executeImport()}
                   disabled={selectedImports.size === 0 || importPending}
                 >
-                  Import Selected ({selectedImports.size})
+                  {t("Import Selected ({count})", { count: selectedImports.size })}
                 </Button>
               </div>
             )}

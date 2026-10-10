@@ -4,6 +4,7 @@ import { Toaster } from "sonner";
 import { AppShell } from "@/components/layout/AppShell";
 import { ErrorBoundary } from "@/components/shared/ErrorBoundary";
 import { PageLoading } from "@/components/shared/PageLoading";
+import { useTranslation } from "@/contexts/LocaleContext";
 
 const Dashboard = lazy(() =>
   import("@/pages/Dashboard").then((module) => ({ default: module.Dashboard })),
@@ -37,23 +38,32 @@ function page(element: ReactNode) {
   return <Suspense fallback={<PageLoading message="Loading page..." />}>{element}</Suspense>;
 }
 
+function LocaleToaster() {
+  const { t } = useTranslation();
+  return (
+    <Toaster
+      position="top-right"
+      closeButton
+      containerAriaLabel={t("Notifications")}
+      toastOptions={{
+        closeButtonAriaLabel: t("Close notification"),
+        classNames: {
+          toast: "font-headline rounded-lg",
+          title: "text-sm font-medium",
+          description: "text-xs text-[var(--fg-55)]",
+          closeButton:
+            "!top-2 !right-2 !left-auto !rounded-lg !border-0 !bg-transparent !text-[var(--fg-40)] hover:!bg-[var(--fg-08)] hover:!text-cursor-dark",
+        },
+      }}
+    />
+  );
+}
+
 const router = createBrowserRouter([
   {
     element: (
       <>
-        <Toaster
-          position="top-right"
-          closeButton
-          toastOptions={{
-            classNames: {
-              toast: "font-headline rounded-lg",
-              title: "text-sm font-medium",
-              description: "text-xs text-[var(--fg-55)]",
-              closeButton:
-                "!top-2 !right-2 !left-auto !rounded-lg !border-0 !bg-transparent !text-[var(--fg-40)] hover:!bg-[var(--fg-08)] hover:!text-cursor-dark",
-            },
-          }}
-        />
+        <LocaleToaster />
         <ErrorBoundary>
           <AppShell />
         </ErrorBoundary>

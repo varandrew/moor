@@ -84,7 +84,7 @@ pub const ALL_CLIENTS: &[ClientMeta] = &[
         format: "yaml",
         top_level_key: "insert",
         gateway_entry_name: "moor-mcp",
-        description: "Append to ~/.dsh/cordis.patch.yml (dsh-mcp-client plugin rows)",
+        description: "Append to ~/.dsh/cordis.patch.yml (export only; YAML import is unsupported)",
     },
     ClientMeta {
         id: "grok-build",
@@ -95,8 +95,7 @@ pub const ALL_CLIENTS: &[ClientMeta] = &[
         gateway_entry_name: "moor",
         description: "Add to ~/.grok/config.toml or project .grok/config.toml (or: grok mcp add --transport http moor <url>)",
     },
-    // Pi's MCP support comes from the community pi-mcp-adapter package — the
-    // adapter must be installed first (pi install npm:pi-mcp-adapter).
+    // Pi 原生 MCP 与项目配置共用 mcpServers 结构。
     ClientMeta {
         id: "pi",
         name: "Pi",
@@ -104,7 +103,25 @@ pub const ALL_CLIENTS: &[ClientMeta] = &[
         format: "json",
         top_level_key: "mcpServers",
         gateway_entry_name: "moor",
-        description: "Add to ~/.pi/agent/mcp.json (requires: pi install npm:pi-mcp-adapter)",
+        description: "Add to ~/.pi/agent/mcp.json or project .pi/mcp.json (native MCP)",
+    },
+    ClientMeta {
+        id: "zcode",
+        name: "ZCode",
+        config_path_segments: &[&[".zcode", "cli", "config.json"], &[".agents", "mcp.json"]],
+        format: "json",
+        top_level_key: "mcp.servers",
+        gateway_entry_name: "moor",
+        description: "Add to ~/.zcode/cli/config.json → mcp.servers or project .zcode/config.json",
+    },
+    ClientMeta {
+        id: "minimax-code",
+        name: "MiniMax Code",
+        config_path_segments: &[&[".minimax", "mcp.json"]],
+        format: "json",
+        top_level_key: "mcpServers",
+        gateway_entry_name: "moor",
+        description: "Add to ~/.minimax/mcp.json or paste the project .mcp.json configuration",
     },
     // claude_desktop_config.json accepts stdio servers only — the formatter
     // bridges HTTP through `npx mcp-remote`. Windows uses %APPDATA%\Claude,

@@ -1,3 +1,4 @@
+import { useTranslation } from "@/contexts/LocaleContext";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -39,6 +40,7 @@ const profileAccents = [
 ];
 
 export function Profiles() {
+  const { t } = useTranslation();
   const { profiles, createProfile, activateProfile, deleteProfile, cloneProfile } = useProfiles();
   const [newName, setNewName] = useState("");
   const [templateId, setTemplateId] = useState("");
@@ -71,12 +73,13 @@ export function Profiles() {
   return (
     <div className="space-y-8 animate-fade-in-up">
       <PageHeader
-        title="Profiles"
-        subtitle="Manage server groupings and tool visibility"
+        title={t("Profiles")}
+        subtitle={t("Manage server groupings and tool visibility")}
         action={
           !creating && (
             <Button onClick={() => setCreating(true)}>
-              <Plus className="h-4 w-4 mr-2" /> New Profile
+              <Plus className="h-4 w-4 mr-2" />
+              {t("New Profile")}
             </Button>
           )
         }
@@ -87,7 +90,7 @@ export function Profiles() {
         <Card className="animate-scale-in border-cursor-orange/20">
           <CardContent className="p-4 flex items-center gap-3 flex-wrap">
             <Input
-              placeholder="Profile name"
+              placeholder={t("Profile name")}
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleCreate()}
@@ -96,22 +99,22 @@ export function Profiles() {
             />
             <Select value={templateId} onValueChange={setTemplateId}>
               <SelectTrigger className="w-[220px]">
-                <SelectValue placeholder="Start from scratch" />
+                <SelectValue placeholder={t("Start from scratch")} />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="none">Start from scratch</SelectItem>
+                <SelectItem value="none">{t("Start from scratch")}</SelectItem>
                 {profiles.map((profile) => (
                   <SelectItem key={profile.id} value={profile.id}>
-                    Copy of {profile.name}
+                    {t("Copy of {name}", { name: profile.name })}
                   </SelectItem>
                 ))}
               </SelectContent>
             </Select>
             <Button onClick={handleCreate} disabled={!newName.trim()}>
-              Create
+              {t("Create")}
             </Button>
             <Button variant="outline" onClick={resetForm}>
-              Cancel
+              {t("Cancel")}
             </Button>
           </CardContent>
         </Card>
@@ -149,7 +152,7 @@ export function Profiles() {
                 </div>
                 <h3 className="font-headline text-base text-cursor-dark mb-1">{profile.name}</h3>
                 <p className="font-body text-xs text-[var(--fg-45)] mb-5">
-                  {profile.isActive ? "Currently active" : "Click to manage"}
+                  {t(profile.isActive ? "Currently active" : "Click to manage")}
                 </p>
                 <div className="flex items-center gap-2 pt-4 border-t border-[var(--fg-06)]">
                   <span
@@ -159,7 +162,7 @@ export function Profiles() {
                     )}
                   />
                   <span className="font-body text-xs text-[var(--fg-40)]">
-                    {profile.serverCount ?? 0} servers
+                    {t("{count} servers", { count: profile.serverCount ?? 0 })}
                   </span>
                 </div>
                 {/* Actions overlay */}
@@ -179,7 +182,7 @@ export function Profiles() {
                           activateProfile(profile.id);
                         }}
                       >
-                        Activate
+                        {t("Activate")}
                       </Button>
                       <Button
                         variant="ghost"
@@ -214,9 +217,11 @@ export function Profiles() {
             <Plus className="h-5 w-5" />
           </div>
           <h3 className="font-headline text-sm font-medium text-cursor-dark group-hover:text-cursor-orange transition-colors">
-            New Profile
+            {t("New Profile")}
           </h3>
-          <p className="font-body text-xs text-[var(--fg-40)] mt-1">Create a server grouping</p>
+          <p className="font-body text-xs text-[var(--fg-40)] mt-1">
+            {t("Create a server grouping")}
+          </p>
         </button>
       </div>
     </div>

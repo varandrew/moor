@@ -1,3 +1,4 @@
+import { useTranslation } from "@/contexts/LocaleContext";
 import { cn } from "@/lib/utils";
 
 interface TabsProps {
@@ -9,6 +10,7 @@ interface TabsProps {
 }
 
 export function Tabs({ value, onValueChange, tabs, className, size = "default" }: TabsProps) {
+  const { text } = useTranslation();
   return (
     <div className={cn("flex gap-1 bg-surface-300/60 rounded-xl p-1 w-fit", className)}>
       {tabs.map((tab) => (
@@ -23,7 +25,7 @@ export function Tabs({ value, onValueChange, tabs, className, size = "default" }
               : "text-[var(--fg-45)] hover:text-[var(--fg-70)]",
           )}
         >
-          {tab.label}
+          {text(tab.label)}
         </button>
       ))}
     </div>

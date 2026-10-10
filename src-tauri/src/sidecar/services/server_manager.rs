@@ -1,11 +1,13 @@
 // Server Runtime 聚合根:registry + 启停状态机 + 会话监护 + 工具刷新。
 // 域内自包含块分域:status(状态类型)/ session(连接 seam)/ errors(脱敏)。
 mod errors;
+mod health;
 mod session;
 mod status;
 
 use errors::format_timeout_ms;
 pub use errors::public_server_start_error_message;
+pub use health::{HealthCheckError, HealthState, ServerHealthSnapshot};
 use session::StdioHttpConnector;
 pub use session::{McpConnector, McpSession};
 use status::ServerStatus;
@@ -33,6 +35,7 @@ struct ServerSlot {
     start_deadline: Option<Instant>,
     start_timeout_ms: Option<u32>,
     session: Option<Arc<Mutex<Box<dyn McpSession>>>>,
+    health: HealthState,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +101,7 @@ impl ServerManager {
                     start_deadline: None,
                     start_timeout_ms: None,
                     session: None,
+                    health: HealthState::default(),
                 },
             );
         }
@@ -124,6 +128,7 @@ impl ServerManager {
                 start_deadline: None,
                 start_timeout_ms: None,
                 session: None,
+                health: HealthState::default(),
             },
         );
         managed
@@ -183,6 +188,7 @@ impl ServerManager {
                 ),
                 _ => {
                     slot.status = ServerStatus::Starting;
+                    slot.health = HealthState::default();
                     slot.start_token = slot.start_token.wrapping_add(1);
                     let wait_deadline = Instant::now()
                         + Duration::from_millis(timeouts.start_ms as u64)
@@ -1361,11 +1367,35 @@ process.stdin.on("data", (chunk) => {{
 
     /// 假会话:记录调用,不做任何 I/O。
     struct FakeSession {
+        ping_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         timeout_calls: Arc<std::sync::atomic::AtomicU32>,
         disconnected: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl McpSession for FakeSession {
+        fn ping(
+            &self,
+            _timeout: Duration,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            (),
+                            crate::sidecar::mcp::transport::request_error::RequestError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                if let Some((started, finish)) = &self.ping_gate {
+                    started.notify_one();
+                    finish.notified().await;
+                }
+                Ok(())
+            })
+        }
+
         fn list_tools(
             &self,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<ToolInsert>, String>> + Send + '_>> {
@@ -1428,6 +1458,7 @@ process.stdin.on("data", (chunk) => {{
                 Ok((
                     vec![],
                     Box::new(FakeSession {
+                        ping_gate: None,
                         timeout_calls,
                         disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     }) as Box<dyn McpSession>,
@@ -1452,6 +1483,99 @@ process.stdin.on("data", (chunk) => {{
             connector,
         ));
         (db, manager)
+    }
+
+    #[tokio::test]
+    async fn busy_probe_does_not_count_failure_or_change_lifecycle() {
+        let data_dir = temp_data_dir("health-busy");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let (connector, _) = FakeConnector::new();
+        let (db, manager) = build_manager_with_fake_connector(&data_dir, Arc::new(connector));
+        let id = uuid::Uuid::new_v4().to_string();
+        insert_stdio_server(&db, &id, "health", "unused".into(), false, 0);
+        manager.load_from_db().await;
+        manager.start_server(&id).await.unwrap();
+        let session = manager
+            .slots
+            .lock()
+            .await
+            .get(&id)
+            .unwrap()
+            .session
+            .clone()
+            .unwrap();
+        let guard = session.lock().await;
+        assert!(matches!(
+            manager.check_health(&id, false).await,
+            Err(HealthCheckError::Busy)
+        ));
+        assert_eq!(
+            manager.health_snapshots().await[0]
+                .health
+                .consecutive_failures,
+            0
+        );
+        drop(guard);
+        assert_eq!(
+            manager.check_health(&id, true).await.unwrap().health.status,
+            health::HealthStatus::Healthy
+        );
+        assert_eq!(manager.get_server(&id).await.unwrap().status, "running");
+        manager.stop_server(&id).await.unwrap();
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn stopped_server_discards_in_flight_probe_result() {
+        let data_dir = temp_data_dir("health-stale");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let (connector, _) = FakeConnector::new();
+        let (db, manager) = build_manager_with_fake_connector(&data_dir, Arc::new(connector));
+        let id = uuid::Uuid::new_v4().to_string();
+        insert_stdio_server(&db, &id, "health", "unused".into(), false, 0);
+        manager.load_from_db().await;
+        manager.start_server(&id).await.unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let session = manager
+            .slots
+            .lock()
+            .await
+            .get(&id)
+            .unwrap()
+            .session
+            .clone()
+            .unwrap();
+        *session.lock().await = Box::new(FakeSession {
+            ping_gate: Some((started.clone(), finish.clone())),
+            timeout_calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        });
+        let task_manager = manager.clone();
+        let task_id = id.clone();
+        let probe = tokio::spawn(async move { task_manager.check_health(&task_id, true).await });
+        started.notified().await;
+        let task_manager = manager.clone();
+        let task_id = id.clone();
+        let stop = tokio::spawn(async move { task_manager.stop_server(&task_id).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while manager.get_server(&id).await.unwrap().status != "stopped" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stop should update lifecycle before waiting for the probe");
+        finish.notify_one();
+        assert!(matches!(
+            probe.await.unwrap(),
+            Err(HealthCheckError::Changed)
+        ));
+        stop.await.unwrap().unwrap();
+        assert_eq!(
+            manager.health_snapshots().await[0].health.status,
+            health::HealthStatus::Unknown
+        );
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]

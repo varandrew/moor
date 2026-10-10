@@ -1,3 +1,4 @@
+import { useTranslation } from "@/contexts/LocaleContext";
 import { useState, Fragment, useMemo, useEffect } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -9,6 +10,7 @@ import { Tabs } from "@/components/ui/tabs";
 import { useLogs, useLogInsights } from "@/hooks/useLogs";
 import { useProfiles } from "@/hooks/useProfiles";
 import { logKeys } from "@/lib/query-keys";
+import { ErrorBanner } from "@/components/shared/ErrorBanner";
 import { StatCard } from "@/components/shared/StatCard";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { PageHeader } from "@/components/shared/PageHeader";
@@ -50,6 +52,7 @@ const WINDOW_OPTIONS: Array<{ value: InsightsWindow; label: string }> = [
 ];
 
 export function AuditLogs() {
+  const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [tab, setTab] = useState("insights");
   const [insightsWindow, setInsightsWindow] = useState<InsightsWindow>("7d");
@@ -67,11 +70,12 @@ export function AuditLogs() {
   return (
     <div className="space-y-8 animate-fade-in-up">
       <PageHeader
-        title="Insights"
-        subtitle="Tool call health and governance signals"
+        title={t("Insights")}
+        subtitle={t("Tool call health and governance signals")}
         action={
           <Button variant="outline" onClick={handleRefresh}>
-            <RefreshCw className="h-4 w-4 mr-2" /> Refresh
+            <RefreshCw className="h-4 w-4 mr-2" />
+            {t("Refresh")}
           </Button>
         }
       />
@@ -80,8 +84,8 @@ export function AuditLogs() {
         value={tab}
         onValueChange={setTab}
         tabs={[
-          { value: "insights", label: "Insights" },
-          { value: "entries", label: "Log Entries" },
+          { value: "insights", label: t("Insights") },
+          { value: "entries", label: t("Log Entries") },
         ]}
       />
 
@@ -113,6 +117,7 @@ function InsightsPanel({
   window: InsightsWindow;
   onWindowChange: (window: InsightsWindow) => void;
 }) {
+  const { t } = useTranslation();
   const [sortKey, setSortKey] = useState<ToolSortKey>("calls");
   const navigate = useNavigate();
   const { profiles } = useProfiles();
@@ -141,7 +146,7 @@ function InsightsPanel({
         {alertCount > 0 && (
           <Badge variant="error" className="text-[11px]">
             <AlertTriangle className="h-3 w-3 mr-1" />
-            {alertCount} tools need attention
+            {t("{count} tools need attention", { count: alertCount })}
           </Badge>
         )}
       </div>
@@ -150,7 +155,7 @@ function InsightsPanel({
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard
           icon={Activity}
-          label="Calls"
+          label={t("Calls")}
           value={insights.totalCalls.toString()}
           accent="bg-[var(--fg-06)] text-[var(--fg-50)] border-[var(--fg-10)]"
           delay={1}
@@ -158,7 +163,7 @@ function InsightsPanel({
         />
         <StatCard
           icon={Zap}
-          label="Error Rate"
+          label={t("Error Rate")}
           value={formatRate(insights.errorRate)}
           accent={
             insights.errorRate > 0.1
@@ -170,7 +175,7 @@ function InsightsPanel({
         />
         <StatCard
           icon={Clock}
-          label="Avg Duration"
+          label={t("Avg Duration")}
           value={formatMs(insights.avgDurationMs)}
           accent="bg-read/10 text-read border-read/15"
           delay={3}
@@ -178,7 +183,7 @@ function InsightsPanel({
         />
         <StatCard
           icon={BarChart3}
-          label="Tools Seen"
+          label={t("Tools Seen")}
           value={insights.tools.length.toString()}
           accent="bg-grep/10 text-grep border-grep/20"
           delay={4}
@@ -190,22 +195,27 @@ function InsightsPanel({
       <Card>
         <CardHeader className="pb-3">
           <CardTitle className="text-base flex items-center gap-2">
-            <SlidersHorizontal className="h-4 w-4 text-[var(--fg-40)]" /> Tool Health
+            <SlidersHorizontal className="h-4 w-4 text-[var(--fg-40)]" />
+            {t("Tool Health")}
           </CardTitle>
           <p className="font-body text-xs text-[var(--fg-45)]">
-            Red = error rate ≥ {formatRate(ERROR_RATE_ALERT)} (≥5 calls) · amber = p95 ≥{" "}
-            {formatMs(SLOW_P95_MS)}
+            {t("Red = error rate ≥ {rate} (≥5 calls) · amber = p95 ≥ {duration}", {
+              rate: formatRate(ERROR_RATE_ALERT),
+              duration: formatMs(SLOW_P95_MS),
+            })}
           </p>
         </CardHeader>
         <CardContent>
           {loading && insights.tools.length === 0 ? (
-            <EmptyState icon={BarChart3} message="Loading insights..." />
+            <EmptyState icon={BarChart3} message={t("Loading insights...")} />
           ) : error != null ? (
-            <EmptyState icon={AlertTriangle} message={`Failed to load insights: ${error}`} />
+            <ErrorBanner message={`Failed to load insights.\n${String(error)}`} />
           ) : insights.tools.length === 0 ? (
             <EmptyState
               icon={BarChart3}
-              message="No tool calls in this window — insights appear once agents start calling tools"
+              message={t(
+                "No tool calls in this window — insights appear once agents start calling tools",
+              )}
             />
           ) : (
             <ScrollArea className="max-h-[520px]">
@@ -213,18 +223,18 @@ function InsightsPanel({
                 <thead>
                   <tr className="border-b border-[var(--fg-08)]">
                     <th className="text-left font-headline text-[11px] text-[var(--fg-45)] uppercase tracking-wider px-4 py-2.5 font-medium">
-                      Tool
+                      {t("Tool")}
                     </th>
                     <th className="text-left font-headline text-[11px] text-[var(--fg-45)] uppercase tracking-wider px-4 py-2.5 font-medium">
-                      Server
+                      {t("Server")}
                     </th>
                     <SortHeader
-                      label="Calls"
+                      label={t("Calls")}
                       active={sortKey === "calls"}
                       onClick={() => setSortKey("calls")}
                     />
                     <SortHeader
-                      label="Errors"
+                      label={t("Errors")}
                       active={sortKey === "errors"}
                       onClick={() => setSortKey("errors")}
                     />
@@ -235,7 +245,7 @@ function InsightsPanel({
                       onClick={() => setSortKey("p95")}
                     />
                     <th className="text-left font-headline text-[11px] text-[var(--fg-45)] uppercase tracking-wider px-4 py-2.5 font-medium">
-                      Last Called
+                      {t("Last Called")}
                     </th>
                     <th className="px-4" />
                   </tr>
@@ -303,7 +313,7 @@ function InsightsPanel({
                               className="h-7 text-xs"
                               onClick={() => jumpToTool(tool)}
                             >
-                              Manage
+                              {t("Manage")}
                             </Button>
                           )}
                         </td>
@@ -322,7 +332,8 @@ function InsightsPanel({
         <Card>
           <CardHeader className="pb-3">
             <CardTitle className="text-base flex items-center gap-2">
-              <Server className="h-4 w-4 text-[var(--fg-40)]" /> Servers
+              <Server className="h-4 w-4 text-[var(--fg-40)]" />
+              {t("Servers")}
             </CardTitle>
           </CardHeader>
           <CardContent>
@@ -337,7 +348,10 @@ function InsightsPanel({
                       {server.serverName ?? server.serverId}
                     </p>
                     <p className="font-mono text-[10px] text-[var(--fg-40)]">
-                      {server.callCount} calls · {formatMs(server.avgDurationMs)} avg
+                      {t("{count} calls · {duration} avg", {
+                        count: server.callCount,
+                        duration: formatMs(server.avgDurationMs),
+                      })}
                     </p>
                   </div>
                   <Badge
@@ -400,6 +414,7 @@ function sortTools(tools: ToolInsight[], key: ToolSortKey): ToolInsight[] {
 }
 
 function LogEntriesPanel() {
+  const { t } = useTranslation();
   const [toolFilter, setToolFilter] = useState("");
   const [debouncedToolFilter, setDebouncedToolFilter] = useState("");
   const [expandedLog, setExpandedLog] = useState<string | null>(null);
@@ -416,7 +431,7 @@ function LogEntriesPanel() {
         <div className="relative flex-1 max-w-xs">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-[var(--fg-30)]" />
           <Input
-            placeholder="Filter by tool name..."
+            placeholder={t("Filter by tool name...")}
             value={toolFilter}
             onChange={(e) => setToolFilter(e.target.value)}
             className="pl-9"
@@ -424,7 +439,7 @@ function LogEntriesPanel() {
         </div>
         {toolFilter && (
           <Button variant="ghost" size="sm" onClick={() => setToolFilter("")}>
-            Clear
+            {t("Clear")}
           </Button>
         )}
       </div>
@@ -435,19 +450,19 @@ function LogEntriesPanel() {
             <thead>
               <tr className="border-b border-[var(--fg-08)]">
                 <th className="text-left font-headline text-[11px] text-[var(--fg-45)] uppercase tracking-wider px-4 py-2.5 font-medium">
-                  Time
+                  {t("Time")}
                 </th>
                 <th className="text-left font-headline text-[11px] text-[var(--fg-45)] uppercase tracking-wider px-4 py-2.5 font-medium">
-                  Tool
+                  {t("Tool")}
                 </th>
                 <th className="text-left font-headline text-[11px] text-[var(--fg-45)] uppercase tracking-wider px-4 py-2.5 font-medium">
-                  Status
+                  {t("Status")}
                 </th>
                 <th className="text-left font-headline text-[11px] text-[var(--fg-45)] uppercase tracking-wider px-4 py-2.5 font-medium">
-                  Duration
+                  {t("Duration")}
                 </th>
                 <th className="text-left font-headline text-[11px] text-[var(--fg-45)] uppercase tracking-wider px-4 py-2.5 font-medium">
-                  Agent
+                  {t("Agent")}
                 </th>
                 <th className="w-10 px-2" />
               </tr>
@@ -456,7 +471,7 @@ function LogEntriesPanel() {
               {logs.length === 0 ? (
                 <tr>
                   <td colSpan={6} className="p-0">
-                    <EmptyState icon={Clock} message="No log entries" />
+                    <EmptyState icon={Clock} message={t("No log entries")} />
                   </td>
                 </tr>
               ) : (
@@ -474,7 +489,7 @@ function LogEntriesPanel() {
                       </td>
                       <td className="px-4 py-2.5">
                         <Badge variant={log.error ? "error" : "success"} className="text-[10px]">
-                          {log.error ? "Error" : "Success"}
+                          {log.error ? t("Error") : t("Success")}
                         </Badge>
                       </td>
                       <td className="px-4 py-2.5 font-mono text-[11px] text-[var(--fg-45)]">
@@ -498,7 +513,7 @@ function LogEntriesPanel() {
                             {log.arguments != null && (
                               <div>
                                 <p className="font-headline text-[11px] text-[var(--fg-50)] mb-1.5 uppercase tracking-wider">
-                                  Arguments
+                                  {t("Arguments")}
                                 </p>
                                 <pre className="font-mono text-[11px] bg-surface-100 rounded-xl p-3 text-[var(--fg-70)] overflow-auto max-h-40 border border-[var(--fg-06)]">
                                   {JSON.stringify(log.arguments, null, 2)}
@@ -508,7 +523,7 @@ function LogEntriesPanel() {
                             {(log.result || log.error) && (
                               <div>
                                 <p className="font-headline text-[11px] text-[var(--fg-50)] mb-1.5 uppercase tracking-wider">
-                                  {log.error ? "Error" : "Result"}
+                                  {log.error ? t("Error") : t("Result")}
                                 </p>
                                 <pre
                                   className={cn(

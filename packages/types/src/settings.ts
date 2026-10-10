@@ -1,4 +1,5 @@
 export type ThemeMode = "light" | "dark" | "system";
+export type LocalePreference = "system" | "zh-CN" | "en";
 
 export const MCP_TIMEOUT_MS_MIN = 5_000;
 export const MCP_TIMEOUT_MS_MAX = 300_000;
@@ -18,6 +19,7 @@ export interface GeneralSettings {
 
 export interface AppearanceSettings {
   theme: ThemeMode;
+  locale: LocalePreference;
 }
 
 export interface AdvancedSettings {
@@ -28,6 +30,8 @@ export interface AdvancedSettings {
   mcpRequestTimeoutMs: number;
   mcpServerStartTimeoutMs: number;
   mcpSessionIdleTtlMs: number;
+  mcpHealthChecksEnabled: boolean;
+  mcpHealthCheckIntervalSeconds: number;
 }
 
 export interface Settings {
@@ -55,7 +59,7 @@ export function createDefaultSettings(): Settings {
       hideDockIconOnClose: false,
       showWindowOnLaunch: true,
     },
-    appearance: { theme: "system" },
+    appearance: { theme: "system", locale: "system" },
     advanced: {
       logRetentionDays: 30,
       enableAuditLogging: true,
@@ -64,6 +68,8 @@ export function createDefaultSettings(): Settings {
       mcpRequestTimeoutMs: MCP_TIMEOUT_MS_DEFAULT,
       mcpServerStartTimeoutMs: MCP_TIMEOUT_MS_DEFAULT,
       mcpSessionIdleTtlMs: MCP_SESSION_IDLE_TTL_MS_DEFAULT,
+      mcpHealthChecksEnabled: false,
+      mcpHealthCheckIntervalSeconds: 60,
     },
   };
 }

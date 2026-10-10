@@ -1,3 +1,4 @@
+import { useTranslation } from "@/contexts/LocaleContext";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
 
@@ -10,11 +11,12 @@ const statusConfig = {
 };
 
 export function StatusBadge({ status }: { status: string }) {
+  const { text } = useTranslation();
   const config = statusConfig[status as keyof typeof statusConfig] || statusConfig.stopped;
   return (
     <Badge variant={config.variant}>
       <span className={cn("h-1.5 w-1.5 rounded-full mr-1.5", config.dot)} />
-      {config.label}
+      {text(config.label)}
     </Badge>
   );
 }

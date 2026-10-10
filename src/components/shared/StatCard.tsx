@@ -1,3 +1,4 @@
+import { useTranslation } from "@/contexts/LocaleContext";
 import { Card, CardContent } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 
@@ -11,6 +12,7 @@ interface StatCardProps {
 }
 
 export function StatCard({ icon: Icon, label, value, accent, delay, compact }: StatCardProps) {
+  const { text } = useTranslation();
   return (
     <Card
       className={cn(
@@ -42,7 +44,7 @@ export function StatCard({ icon: Icon, label, value, accent, delay, compact }: S
           {value}
         </p>
         <p className={cn("font-body text-[var(--fg-45)] mt-1.5", compact ? "text-xs" : "text-sm")}>
-          {label}
+          {text(label)}
         </p>
       </CardContent>
     </Card>

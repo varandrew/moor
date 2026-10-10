@@ -1,3 +1,4 @@
+use super::request_error::RequestError;
 use crate::sidecar::db::tool_discovery_repo::ToolInsert;
 use crate::sidecar::mcp::transport::http_client::HttpClientTransport;
 use crate::sidecar::mcp::transport::stdio_client::StdioClientTransport;
@@ -34,6 +35,29 @@ pub struct HttpConnectConfig {
 }
 
 impl McpClient {
+    pub async fn ping(&self, timeout: Duration) -> Result<(), RequestError> {
+        let result = match &self.transport {
+            McpTransport::Stdio(transport) => {
+                transport
+                    .send_request_with_timeout("ping", None, timeout)
+                    .await?
+            }
+            McpTransport::Http(transport) => {
+                transport
+                    .send_request_with_timeout(
+                        chrono::Utc::now().timestamp_millis(),
+                        "ping",
+                        None,
+                        timeout,
+                    )
+                    .await?
+            }
+        };
+        if !result.is_object() {
+            return Err("Invalid MCP ping response".into());
+        }
+        Ok(())
+    }
     pub async fn connect_stdio(config: StdioConnectConfig) -> Result<Self, String> {
         let transport = StdioClientTransport::spawn(
             &config.command,
@@ -186,6 +210,13 @@ fn parse_tools_list(result: &Value) -> Vec<ToolInsert> {
 /// 连接工厂(StdioHttpConnector)负责构造 McpClient;之后 ServerManager
 /// 只通过 trait 接口与它交互,不再知道具体类型。
 impl crate::sidecar::services::server_manager::McpSession for McpClient {
+    fn ping(
+        &self,
+        timeout: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), RequestError>> + Send + '_>>
+    {
+        Box::pin(McpClient::ping(self, timeout))
+    }
     fn list_tools(
         &self,
     ) -> std::pin::Pin<

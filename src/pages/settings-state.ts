@@ -6,6 +6,7 @@ import {
   type GeneralSettings,
   type SidecarInfo,
 } from "@moor/types";
+import { getErrorMessage } from "@/lib/utils";
 
 export type SettingsPageLoadState =
   | { kind: "loading"; canRenderControls: false }
@@ -63,7 +64,7 @@ export function getSettingsPageLoadState({
     return {
       kind: "error",
       canRenderControls: false,
-      message: error instanceof Error ? error.message : "Failed to load settings",
+      message: getErrorMessage(error, "Failed to load settings"),
     };
   }
   return { kind: "ready", canRenderControls: true };

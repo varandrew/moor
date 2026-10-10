@@ -1,3 +1,4 @@
+import { useTranslation } from "@/contexts/LocaleContext";
 import { useEffect, useMemo, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Switch } from "@/components/ui/switch";
@@ -24,17 +25,18 @@ import { cn } from "@/lib/utils";
 import type { ProfileToolGroup, ToolDetail } from "@moor/types";
 
 export function ProfileDetail() {
+  const { t } = useTranslation();
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const { setServerEnabled, busy: isUpdatingServer } = useProfileGovernance(id);
   const { profile, isLoading: loading } = useProfile(id);
 
   if (loading) {
-    return <PageLoading message="Loading profile..." />;
+    return <PageLoading message={t("Loading profile...")} />;
   }
 
   if (!profile || !id) {
-    return <EmptyState icon={FolderOpen} message="Profile not found" />;
+    return <EmptyState icon={FolderOpen} message={t("Profile not found")} />;
   }
 
   const enabledCount = profile.servers.filter((s) => s.profileServer.enabled).length;
@@ -43,7 +45,10 @@ export function ProfileDetail() {
     <div className="space-y-6 animate-fade-in-up">
       <DetailPageHeader
         title={profile.name}
-        subtitle={`${enabledCount} of ${profile.servers.length} servers enabled`}
+        subtitle={t("{enabled} of {total} servers enabled", {
+          enabled: enabledCount,
+          total: profile.servers.length,
+        })}
         badge={
           profile.isActive ? (
             <Badge variant="success">
@@ -51,7 +56,7 @@ export function ProfileDetail() {
                 <span className="animate-ping-slow absolute inline-flex h-full w-full rounded-full bg-success-muted opacity-50" />
                 <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-success-muted" />
               </span>
-              Active
+              {t("Active")}
             </Badge>
           ) : undefined
         }
@@ -62,12 +67,13 @@ export function ProfileDetail() {
       <Card>
         <CardHeader className="pb-3">
           <CardTitle className="text-base flex items-center gap-2">
-            <Server className="h-4 w-4 text-[var(--fg-40)]" /> Server Selection
+            <Server className="h-4 w-4 text-[var(--fg-40)]" />
+            {t("Server Selection")}
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-1">
           {profile.servers.length === 0 ? (
-            <EmptyState icon={Server} message="No servers available. Add servers first." />
+            <EmptyState icon={Server} message={t("No servers available. Add servers first.")} />
           ) : (
             profile.servers.map((server) => (
               <div
@@ -105,7 +111,7 @@ export function ProfileDetail() {
                 {server.profileServer.enabled && (
                   <div className="flex items-center gap-1.5">
                     <span className="h-1.5 w-1.5 rounded-full bg-success-muted" />
-                    <span className="font-body text-xs text-[var(--fg-40)]">Enabled</span>
+                    <span className="font-body text-xs text-[var(--fg-40)]">{t("Enabled")}</span>
                   </div>
                 )}
               </div>
@@ -121,6 +127,7 @@ export function ProfileDetail() {
 }
 
 function ToolGovernanceCard({ profileId }: { profileId: string }) {
+  const { t } = useTranslation();
   const { groups, isLoading } = useProfileTools(profileId);
   const { setTools, busy: governanceBusy } = useProfileGovernance(profileId);
   const [searchParams, setSearchParams] = useSearchParams();
@@ -225,8 +232,8 @@ function ToolGovernanceCard({ profileId }: { profileId: string }) {
       tools.map((tool) => ({ serverId: group.serverId, toolName: tool.toolName })),
       enable,
       enable
-        ? `Enabled all tools in ${group.serverName}`
-        : `Disabled all tools in ${group.serverName}`,
+        ? t("Enabled all tools in {name}", { name: group.serverName })
+        : t("Disabled all tools in {name}", { name: group.serverName }),
     );
   };
 
@@ -236,7 +243,7 @@ function ToolGovernanceCard({ profileId }: { profileId: string }) {
       await setTools(
         selection,
         enable,
-        enable ? `Enabled ${count} tools` : `Disabled ${count} tools`,
+        enable ? t("Enabled {count} tools", { count }) : t("Disabled {count} tools", { count }),
       )
     ) {
       setSelection([]);
@@ -249,14 +256,15 @@ function ToolGovernanceCard({ profileId }: { profileId: string }) {
     <Card>
       <CardHeader className="pb-3">
         <CardTitle className="text-base flex items-center gap-2">
-          <SlidersHorizontal className="h-4 w-4 text-[var(--fg-40)]" /> Tool Governance
-          <Badge variant="subtle">{totalTools} tools</Badge>
+          <SlidersHorizontal className="h-4 w-4 text-[var(--fg-40)]" />
+          {t("Tool Governance")}
+          <Badge variant="subtle">{t("{count} tools", { count: totalTools })}</Badge>
         </CardTitle>
         <div className="flex items-center gap-3 flex-wrap pt-1">
           <div className="relative flex-1 min-w-[220px] max-w-sm">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-[var(--fg-30)]" />
             <Input
-              placeholder="Search tools, servers, descriptions..."
+              placeholder={t("Search tools, servers, descriptions...")}
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               className="pl-9"
@@ -265,7 +273,7 @@ function ToolGovernanceCard({ profileId }: { profileId: string }) {
           {selection.length > 0 && (
             <>
               <span className="font-body text-xs text-[var(--fg-45)]">
-                {selection.length} selected
+                {t("{count} selected", { count: selection.length })}
               </span>
               <Button
                 size="sm"
@@ -273,7 +281,7 @@ function ToolGovernanceCard({ profileId }: { profileId: string }) {
                 disabled={governanceBusy}
                 onClick={() => void applySelection(true)}
               >
-                Enable
+                {t("Enable")}
               </Button>
               <Button
                 size="sm"
@@ -281,7 +289,7 @@ function ToolGovernanceCard({ profileId }: { profileId: string }) {
                 disabled={governanceBusy}
                 onClick={() => void applySelection(false)}
               >
-                Disable
+                {t("Disable")}
               </Button>
               <Button
                 size="sm"
@@ -289,7 +297,8 @@ function ToolGovernanceCard({ profileId }: { profileId: string }) {
                 onClick={() => setSelection([])}
                 className="h-7 px-2 text-xs"
               >
-                <X className="h-3.5 w-3.5 mr-1" /> Clear
+                <X className="h-3.5 w-3.5 mr-1" />
+                {t("Clear")}
               </Button>
             </>
           )}
@@ -302,7 +311,7 @@ function ToolGovernanceCard({ profileId }: { profileId: string }) {
                   className="h-7 px-2 text-xs"
                   onClick={() => setSelection(allFilteredTools)}
                 >
-                  Select all {trimmed ? "filtered" : ""}
+                  {t(trimmed ? "Select filtered" : "Select all")}
                 </Button>
               )}
               <Button
@@ -311,7 +320,7 @@ function ToolGovernanceCard({ profileId }: { profileId: string }) {
                 className="h-7 px-2 text-xs"
                 onClick={invertFilteredSelection}
               >
-                Invert {trimmed ? "filtered" : "all"}
+                {t(trimmed ? "Invert filtered" : "Invert all")}
               </Button>
             </>
           )}
@@ -319,11 +328,11 @@ function ToolGovernanceCard({ profileId }: { profileId: string }) {
       </CardHeader>
       <CardContent className="space-y-1">
         {isLoading ? (
-          <EmptyState icon={SlidersHorizontal} message="Loading tools..." />
+          <EmptyState icon={SlidersHorizontal} message={t("Loading tools...")} />
         ) : groups.length === 0 ? (
-          <EmptyState icon={Server} message="No servers available. Add servers first." />
+          <EmptyState icon={Server} message={t("No servers available. Add servers first.")} />
         ) : filteredGroups.length === 0 ? (
-          <EmptyState icon={Search} message="No tools match your search." />
+          <EmptyState icon={Search} message={t("No tools match your search.")} />
         ) : (
           filteredGroups.map((group) => (
             <ToolGroupSection
@@ -376,6 +385,7 @@ function ToolGroupSection({
   onSetAllTools: (enable: boolean) => void;
   onToggleSelected: (toolName: string) => void;
 }) {
+  const { t } = useTranslation();
   const enabledTools = group.tools.filter((tool) => !tool.disabled).length;
   const allEnabled = group.tools.length > 0 && enabledTools === group.tools.length;
   const noneEnabled = enabledTools === 0;
@@ -396,18 +406,18 @@ function ToolGroupSection({
             <span className="font-headline text-sm text-cursor-dark">{group.serverName}</span>
             {group.serverEnabled ? (
               <Badge variant="subtle" className="text-[10px]">
-                {enabledTools}/{group.tools.length} tools
+                {t("{enabled}/{total} tools", { enabled: enabledTools, total: group.tools.length })}
               </Badge>
             ) : (
               <Badge variant="outline" className="text-[10px]">
-                Server disabled — tools hidden from agents
+                {t("Server disabled — tools hidden from agents")}
               </Badge>
             )}
           </div>
         </div>
         {selectionCount > 0 && (
           <Badge variant="success" className="text-[10px]">
-            {selectionCount} selected
+            {t("{count} selected", { count: selectionCount })}
           </Badge>
         )}
         <Button
@@ -417,7 +427,7 @@ function ToolGroupSection({
           disabled={disabled || allEnabled}
           onClick={() => onSetAllTools(true)}
         >
-          Enable all
+          {t("Enable all")}
         </Button>
         <Button
           variant="ghost"
@@ -426,14 +436,14 @@ function ToolGroupSection({
           disabled={disabled || noneEnabled}
           onClick={() => onSetAllTools(false)}
         >
-          Disable all
+          {t("Disable all")}
         </Button>
       </div>
       {expanded && (
         <div className="divide-y divide-[var(--fg-04)]">
           {group.tools.length === 0 ? (
             <p className="px-4 py-3 font-body text-xs text-[var(--fg-40)]">
-              No tools discovered for this server yet.
+              {t("No tools discovered for this server yet.")}
             </p>
           ) : (
             group.tools.map((tool) => (
@@ -472,6 +482,7 @@ function ToolRow({
   onToggleSelected: () => void;
   onToggleTool: (enabled: boolean) => void;
 }) {
+  const { t } = useTranslation();
   return (
     <div
       id={toolRowId(serverId, tool.toolName)}
@@ -503,7 +514,7 @@ function ToolRow({
       {!tool.disabled && (
         <div className="flex items-center gap-1.5 shrink-0">
           <span className="h-1.5 w-1.5 rounded-full bg-success-muted" />
-          <span className="font-body text-[11px] text-[var(--fg-40)]">Visible</span>
+          <span className="font-body text-[11px] text-[var(--fg-40)]">{t("Visible")}</span>
         </div>
       )}
     </div>

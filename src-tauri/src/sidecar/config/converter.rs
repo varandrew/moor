@@ -137,6 +137,9 @@ fn resolve_from_paste(
     }
     let client = source_client.and_then(clients::get_client_by_id);
     let source = source_client.unwrap_or("paste");
+    if client.is_some_and(|c| c.format == "yaml") {
+        return Err("YAML import is unsupported; dynamic !!js expressions are never evaluated. DSH supports export only.".to_string());
+    }
     let parsed = match client {
         Some(c) if c.format == "toml" => import_parser::parse_codex_toml_config(content, source),
         _ => import_parser::parse_json_mcp_config(content, source),
@@ -157,6 +160,13 @@ fn parsed_import_warnings(parsed: &import_parser::ParsedImport) -> Vec<String> {
             .iter()
             .map(|s| format!("Skipped unsupported server \"{}\": {}", s.name, s.reason)),
     );
+    warnings.extend(
+        parsed
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.as_deref() == Some("UNMAPPED_FIELDS"))
+            .map(|d| d.message.clone()),
+    );
     warnings
 }
 
@@ -175,6 +185,56 @@ mod tests {
         let db = Database::open(&path).expect("open db");
         db.run_migrations().expect("migrate");
         db
+    }
+
+    #[test]
+    fn converts_between_new_client_formats_and_reports_target_paths() {
+        let db = temp_db();
+        let mut content = r#"{"mcpServers":{"moor":{"type":"streamable-http","url":"http://127.0.0.1:9231/mcp"}}}"#.to_string();
+        for (source, target, key, path) in [
+            (
+                "minimax-code",
+                "zcode",
+                "/mcp/servers/moor/url",
+                ".zcode/cli/config.json",
+            ),
+            (
+                "zcode",
+                "minimax-code",
+                "/mcpServers/moor/url",
+                ".minimax/mcp.json",
+            ),
+        ] {
+            let result = convert_config(
+                &ConvertInput {
+                    source: "paste".to_string(),
+                    source_client: Some(source.to_string()),
+                    content: Some(content),
+                    server_ids: None,
+                    target_client: target.to_string(),
+                },
+                &db,
+            )
+            .unwrap();
+            let json: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+            assert_eq!(json.pointer(key).unwrap(), "http://127.0.0.1:9231/mcp");
+            assert!(result.target_path.ends_with(path));
+            content = result.content;
+        }
+    }
+
+    #[test]
+    fn dsh_paste_reports_yaml_limit_without_evaluation() {
+        let err = resolve_from_paste("- insert: !!js process.exit()", Some("dsh")).unwrap_err();
+        assert!(err.contains("YAML import is unsupported"));
+    }
+
+    #[test]
+    fn client_specific_fields_are_visible_as_conversion_warnings() {
+        let (_, warnings) = resolve_from_paste(r#"{"mcpServers":{"moor":{"url":"http://localhost/mcp","oauth":{"clientId":"example"},"http_headers_helper":"never execute"}}}"#, Some("minimax-code")).unwrap();
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("oauth") && w.contains("http_headers_helper")));
     }
 
     #[test]

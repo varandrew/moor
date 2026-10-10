@@ -149,8 +149,49 @@ fn sync_runtime_settings_from_db(
 }
 
 #[tauri::command]
-fn sync_runtime_settings(state: State<'_, MoorState>) -> Result<(), String> {
-    sync_runtime_settings_from_db(&state, state.inner.db.as_ref())
+fn sync_runtime_settings(
+    app: tauri::AppHandle,
+    state: State<'_, MoorState>,
+    locale: Option<String>,
+) -> Result<(), String> {
+    sync_runtime_settings_from_db(&state, state.inner.db.as_ref())?;
+    if let Some(locale) = locale {
+        if locale != "en" && locale != "zh-CN" {
+            return Err("Invalid locale".to_string());
+        }
+        let title = localized_app_title(locale == "zh-CN");
+        if let Some(window) = app.get_webview_window("main") {
+            window.set_title(title).map_err(|error| error.to_string())?;
+        }
+        if let Some(tray) = app.tray_by_id("moor-tray") {
+            tray.set_menu(Some(
+                localized_tray_menu(&app, locale == "zh-CN").map_err(|error| error.to_string())?,
+            ))
+            .map_err(|error| error.to_string())?;
+            tray.set_tooltip(Some(title))
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn localized_app_title(chinese: bool) -> &'static str {
+    if chinese {
+        "Moor - MCP 管理器"
+    } else {
+        "Moor - MCP Manager"
+    }
+}
+
+fn localized_tray_menu(app: &tauri::AppHandle, chinese: bool) -> tauri::Result<Menu<tauri::Wry>> {
+    let (show_label, quit_label) = if chinese {
+        ("显示窗口", "退出 Moor")
+    } else {
+        ("Show Window", "Quit Moor")
+    };
+    let show = MenuItem::with_id(app, "show", show_label, true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", quit_label, true, None::<&str>)?;
+    Menu::with_items(app, &[&show, &quit])
 }
 
 #[tauri::command]
@@ -327,6 +368,7 @@ pub fn run() {
             // Spawn axum server
             let host = host.to_string();
             let sm = server_manager.clone();
+            server_manager.spawn_health_checker();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = sidecar::http::start_server(app_state, &host, port).await {
                     eprintln!("HTTP server error: {e}");
@@ -345,14 +387,12 @@ pub fn run() {
             let _ = apply_autostart_setting(app.handle(), auto_start);
 
             // Tray menu
-            let quit = MenuItem::with_id(app, "quit", "Quit Moor", true, None::<&str>)?;
-            let show = MenuItem::with_id(app, "show", "Show Window", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &quit])?;
+            let menu = localized_tray_menu(app.handle(), settings.appearance.locale == "zh-CN")?;
             let _tray = {
-                let builder = TrayIconBuilder::new()
+                let builder = TrayIconBuilder::with_id("moor-tray")
                     .menu(&menu)
                     .show_menu_on_left_click(false)
-                    .tooltip("Moor - MCP Manager")
+                    .tooltip(localized_app_title(settings.appearance.locale == "zh-CN"))
                     .on_menu_event(|app, event| match event.id.as_ref() {
                         "quit" => {
                             app.exit(0);

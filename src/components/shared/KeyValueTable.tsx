@@ -1,3 +1,4 @@
+import { useTranslation } from "@/contexts/LocaleContext";
 interface KeyValueTableProps {
   entries: Array<[string, string]>;
   keyLabel?: string;
@@ -9,16 +10,17 @@ export function KeyValueTable({
   keyLabel = "Key",
   valueLabel = "Value",
 }: KeyValueTableProps) {
+  const { text } = useTranslation();
   return (
     <div className="rounded-xl border border-[var(--fg-08)] overflow-hidden">
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-[var(--fg-08)] bg-surface-300/30">
             <th className="text-left font-headline text-[11px] text-[var(--fg-45)] uppercase tracking-wider px-4 py-2 font-medium">
-              {keyLabel}
+              {text(keyLabel)}
             </th>
             <th className="text-left font-headline text-[11px] text-[var(--fg-45)] uppercase tracking-wider px-4 py-2 font-medium">
-              {valueLabel}
+              {text(valueLabel)}
             </th>
           </tr>
         </thead>

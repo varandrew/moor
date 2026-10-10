@@ -1,8 +1,9 @@
 # Claude Desktop Model Context Protocol (MCP)
 
 > Source: https://modelcontextprotocol.io/docs/2026-07-28/develop/connect-local-servers
+> Checked: 2026-10-08
+> Applicable version: Current official documentation; version-specific requirements are noted below.
 > Additional sources: https://modelcontextprotocol.io/docs/2026-07-28/develop/connect-remote-servers, https://github.com/modelcontextprotocol/modelcontextprotocol/discussions/1940
-> Accessed: 2026-08-29
 >
 > Note: This document is an external documentation mirror/reference. Copyright belongs to the original site; content may be outdated, please refer to the official links. Follow the original site's license when citing or redistributing.
 
@@ -71,3 +72,7 @@ Requires Node.js on the machine. Headers can be passed as `--header "Name: Value
 - Servers run with your user permissions — only grant access to directories and services you're comfortable with Claude reading and modifying
 - Every tool action requires your explicit approval; review requests before approving
 - Only configure servers from trusted sources
+
+## Moor integration boundary
+
+The stdio bridge is third-party software: https://github.com/punkpeye/mcp-remote. It requires Node.js; Moor does not install it. Credential references in bridge headers require values in the entry's `env` block because GUI clients do not inherit the terminal environment reliably. Moor models the macOS path; Windows remains documented but is not connection-tested in this change.

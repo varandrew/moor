@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api/client";
 import { routes } from "@/lib/api-routes";
 import { logKeys } from "@/lib/query-keys";
+import { getErrorMessage } from "@/lib/utils";
 import type { AuditLogEntry, LogInsights, LogStats } from "@moor/types";
 
 const DEFAULT_STATS: LogStats = {
@@ -37,7 +38,7 @@ export function useLogs(filters?: {
     await queryClient.invalidateQueries({ queryKey: logKeys.all() });
   }, [queryClient]);
 
-  return { logs, loading, error: error?.message ?? null, refresh };
+  return { logs, loading, error: error ? getErrorMessage(error) : null, refresh };
 }
 
 export function useLogStats() {
@@ -56,7 +57,7 @@ export function useLogStats() {
     await queryClient.invalidateQueries({ queryKey: logKeys.stats() });
   }, [queryClient]);
 
-  return { stats, loading, error: error?.message ?? null, refresh };
+  return { stats, loading, error: error ? getErrorMessage(error) : null, refresh };
 }
 
 const DEFAULT_INSIGHTS: LogInsights = {
@@ -85,5 +86,5 @@ export function useLogInsights(window?: { from?: string }) {
     await queryClient.invalidateQueries({ queryKey: ["logs", "insights"] });
   }, [queryClient]);
 
-  return { insights, loading, error: error?.message ?? null, refresh };
+  return { insights, loading, error: error ? getErrorMessage(error) : null, refresh };
 }

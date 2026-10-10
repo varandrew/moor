@@ -1,3 +1,6 @@
+import { HealthSettings } from "@/components/shared/HealthSettings";
+import { UpdateCheck } from "@/components/shared/UpdateCheck";
+import { useTranslation } from "@/contexts/LocaleContext";
 import { useState, useEffect, useCallback } from "react";
 import { cn, createErrorWithCause, getErrorMessage } from "@/lib/utils";
 import { getApiRuntime, resetRuntime } from "@/lib/api/runtime";
@@ -12,7 +15,7 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent } from "@/components/ui/card";
 import { Tabs } from "@/components/ui/tabs";
 import { Cog, Palette, Wrench, AlertTriangle, Eye, EyeOff, ExternalLink } from "lucide-react";
-import type { GeneralSettings, SettingsGroup, SidecarInfo } from "@moor/types";
+import type { GeneralSettings, SettingsGroup, SidecarInfo, LocalePreference } from "@moor/types";
 import { CopyButton } from "@/components/shared/CopyButton";
 import {
   getAdvancedPortStatus,
@@ -35,12 +38,13 @@ interface SettingRowProps {
 }
 
 function SettingRow({ label, description, children }: SettingRowProps) {
+  const { text } = useTranslation();
   return (
     <div className="flex items-center justify-between py-3.5 px-4">
       <div className="flex-1 min-w-0 mr-4">
-        <p className="font-headline text-sm text-cursor-dark">{label}</p>
+        <p className="font-headline text-sm text-cursor-dark">{text(label)}</p>
         {description && (
-          <p className="font-body text-xs text-[var(--fg-45)] mt-0.5">{description}</p>
+          <p className="font-body text-xs text-[var(--fg-45)] mt-0.5">{text(description)}</p>
         )}
       </div>
       <div className="shrink-0">{children}</div>
@@ -70,6 +74,7 @@ function TimeoutSettingRow({
   applyPending,
   onApply,
 }: TimeoutSettingRowProps) {
+  const { t } = useTranslation();
   const [local, setLocal] = useState(String(milliseconds / 1000));
   const parsed = parse(local);
 
@@ -98,12 +103,12 @@ function TimeoutSettingRow({
             disabled={!parsed.valid || applyPending}
             onClick={() => onApply(parsed)}
           >
-            Apply
+            {t("Apply")}
           </Button>
         </div>
         {!parsed.valid && (
           <p id={errorId} className="font-body text-[11px] text-error-warm">
-            {parsed.message}
+            {t("Enter a whole number between {min} and {max}.", bounds)}
           </p>
         )}
       </div>
@@ -135,6 +140,7 @@ interface GroupNavItemProps {
 }
 
 function GroupNavItem({ icon: Icon, label, active, onClick }: GroupNavItemProps) {
+  const { text } = useTranslation();
   return (
     <button
       onClick={onClick}
@@ -146,7 +152,7 @@ function GroupNavItem({ icon: Icon, label, active, onClick }: GroupNavItemProps)
       )}
     >
       <Icon className="h-4 w-4" />
-      {label}
+      {text(label)}
     </button>
   );
 }
@@ -154,6 +160,7 @@ function GroupNavItem({ icon: Icon, label, active, onClick }: GroupNavItemProps)
 // --- Settings Sections ---
 
 function GeneralSection({ onError }: { onError: (message: string | null) => void }) {
+  const { t } = useTranslation();
   const { settings, updateSettings } = useSettings();
 
   const handleSwitch = useCallback(
@@ -195,8 +202,8 @@ function GeneralSection({ onError }: { onError: (message: string | null) => void
     <Card>
       <CardContent className="p-2 divide-y divide-[var(--fg-06)]">
         <SettingRow
-          label="Auto-start on Login"
-          description="Launch Moor automatically when you log in"
+          label={t("Auto-start on Login")}
+          description={t("Launch Moor automatically when you log in")}
         >
           <Switch
             checked={settings.general.autoStartOnLogin}
@@ -204,8 +211,8 @@ function GeneralSection({ onError }: { onError: (message: string | null) => void
           />
         </SettingRow>
         <SettingRow
-          label="Auto-start Servers on Launch"
-          description="Automatically start servers marked as auto-start when Moor opens"
+          label={t("Auto-start Servers on Launch")}
+          description={t("Automatically start servers marked as auto-start when Moor opens")}
         >
           <Switch
             checked={settings.general.autoStartServersOnLaunch}
@@ -213,8 +220,8 @@ function GeneralSection({ onError }: { onError: (message: string | null) => void
           />
         </SettingRow>
         <SettingRow
-          label="Minimize to Tray on Close"
-          description="Keep Moor running in the system tray when the window is closed"
+          label={t("Minimize to Tray on Close")}
+          description={t("Keep Moor running in the system tray when the window is closed")}
         >
           <Switch
             checked={settings.general.minimizeToTrayOnClose}
@@ -222,8 +229,8 @@ function GeneralSection({ onError }: { onError: (message: string | null) => void
           />
         </SettingRow>
         <SettingRow
-          label="Hide Dock Icon on Close"
-          description="Hide the macOS Dock icon after the window is closed"
+          label={t("Hide Dock Icon on Close")}
+          description={t("Hide the macOS Dock icon after the window is closed")}
         >
           <Switch
             checked={settings.general.hideDockIconOnClose}
@@ -232,8 +239,8 @@ function GeneralSection({ onError }: { onError: (message: string | null) => void
           />
         </SettingRow>
         <SettingRow
-          label="Show Window on Launch"
-          description="Display the main window when Moor starts"
+          label={t("Show Window on Launch")}
+          description={t("Display the main window when Moor starts")}
         >
           <Switch
             checked={settings.general.showWindowOnLaunch}
@@ -243,7 +250,7 @@ function GeneralSection({ onError }: { onError: (message: string | null) => void
         </SettingRow>
         {!settings.general.minimizeToTrayOnClose && (
           <p className="px-4 py-2 font-body text-xs text-[var(--fg-35)]">
-            Enable "Minimize to Tray on Close" to configure window visibility on launch
+            {t('Enable "Minimize to Tray on Close" to configure window visibility on launch')}
           </p>
         )}
       </CardContent>
@@ -252,6 +259,7 @@ function GeneralSection({ onError }: { onError: (message: string | null) => void
 }
 
 function AppearanceSection({ onError }: { onError: (message: string | null) => void }) {
+  const { t } = useTranslation();
   const { settings, updateSettings } = useSettings();
 
   const handleThemeChange = useCallback(
@@ -271,21 +279,37 @@ function AppearanceSection({ onError }: { onError: (message: string | null) => v
       <CardContent className="p-2">
         <div className="flex items-center justify-between py-3.5 px-4">
           <div className="flex-1 min-w-0 mr-4">
-            <p className="font-headline text-sm text-cursor-dark">Theme</p>
+            <p className="font-headline text-sm text-cursor-dark">{t("Theme")}</p>
             <p className="font-body text-xs text-[var(--fg-45)] mt-0.5">
-              Choose the application appearance
+              {t("Choose the application appearance")}
             </p>
           </div>
           <Tabs
             value={settings.appearance.theme}
             onValueChange={(v) => void handleThemeChange(v)}
             tabs={[
-              { value: "light", label: "Light" },
-              { value: "dark", label: "Dark" },
-              { value: "system", label: "System" },
+              { value: "light", label: t("Light") },
+              { value: "dark", label: t("Dark") },
+              { value: "system", label: t("System") },
             ]}
           />
         </div>
+        <SettingRow label={t("Language")} description={t("Choose the interface and tray language")}>
+          <Tabs
+            value={settings.appearance.locale ?? "system"}
+            tabs={[
+              { value: "system", label: t("System") },
+              { value: "zh-CN", label: "简体中文" },
+              { value: "en", label: "English" },
+            ]}
+            onValueChange={(value) => {
+              onError(null);
+              void updateSettings({ appearance: { locale: value as LocalePreference } }).catch(
+                (error) => onError(getErrorMessage(error)),
+              );
+            }}
+          />
+        </SettingRow>
       </CardContent>
     </Card>
   );
@@ -302,6 +326,7 @@ function AdvancedSection({
   onPortApplied: (port: number) => void;
   onLanAccessApplied: () => void;
 }) {
+  const { t } = useTranslation();
   const { settings, updateSettings } = useSettings();
   const [localRetention, setLocalRetention] = useState(String(settings.advanced.logRetentionDays));
   const [localPort, setLocalPort] = useState(String(settings.advanced.sidecarPort));
@@ -353,27 +378,30 @@ function AdvancedSection({
   const timeoutFields = [
     {
       key: "mcpRequestTimeoutMs",
-      label: "Request Timeout",
-      description:
+      label: t("Request Timeout"),
+      description: t(
         "Timeout for MCP JSON-RPC requests in seconds (5-300). Applies to the next MCP request.",
+      ),
       bounds: { min: 5, max: 300 },
       parse: parseTimeoutSecondsInput,
       errorId: "request-timeout-error",
     },
     {
       key: "mcpServerStartTimeoutMs",
-      label: "Server Start Timeout",
-      description:
+      label: t("Server Start Timeout"),
+      description: t(
         "Total startup wait for MCP servers in seconds (5-300). Applies to the next server start.",
+      ),
       bounds: { min: 5, max: 300 },
       parse: parseTimeoutSecondsInput,
       errorId: "server-start-timeout-error",
     },
     {
       key: "mcpSessionIdleTtlMs",
-      label: "Session Idle TTL",
-      description:
+      label: t("Session Idle TTL"),
+      description: t(
         "Idle expiry for MCP sessions in seconds (300-86400). Idle clients re-initialize on their next request.",
+      ),
       bounds: { min: 300, max: 86400 },
       parse: parseIdleTtlSecondsInput,
       errorId: "session-idle-ttl-error",
@@ -401,9 +429,10 @@ function AdvancedSection({
     <div className="space-y-4">
       <Card>
         <CardContent className="p-2 divide-y divide-[var(--fg-06)]">
+          <HealthSettings onError={onError} />
           <SettingRow
-            label="Log Retention"
-            description="Number of days to keep audit logs (0 for unlimited)"
+            label={t("Log Retention")}
+            description={t("Number of days to keep audit logs (0 for unlimited)")}
           >
             <div className="flex items-center gap-2">
               <Input
@@ -420,19 +449,24 @@ function AdvancedSection({
                 disabled={applyRetention.pending}
                 onClick={() => void applyRetention.mutate(Number(localRetention))}
               >
-                Apply
+                {t("Apply")}
               </Button>
             </div>
           </SettingRow>
-          <SettingRow label="Audit Logging" description="Record tool calls in the audit log">
+          <SettingRow
+            label={t("Audit Logging")}
+            description={t("Record tool calls in the audit log")}
+          >
             <Switch
               checked={settings.advanced.enableAuditLogging}
               onCheckedChange={(v) => void updateSettings({ advanced: { enableAuditLogging: v } })}
             />
           </SettingRow>
           <SettingRow
-            label="Allow LAN MCP Access"
-            description="Expose /mcp on all interfaces for WSL2/LAN clients; /api stays loopback-only (requires restart)"
+            label={t("Allow LAN MCP Access")}
+            description={t(
+              "Expose /mcp on all interfaces for WSL2/LAN clients; /api stays loopback-only (requires restart)",
+            )}
           >
             <Switch
               checked={settings.advanced.allowLanMcpAccess}
@@ -467,8 +501,8 @@ function AdvancedSection({
         <CardContent className="p-2 divide-y divide-[var(--fg-06)]">
           <div>
             <SettingRow
-              label="Sidecar Port"
-              description="Port for the Moor API server (requires restart)"
+              label={t("Sidecar Port")}
+              description={t("Port for the Moor API server (requires restart)")}
             >
               <div className="flex items-center gap-2">
                 <Input
@@ -485,24 +519,25 @@ function AdvancedSection({
                   disabled={applyPort.pending}
                   onClick={() => void applyPort.mutate(Number(localPort))}
                 >
-                  Apply
+                  {t("Apply")}
                 </Button>
               </div>
             </SettingRow>
             {portStatus?.kind === "mismatch" && (
               <p className="px-4 pb-3 -mt-1 font-body text-xs text-[var(--fg-45)]">
-                Currently running on port {portStatus.currentPort}; configured for port{" "}
-                {portStatus.configuredPort}. The configured port may already be used by another Moor
-                instance.
+                {t(
+                  "Currently running on port {current}; configured for port {configured}. The configured port may already be used by another Moor instance.",
+                  { current: portStatus.currentPort, configured: portStatus.configuredPort },
+                )}
               </p>
             )}
           </div>
           <div className="py-3.5 px-4">
             <div className="flex items-center justify-between mb-2">
               <div className="flex-1 min-w-0 mr-4">
-                <p className="font-headline text-sm text-cursor-dark">API Token</p>
+                <p className="font-headline text-sm text-cursor-dark">{t("API Token")}</p>
                 <p className="font-body text-xs text-[var(--fg-45)] mt-0.5">
-                  Authentication token for the Moor API
+                  {t("Authentication token for the Moor API")}
                 </p>
               </div>
             </div>
@@ -512,7 +547,7 @@ function AdvancedSection({
                   ? tokenVisible
                     ? runtimeInfo.apiToken
                     : "•".repeat(20)
-                  : "Loading..."}
+                  : t("Loading...")}
               </code>
               <Button variant="ghost" size="icon" onClick={() => setTokenVisible(!tokenVisible)}>
                 {tokenVisible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
@@ -528,7 +563,7 @@ function AdvancedSection({
           <div className="flex items-center justify-between">
             <div>
               <p className="font-headline text-sm text-cursor-dark">Moor v{__APP_VERSION__}</p>
-              <p className="font-body text-xs text-[var(--fg-40)]">MCP Gateway Manager</p>
+              <p className="font-body text-xs text-[var(--fg-40)]">{t("MCP Gateway Manager")}</p>
             </div>
             <a
               href="https://github.com/varandrew/moor"
@@ -539,6 +574,7 @@ function AdvancedSection({
               <ExternalLink className="h-4 w-4" />
             </a>
           </div>
+          <UpdateCheck />
         </CardContent>
       </Card>
     </div>
@@ -554,6 +590,7 @@ const groups: { key: SettingsGroup; label: string; icon: React.ElementType }[] =
 ];
 
 export function SettingsPage() {
+  const { t } = useTranslation();
   const [activeGroup, setActiveGroup] = useState<SettingsGroup>("general");
   const [runtimeInfo, setRuntimeInfo] = useState<SidecarInfo | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -610,12 +647,12 @@ export function SettingsPage() {
   return (
     <div className="space-y-6 animate-fade-in-up">
       <PageHeader
-        title="Settings"
-        subtitle="Configure Moor to your preferences"
+        title={t("Settings")}
+        subtitle={t("Configure Moor to your preferences")}
         action={
           loadState.canRenderControls ? (
             <Button variant="outline" size="sm" onClick={handleReset}>
-              Reset to Defaults
+              {t("Reset to Defaults")}
             </Button>
           ) : undefined
         }
@@ -624,14 +661,14 @@ export function SettingsPage() {
       {loadState.kind === "error" && <ErrorBanner message={loadState.message} />}
       {portBannerState?.kind === "restart" && (
         <RestartBanner
-          title="Port changes require reopening Moor"
-          message="Quit and reopen Moor to apply the configured port."
+          title={t("Port changes require reopening Moor")}
+          message={t("Quit and reopen Moor to apply the configured port.")}
         />
       )}
       {lanAccessChangeApplied && (
         <RestartBanner
-          title="LAN access changes require reopening Moor"
-          message="Quit and reopen Moor to apply the new network binding."
+          title={t("LAN access changes require reopening Moor")}
+          message={t("Quit and reopen Moor to apply the new network binding.")}
         />
       )}
       {errorMessage && <ErrorBanner message={errorMessage} />}

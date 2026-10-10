@@ -1,16 +1,18 @@
+import { useTranslation } from "@/contexts/LocaleContext";
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-shell";
 import { FolderOpen } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { getServerLogPath } from "@/lib/tauri";
-import { getErrorMessage } from "@/lib/utils";
+import { getNoticeErrorMessage } from "@/lib/utils";
 
 interface OpenLogButtonProps {
   serverId: string;
 }
 
 export function OpenLogButton({ serverId }: OpenLogButtonProps) {
+  const { t } = useTranslation();
   const [logPath, setLogPath] = useState<string | null>(null);
 
   useEffect(() => {
@@ -29,15 +31,15 @@ export function OpenLogButton({ serverId }: OpenLogButtonProps) {
 
   const handleOpen = async () => {
     if (!logPath) {
-      toast.error("Logs unavailable", {
-        description: "Log files are only accessible in the Moor desktop app.",
+      toast.error(t("Logs unavailable"), {
+        description: t("Log files are only accessible in the Moor desktop app."),
       });
       return;
     }
     try {
       await open(logPath);
     } catch (err) {
-      toast.error("Failed to open log file", { description: getErrorMessage(err) });
+      toast.error(t("Failed to open log file"), { description: getNoticeErrorMessage(err) });
     }
   };
 
@@ -46,10 +48,11 @@ export function OpenLogButton({ serverId }: OpenLogButtonProps) {
       variant="ghost"
       size="sm"
       onClick={handleOpen}
-      title={logPath ?? "Open log file"}
+      title={logPath ?? t("Open log file")}
       className="h-7 px-2 text-error-warm hover:bg-error-warm/10 hover:text-error-warm"
     >
-      <FolderOpen className="h-3.5 w-3.5 mr-1" /> Open Logs
+      <FolderOpen className="h-3.5 w-3.5 mr-1" />
+      {t("Open Logs")}
     </Button>
   );
 }

@@ -1,7 +1,8 @@
 # OpenCode MCP Servers
 
 > Source: https://opencode.ai/docs/mcp-servers/
-> Accessed: 2026-08-29
+> Checked: 2026-10-08
+> Applicable version: Current official documentation; version-specific requirements are noted below.
 >
 > Note: This document is an external documentation mirror/reference. Copyright belongs to the original site; content may be outdated, please refer to the official link. Follow the original site's license when citing or redistributing.
 
@@ -428,3 +429,9 @@ Or add to AGENTS.md:
 ```markdown
 If you are unsure how to do something, use `gh_grep` to search code examples from GitHub.
 ```
+
+## Configuration locations and precedence
+
+Additional source: https://opencode.ai/docs/config/
+
+User files are `~/.config/opencode/opencode.json` or `.jsonc`; project files are `opencode.json` or `.jsonc`. `OPENCODE_CONFIG` loads between user and project configuration. Overlapping keys are overridden while unrelated keys remain merged. Managed/MDM settings have higher precedence. Moor scans default user locations only; paste project or custom-path files manually.

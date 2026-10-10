@@ -1,3 +1,4 @@
+import { translateCurrent } from "@/lib/messages";
 import {
   useIsMutating,
   MutationObserver,
@@ -86,14 +87,14 @@ async function applyChange(client: QueryClient, profileId: string | undefined, c
         entries.set(profileId, undo);
         undo.toastId = toast.success(change.message, {
           action: {
-            label: "Undo",
+            label: translateCurrent("Undo"),
             onClick: () => {
               void applyChange(client, profileId, { kind: "undo", undo }).catch(() => {});
             },
           },
         });
       } else if (change.kind === "undo") {
-        toast.success("Restored previous tool states");
+        toast.success(translateCurrent("Restored previous tool states"));
       }
       await Promise.all([
         client.invalidateQueries({ queryKey: profileKeys.detail(profileId) }),

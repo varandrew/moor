@@ -45,3 +45,26 @@ describe("parseMoorSSEEvent", () => {
     expect(warnings).toHaveLength(1);
   });
 });
+
+describe("server health events", () => {
+  it("accepts complete snapshots and rejects malformed health payloads", () => {
+    const snapshot = {
+      serverId: "demo",
+      status: "unhealthy",
+      checkedAt: "2026-10-09T00:00:00Z",
+      consecutiveFailures: 3,
+      errorMessage: "timeout",
+    };
+    expect(parseMoorSSEEvent("server:health", snapshot)).toEqual({
+      type: "server:health",
+      data: snapshot,
+    });
+    for (const invalid of [
+      { ...snapshot, status: "running" },
+      { ...snapshot, consecutiveFailures: -1 },
+      { ...snapshot, checkedAt: 1 },
+    ]) {
+      expect(parseMoorSSEEvent("server:health", invalid, () => undefined)).toBeNull();
+    }
+  });
+});

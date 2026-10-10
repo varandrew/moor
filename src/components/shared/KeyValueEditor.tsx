@@ -1,3 +1,4 @@
+import { useTranslation } from "@/contexts/LocaleContext";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -26,6 +27,7 @@ export function KeyValueEditor({
   valueLabel = "Value",
   disabled = false,
 }: KeyValueEditorProps) {
+  const { t, text } = useTranslation();
   const reactId = useId();
   const duplicateErrorId = `${reactId}-duplicate-error`;
   const nextRowIdRef = useRef(entries.length);
@@ -73,10 +75,10 @@ export function KeyValueEditor({
     <div className="space-y-2">
       <div className="grid grid-cols-[1fr_1fr_36px] gap-2 items-center">
         <span className="font-headline text-[11px] text-[var(--fg-45)] uppercase tracking-wider px-1">
-          {keyLabel}
+          {text(keyLabel)}
         </span>
         <span className="font-headline text-[11px] text-[var(--fg-45)] uppercase tracking-wider px-1">
-          {valueLabel}
+          {text(valueLabel)}
         </span>
         <span />
       </div>
@@ -88,7 +90,7 @@ export function KeyValueEditor({
             className="grid grid-cols-[1fr_1fr_36px] gap-2 items-center"
           >
             <Input
-              placeholder={keyPlaceholder}
+              placeholder={text(keyPlaceholder)}
               value={key}
               onChange={(e) => update(index, 0, e.target.value)}
               disabled={disabled}
@@ -97,7 +99,7 @@ export function KeyValueEditor({
               className={cn("h-9 text-xs font-mono", duplicated && "border-error-warm")}
             />
             <Input
-              placeholder={valuePlaceholder}
+              placeholder={text(valuePlaceholder)}
               value={value}
               onChange={(e) => update(index, 1, e.target.value)}
               disabled={disabled}
@@ -110,7 +112,7 @@ export function KeyValueEditor({
               className="h-9 w-9 text-[var(--fg-40)] hover:text-error-warm shrink-0"
               onClick={() => remove(index)}
               disabled={disabled}
-              aria-label={`Remove ${keyLabel.toLowerCase()} row`}
+              aria-label={t("Remove {name} row", { name: text(keyLabel).toLowerCase() })}
             >
               <X className="h-4 w-4" />
             </Button>
@@ -119,7 +121,7 @@ export function KeyValueEditor({
       })}
       {duplicateIndexes.size > 0 && (
         <p id={duplicateErrorId} className="px-1 text-xs text-error-warm">
-          {keyLabel} keys must be unique.
+          {t("{label} keys must be unique.", { label: text(keyLabel) })}
         </p>
       )}
       <Button
@@ -130,7 +132,8 @@ export function KeyValueEditor({
         onClick={add}
         disabled={disabled}
       >
-        <Plus className="h-3.5 w-3.5 mr-1.5" /> Add
+        <Plus className="h-3.5 w-3.5 mr-1.5" />
+        {t("Add")}
       </Button>
     </div>
   );

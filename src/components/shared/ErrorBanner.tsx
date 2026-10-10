@@ -1,3 +1,5 @@
+import { useTranslation } from "@/contexts/LocaleContext";
+import { messages } from "@/lib/messages";
 import { AlertTriangle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ReactNode } from "react";
@@ -10,6 +12,15 @@ interface ErrorBannerProps {
 }
 
 export function ErrorBanner({ message, variant = "default", className, action }: ErrorBannerProps) {
+  const { t, text, locale } = useTranslation();
+  const [summary, ...details] = message.split("\n");
+  const known = Object.prototype.hasOwnProperty.call(messages, summary);
+  const display = known
+    ? text(summary)
+    : locale === "en"
+      ? summary
+      : t("Moor could not complete this operation.");
+  const diagnostic = known ? details.join("\n") : locale === "en" ? details.join("\n") : message;
   return (
     <div
       role="alert"
@@ -19,15 +30,21 @@ export function ErrorBanner({ message, variant = "default", className, action }:
       )}
     >
       <AlertTriangle className="h-4 w-4 shrink-0 text-error-warm" />
-      <p
+      <div
         className={cn(
           "min-w-0 text-error-warm",
           variant === "mono" ? "truncate font-mono text-[11px]" : "break-words font-body text-xs",
         )}
         title={message}
       >
-        {message}
-      </p>
+        {display}
+        {diagnostic && (
+          <details className="mt-1 whitespace-pre-wrap font-mono text-[11px]">
+            <summary className="cursor-pointer font-body">{t("Diagnostic details")}</summary>
+            {diagnostic}
+          </details>
+        )}
+      </div>
       {action && <div className="ml-auto shrink-0">{action}</div>}
     </div>
   );

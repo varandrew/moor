@@ -11,6 +11,14 @@ pub struct AppError {
 }
 
 impl AppError {
+    pub fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, code, message)
+    }
+
+    pub fn upstream(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_GATEWAY, code, message)
+            .with_client_message("Unable to check for updates".to_string())
+    }
     pub fn not_found(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "NOT_FOUND", msg)
     }
@@ -77,9 +85,9 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         // 5xx 可能包含底层细节；默认隐藏，只返回显式标记为可公开的消息。
         let client_message = if self.status.is_server_error() {
-            tracing::error!(code = self.code, error = %self.message, "请求处理失败");
+            tracing::error!(code = self.code, error = %self.message, "Request handling failed");
             self.client_message
-                .unwrap_or_else(|| "服务器内部错误".to_string())
+                .unwrap_or_else(|| "Internal server error".to_string())
         } else {
             self.message
         };

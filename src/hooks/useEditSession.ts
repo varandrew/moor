@@ -1,3 +1,5 @@
+import { getNoticeErrorMessage } from "@/lib/utils";
+import { useTranslation } from "@/contexts/LocaleContext";
 import { useState, useCallback, useEffect, useMemo } from "react";
 import { useBlocker } from "react-router-dom";
 import { api } from "@/lib/api/client";
@@ -20,6 +22,7 @@ interface EditSessionOptions {
 }
 
 export function useEditSession({ server, serverId, updateServer }: EditSessionOptions) {
+  const { t, text } = useTranslation();
   const [isEditing, setIsEditing] = useState(false);
   const [editForm, setEditForm] = useState<EditForm | null>(null);
   const [baselineForm, setBaselineForm] = useState<EditForm | null>(null);
@@ -66,15 +69,15 @@ export function useEditSession({ server, serverId, updateServer }: EditSessionOp
       const connectionType = baselineServer?.connectionType ?? server.connectionType;
       const validationError = validateEditForm(editForm, connectionType);
       if (validationError) {
-        toast.error(validationError);
+        toast.error(text(validationError));
         return;
       }
 
       if (!overwrite) {
         const latest = await api<ServerDetail>(routes.servers.detail(serverId));
         if (latest.connectionType !== connectionType) {
-          toast.error("Save failed", {
-            description: "Connection type changed. Reopen this server before saving.",
+          toast.error(t("Save failed"), {
+            description: t("Connection type changed. Reopen this server before saving."),
           });
           return;
         }
@@ -87,18 +90,18 @@ export function useEditSession({ server, serverId, updateServer }: EditSessionOp
       const updates = formToUpdates(editForm, connectionType);
       await updateServer({ id: serverId, updates });
       if (server?.status === "running") {
-        toast.success("Configuration saved", {
-          description: "Restart the server to apply changes.",
+        toast.success(t("Configuration saved"), {
+          description: t("Restart the server to apply changes."),
         });
       } else {
-        toast.success("Configuration saved");
+        toast.success(t("Configuration saved"));
       }
       exitEdit();
     },
     {
       onError: (err) =>
-        toast.error("Save failed", {
-          description: err instanceof Error ? err.message : "Unknown error",
+        toast.error(t("Save failed"), {
+          description: getNoticeErrorMessage(err),
         }),
     },
   );

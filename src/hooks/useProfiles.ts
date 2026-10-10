@@ -5,6 +5,7 @@ import { api, apiPost, apiPut, apiDelete } from "@/lib/api/client";
 import { routes } from "@/lib/api-routes";
 import { serverKeys, profileKeys, logKeys } from "@/lib/query-keys";
 import { useSSEEvent } from "@/contexts/SSEContext";
+import { getErrorMessage } from "@/lib/utils";
 import type { Profile, ProfileDetail, ProfileToolGroup } from "@moor/types";
 
 export function useProfiles() {
@@ -77,7 +78,7 @@ export function useProfiles() {
   return {
     profiles,
     loading,
-    error: error?.message ?? null,
+    error: error ? getErrorMessage(error) : null,
     refresh,
     createProfile: createProfile.mutateAsync,
     activateProfile: activateProfile.mutateAsync,

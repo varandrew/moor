@@ -101,7 +101,17 @@ pub fn parse_json_mcp_config(content: &str, source: &str) -> ParsedImport {
         results.push(parse_server_map(mcp_servers, source));
     }
     if let Some(mcp) = config_obj.get("mcp") {
-        results.push(parse_server_map(mcp, source));
+        if let Some(servers) = mcp.get("servers").filter(|servers| {
+            source == "zcode"
+                || ((source == "paste" || source == "json-import")
+                    && servers
+                        .as_object()
+                        .is_some_and(|m| m.values().all(Value::is_object)))
+        }) {
+            results.push(parse_server_map(servers, "zcode"));
+        } else {
+            results.push(parse_server_map(mcp, source));
+        }
     }
 
     if results.is_empty() {
@@ -111,7 +121,15 @@ pub fn parse_json_mcp_config(content: &str, source: &str) -> ParsedImport {
         };
     }
 
-    merge_parsed(&results)
+    let mut parsed = merge_parsed(&results);
+    if source == "json-import" {
+        for server in &mut parsed.servers {
+            if server.connection_type == "sse" {
+                server.connection_type = "http".to_string();
+            }
+        }
+    }
+    parsed
 }
 
 pub fn parse_codex_toml_config(content: &str, source: &str) -> ParsedImport {
@@ -138,7 +156,18 @@ pub fn parse_codex_toml_config(content: &str, source: &str) -> ParsedImport {
     match config_table.get("mcp_servers") {
         Some(mcp_servers) => {
             let json_val = toml_to_json_value(mcp_servers);
-            parse_server_map(&json_val, source)
+            let mut parsed = parse_server_map(&json_val, source);
+            if source == "grok-build" {
+                if let Some(disabled) = config_table
+                    .get("disabled_mcp_servers")
+                    .and_then(toml::Value::as_array)
+                {
+                    parsed
+                        .servers
+                        .retain(|s| !disabled.iter().any(|name| name.as_str() == Some(&s.name)));
+                }
+            }
+            parsed
         }
         None => ParsedImport {
             errors: vec![format!("{source}: no mcp_servers key found")],
@@ -180,6 +209,7 @@ fn parse_server_map(value: &Value, source: &str) -> ParsedImport {
 
     let mut servers = vec![];
     let mut unsupported = vec![];
+    let mut diagnostics = vec![];
 
     for (name, raw_config) in obj {
         let raw_obj = match raw_config.as_object() {
@@ -194,12 +224,56 @@ fn parse_server_map(value: &Value, source: &str) -> ParsedImport {
             }
         };
 
-        if raw_obj.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+        if raw_obj.get("enabled").and_then(|v| v.as_bool()) == Some(false)
+            || (source == "zcode" && raw_obj.get("enable").and_then(|v| v.as_bool()) == Some(false))
+        {
             continue;
         }
 
         match normalize_server(name, raw_obj, source) {
-            Some(Normalized::Server(s)) => servers.push(s),
+            Some(Normalized::Server(s)) => {
+                let unmapped: Vec<_> = raw_obj
+                    .keys()
+                    .filter(|key| {
+                        ![
+                            "type",
+                            "transport",
+                            "command",
+                            "args",
+                            "url",
+                            "env",
+                            "environment",
+                            "headers",
+                            "http_headers",
+                            "env_http_headers",
+                            "bearer_token_env_var",
+                            "bearerTokenEnvVar",
+                            "cwd",
+                            "workingDir",
+                            "working_dir",
+                            "enabled",
+                            "enable",
+                        ]
+                        .contains(&key.as_str())
+                    })
+                    .cloned()
+                    .collect();
+                if !unmapped.is_empty() {
+                    diagnostics.push(ImportDiagnostic {
+                        source: source.to_string(),
+                        message: format!(
+                            "Server {name}: client-specific fields are not converted: {}",
+                            unmapped.join(", ")
+                        ),
+                        code: Some("UNMAPPED_FIELDS".to_string()),
+                        line: None,
+                        column: None,
+                        offset: None,
+                        length: None,
+                    });
+                }
+                servers.push(s);
+            }
             Some(Normalized::Unsupported(u)) => unsupported.push(u),
             None => {}
         }
@@ -209,7 +283,7 @@ fn parse_server_map(value: &Value, source: &str) -> ParsedImport {
         servers,
         unsupported,
         errors: vec![],
-        diagnostics: vec![],
+        diagnostics,
     }
 }
 
@@ -225,6 +299,13 @@ fn normalize_server(
 ) -> Option<Normalized> {
     let type_val = raw
         .get("type")
+        .or_else(|| {
+            if source == "kimi-code" {
+                raw.get("transport")
+            } else {
+                None
+            }
+        })
         .and_then(|v| v.as_str())
         .map(|s| s.to_lowercase());
 
@@ -267,7 +348,10 @@ fn normalize_server(
         .or(raw.get("working_dir"))
         .and_then(|v| v.as_str())
         .map(String::from);
-    let bearer_token_env = raw.get("bearer_token_env_var").and_then(|v| v.as_str());
+    let bearer_token_env = raw
+        .get("bearer_token_env_var")
+        .or_else(|| raw.get("bearerTokenEnvVar"))
+        .and_then(|v| v.as_str());
     let headers = merge_records(
         as_header_record(raw.get("headers")),
         as_header_record(raw.get("http_headers")),
@@ -312,7 +396,12 @@ fn normalize_server(
         {
             return Some(Normalized::Server(ScannedServer {
                 name: name.to_string(),
-                connection_type: "http".to_string(),
+                connection_type: if type_val.as_deref() == Some("sse") {
+                    "sse"
+                } else {
+                    "http"
+                }
+                .to_string(),
                 command: None,
                 args: None,
                 url: Some(url),
@@ -519,6 +608,57 @@ mod tests {
             .iter()
             .find(|s| s.name == name)
             .unwrap_or_else(|| panic!("server {name} not found"))
+    }
+
+    #[test]
+    fn automatic_paste_recognizes_zcode_without_masking_opencode_server_names() {
+        let zcode = parse_json_mcp_config(
+            r#"{"mcp":{"servers":{"off":{"enable":false,"url":"http://localhost/mcp"},"on":{"url":"http://localhost/mcp"}}}}"#,
+            "json-import",
+        );
+        assert_eq!(zcode.servers.len(), 1);
+        assert_eq!(zcode.servers[0].name, "on");
+        let opencode = parse_json_mcp_config(
+            r#"{"mcp":{"servers":{"type":"remote","url":"http://localhost/mcp"}}}"#,
+            "json-import",
+        );
+        assert_eq!(opencode.servers[0].name, "servers");
+    }
+
+    #[test]
+    fn zcode_disabled_fields_never_import_disabled_servers() {
+        let parsed = parse_json_mcp_config(
+            r#"{"mcp":{"servers":{
+            "desktop-off":{"url":"http://localhost/mcp","enable":false,"enabled":true},
+            "cli-off":{"url":"http://localhost/mcp","enabled":false},
+            "active":{"url":"http://localhost/mcp","type":"http"}
+        }}}"#,
+            "zcode",
+        );
+        assert!(parsed.errors.is_empty());
+        assert_eq!(parsed.servers.len(), 1);
+        assert_eq!(parsed.servers[0].name, "active");
+    }
+
+    #[test]
+    fn minimax_disabled_entries_and_sse_keep_their_intent() {
+        let parsed = parse_json_mcp_config(
+            r#"{"mcpServers":{
+            "off":{"url":"http://localhost/mcp","enabled":false},
+            "legacy":{"url":"http://localhost/sse","type":"sse","timeout":30000}
+        }}"#,
+            "minimax-code",
+        );
+        assert_eq!(parsed.servers.len(), 1);
+        assert_eq!(parsed.servers[0].connection_type, "sse");
+        assert!(parsed.diagnostics[0].message.contains("timeout"));
+    }
+
+    #[test]
+    fn grok_root_disabled_list_is_respected() {
+        let parsed = parse_codex_toml_config("disabled_mcp_servers = [\"off\"]\n[mcp_servers.off]\nurl = \"http://localhost/mcp\"\n[mcp_servers.on]\nurl = \"http://localhost/mcp\"", "grok-build");
+        assert_eq!(parsed.servers.len(), 1);
+        assert_eq!(parsed.servers[0].name, "on");
     }
 
     #[test]
@@ -805,7 +945,7 @@ enabled = false
         assert_eq!(remote.url.as_deref(), Some("https://mcp.linear.app/mcp"));
 
         let sse = find(&parsed, "legacy-events");
-        assert_eq!(sse.connection_type, "http");
+        assert_eq!(sse.connection_type, "sse");
         assert_eq!(sse.url.as_deref(), Some("https://mcp.example.com/sse"));
     }
 }

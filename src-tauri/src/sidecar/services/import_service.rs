@@ -26,7 +26,12 @@ pub async fn execute_import(
         .iter()
         .map(|sc| CreateServerInput {
             name: sc.name.clone(),
-            connection_type: sc.connection_type.clone(),
+            // SSE 导入沿用 HTTP 存储，由传输层识别协议。
+            connection_type: if sc.connection_type == "sse" {
+                "http".to_string()
+            } else {
+                sc.connection_type.clone()
+            },
             command: sc.command.clone(),
             args: sc.args.clone(),
             url: sc.url.clone(),

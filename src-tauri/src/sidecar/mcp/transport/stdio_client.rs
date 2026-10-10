@@ -13,10 +13,23 @@ use tokio::process::{Child, Command};
 use tokio::sync::{oneshot, watch, Mutex as AsyncMutex};
 
 use super::format_timeout_duration;
+use super::request_error::{parse_response, RequestError};
 use crate::sidecar::services::server_log::{redact_sensitive_stderr_values, DiagnosticAttempt};
 
 type PendingMap = Arc<Mutex<HashMap<i64, oneshot::Sender<Value>>>>;
 type StderrLines = Arc<Mutex<VecDeque<String>>>;
+
+// 超时、写入失败及任务取消都必须释放挂起请求。
+struct PendingRequest {
+    pending: PendingMap,
+    id: i64,
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.id);
+    }
+}
 
 #[cfg(any(windows, test))]
 const WINDOWS_CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -139,6 +152,17 @@ impl StdioClientTransport {
     }
 
     pub async fn send_request(&self, method: &str, params: Option<Value>) -> Result<Value, String> {
+        self.send_request_with_timeout(method, params, self.request_timeout)
+            .await
+            .map_err(|error| error.message)
+    }
+
+    pub async fn send_request_with_timeout(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value, RequestError> {
         let id = {
             let mut next = self.next_id.lock().unwrap();
             let id = *next;
@@ -146,54 +170,52 @@ impl StdioClientTransport {
             id
         };
 
-        let request = serde_json::json!({
+        let mut request = serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": method,
-            "params": params.unwrap_or(Value::Null),
         });
+        if let Some(params) = params {
+            request["params"] = params;
+        }
 
         let (tx, rx) = oneshot::channel();
         {
             let mut map = self.pending.lock().unwrap();
             map.insert(id, tx);
         }
+        let _pending = PendingRequest {
+            pending: self.pending.clone(),
+            id,
+        };
 
-        let msg = format!("{}\n", serde_json::to_string(&request).unwrap_or_default());
-        {
-            let mut stdin_opt = self.stdin_handle.lock().await;
-            let stdin = stdin_opt.as_mut().ok_or("stdin closed")?;
-            stdin
-                .write_all(msg.as_bytes())
-                .await
-                .map_err(|e| format!("stdin write failed: {e}"))?;
-            stdin
-                .flush()
-                .await
-                .map_err(|e| format!("stdin flush failed: {e}"))?;
-        }
+        tokio::time::timeout(timeout, async {
+            let msg = format!("{}\n", serde_json::to_string(&request).unwrap_or_default());
+            {
+                let mut stdin_opt = self.stdin_handle.lock().await;
+                let stdin = stdin_opt.as_mut().ok_or("stdin closed")?;
+                stdin
+                    .write_all(msg.as_bytes())
+                    .await
+                    .map_err(|e| format!("stdin write failed: {e}"))?;
+                stdin
+                    .flush()
+                    .await
+                    .map_err(|e| format!("stdin flush failed: {e}"))?;
+            }
 
-        match tokio::time::timeout(self.request_timeout, rx).await {
-            Ok(Ok(response)) => {
-                if let Some(error) = response.get("error") {
-                    let msg = error
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("Unknown error");
-                    return Err(msg.to_string());
-                }
-                Ok(response.get("result").cloned().unwrap_or(Value::Null))
-            }
-            Ok(Err(_)) => Err("response channel closed".into()),
-            Err(_) => {
-                let mut map = self.pending.lock().unwrap();
-                map.remove(&id);
-                Err(format!(
-                    "request timed out after {}",
-                    format_timeout_duration(self.request_timeout)
-                ))
-            }
-        }
+            let response = rx
+                .await
+                .map_err(|_| RequestError::from("response channel closed"))?;
+            parse_response(&response)
+        })
+        .await
+        .map_err(|_| {
+            RequestError::from(format!(
+                "request timed out after {}",
+                format_timeout_duration(timeout)
+            ))
+        })?
     }
 
     pub async fn send_notification(
@@ -383,6 +405,10 @@ fn build_stdio_environment_with_login_shell_path(
         .collect();
 
     let separator = if is_windows { ";" } else { ":" };
+    // Windows 环境键不区分大小写，重复别名会覆盖已经合并的路径。
+    if is_windows {
+        env.retain(|key, _| !key.eq_ignore_ascii_case("PATH"));
+    }
     env.insert("PATH".to_string(), unique.join(separator));
     env
 }
@@ -586,6 +612,42 @@ fn is_executable(path: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn probe_timeout_cleans_pending_without_changing_tool_timeout() {
+        let diagnostics = crate::sidecar::services::server_log::ServerDiagnostics::default()
+            .begin_attempt("timeout", "node");
+        let mut transport = StdioClientTransport::spawn(
+            "node",
+            &[
+                "-e".into(),
+                "process.stdin.resume(); setInterval(() => {}, 1000)".into(),
+            ],
+            None,
+            std::env::vars().collect(),
+            Duration::from_secs(30),
+            diagnostics,
+        )
+        .await
+        .expect("spawn test process");
+        let error = transport
+            .send_request_with_timeout("ping", None, Duration::from_millis(20))
+            .await
+            .expect_err("ping should time out");
+        assert!(error.message.contains("timed out"));
+        assert!(transport.pending.lock().unwrap().is_empty());
+        assert_eq!(transport.request_timeout, Duration::from_secs(30));
+        {
+            let stdin = transport.stdin_handle.clone();
+            let _guard = stdin.lock().await;
+            let request =
+                transport.send_request_with_timeout("ping", None, Duration::from_secs(30));
+            tokio::pin!(request);
+            tokio::select! { _ = &mut request => panic!("request unexpectedly completed"), _ = tokio::time::sleep(Duration::from_millis(10)) => {} }
+        }
+        assert!(transport.pending.lock().unwrap().is_empty());
+        transport.close().await.expect("close test process");
+    }
+
     #[test]
     fn windows_path_lookup_accepts_path_alias() {
         let env = HashMap::from([("Path".to_string(), r"C:\Tools".to_string())]);
@@ -693,6 +755,24 @@ mod tests {
 mod stdio_env_tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_aliases_cannot_override_the_merged_path() {
+        let parent = HashMap::from([("Path".to_string(), r"C:\Parent".to_string())]);
+        let server = HashMap::from([("pAtH".to_string(), r"C:\Server".to_string())]);
+        let env = build_stdio_environment(&parent, Some(&server));
+        assert_eq!(
+            env.keys()
+                .filter(|key| key.eq_ignore_ascii_case("PATH"))
+                .count(),
+            1
+        );
+        assert!(env
+            .get("PATH")
+            .unwrap()
+            .starts_with(r"C:\Server;C:\Parent;"));
+    }
 
     #[cfg(unix)]
     #[test]

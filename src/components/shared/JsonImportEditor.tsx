@@ -1,13 +1,13 @@
+import { useTranslation } from "@/contexts/LocaleContext";
+import { translateText } from "@/lib/messages";
+import type { Locale } from "@/lib/locale";
+import { EditorState } from "@codemirror/state";
 import { useMemo } from "react";
 import CodeMirror from "@uiw/react-codemirror";
 import { json } from "@codemirror/lang-json";
 import { lintGutter, linter, type Diagnostic } from "@codemirror/lint";
 import { EditorView } from "@codemirror/view";
-import {
-  formatJsonDiagnostic,
-  getJsonImportDiagnostics,
-  type ImportDiagnostic,
-} from "@/lib/json-import-editor";
+import { getJsonImportDiagnostics, type ImportDiagnostic } from "@/lib/json-import-editor";
 
 interface JsonImportEditorProps {
   value: string;
@@ -16,7 +16,11 @@ interface JsonImportEditorProps {
   onChange: (value: string) => void;
 }
 
-function toCodeMirrorDiagnostic(content: string, diagnostic: ImportDiagnostic): Diagnostic {
+function toCodeMirrorDiagnostic(
+  content: string,
+  diagnostic: ImportDiagnostic,
+  locale: Locale,
+): Diagnostic {
   const from = Math.min(diagnostic.offset ?? 0, content.length);
   const length = Math.max(diagnostic.length ?? 1, 1);
   return {
@@ -24,7 +28,7 @@ function toCodeMirrorDiagnostic(content: string, diagnostic: ImportDiagnostic): 
     to: Math.min(from + length, content.length),
     severity: "error",
     source: diagnostic.source,
-    message: diagnostic.message,
+    message: translateText(locale, diagnostic.code ?? diagnostic.message),
   };
 }
 
@@ -101,19 +105,42 @@ export function JsonImportEditor({
   diagnostics,
   onChange,
 }: JsonImportEditorProps) {
+  const { t, text, locale } = useTranslation();
   const extensions = useMemo(
     () => [
       json(),
+      EditorState.phrases.of(
+        locale === "zh-CN"
+          ? {
+              Find: "查找",
+              Replace: "替换",
+              next: "下一个",
+              previous: "上一个",
+              all: "全部",
+              "match case": "区分大小写",
+              "by word": "按单词",
+              regexp: "正则表达式",
+              replace: "替换",
+              "replace all": "全部替换",
+              close: "关闭",
+              "No diagnostics": "没有诊断问题",
+              "Fold line": "折叠行",
+              "Unfold line": "展开行",
+              "Folded lines": "已折叠的行",
+              "$1 scan warnings": "$1 条检查警告",
+            }
+          : {},
+      ),
       linter((view) => {
         const content = view.state.doc.toString();
         return getJsonImportDiagnostics(content).map((diagnostic) =>
-          toCodeMirrorDiagnostic(content, diagnostic),
+          toCodeMirrorDiagnostic(content, diagnostic, locale),
         );
       }),
       lintGutter(),
       moorEditorTheme,
     ],
-    [],
+    [locale],
   );
 
   return (
@@ -139,7 +166,13 @@ export function JsonImportEditor({
               key={`${diagnostic.offset ?? "root"}:${diagnostic.message}`}
               className="font-mono text-[11px] leading-relaxed text-error-warm"
             >
-              {formatJsonDiagnostic(diagnostic)}
+              {diagnostic.line && diagnostic.column
+                ? t("Line {line}, Column {column}: {message}", {
+                    line: diagnostic.line,
+                    column: diagnostic.column,
+                    message: text(diagnostic.code ?? diagnostic.message),
+                  })
+                : text(diagnostic.code ?? diagnostic.message)}
             </p>
           ))}
         </div>

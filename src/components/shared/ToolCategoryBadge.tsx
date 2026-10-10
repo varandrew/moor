@@ -1,11 +1,13 @@
+import { useTranslation } from "@/contexts/LocaleContext";
 import { Badge } from "@/components/ui/badge";
 
 export function ToolCategoryBadge({ name }: { name: string }) {
+  const { t } = useTranslation();
   const lower = name.toLowerCase();
   if (lower.includes("read") || lower.includes("get") || lower.includes("fetch")) {
     return (
       <Badge variant="subtle" className="text-[10px] bg-read/15 text-read border-read/20">
-        Read
+        {t("Read")}
       </Badge>
     );
   }
@@ -17,7 +19,7 @@ export function ToolCategoryBadge({ name }: { name: string }) {
   ) {
     return (
       <Badge variant="subtle" className="text-[10px] bg-edit/15 text-edit border-edit/20">
-        Edit
+        {t("Edit")}
       </Badge>
     );
   }
@@ -29,7 +31,7 @@ export function ToolCategoryBadge({ name }: { name: string }) {
   ) {
     return (
       <Badge variant="subtle" className="text-[10px] bg-grep/15 text-grep border-grep/20">
-        Search
+        {t("Search")}
       </Badge>
     );
   }
@@ -39,13 +41,13 @@ export function ToolCategoryBadge({ name }: { name: string }) {
         variant="subtle"
         className="text-[10px] bg-error-warm/10 text-error-warm border-error-warm/15"
       >
-        Destructive
+        {t("Destructive")}
       </Badge>
     );
   }
   return (
     <Badge variant="subtle" className="text-[10px]">
-      Tool
+      {t("Tool")}
     </Badge>
   );
 }

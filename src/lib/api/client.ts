@@ -1,10 +1,10 @@
 import type { SidecarInfo } from "@moor/types";
-import { createErrorWithCause } from "@/lib/utils";
+import { ApiRequestError } from "@/lib/api-error";
 import { getApiRuntime, refreshApiRuntime, buildApiUrl, buildApiHeaders } from "./runtime";
 import {
   formatApiNetworkError,
   formatApiRetryError,
-  readApiError,
+  readApiFailure,
   parseApiResponse,
   isAbortError,
   shouldRetryNetworkError,
@@ -35,12 +35,15 @@ async function retryWithFreshRuntime<T>(
   try {
     const retryResp = await fetchWithRuntime(path, options, runtime);
     if (!retryResp.ok) {
-      throw new Error(await readApiError(retryResp));
+      throw await readApiFailure(retryResp);
     }
     return retryResp.json() as Promise<T>;
   } catch (retryErr) {
-    throw createErrorWithCause(
+    if (retryErr instanceof ApiRequestError) throw retryErr;
+    throw new ApiRequestError(
       formatApiRetryError(path, runtime, originalError, retryErr),
+      "NETWORK_ERROR",
+      undefined,
       originalError,
     );
   }
@@ -55,14 +58,19 @@ export async function api<T>(path: string, options?: RequestOptions): Promise<T>
     if (isAbortError(err, options?.signal)) {
       throw err;
     }
-    const networkError = createErrorWithCause(formatApiNetworkError(path, err, runtime), err);
+    const networkError = new ApiRequestError(
+      formatApiNetworkError(path, err, runtime),
+      "NETWORK_ERROR",
+      undefined,
+      err,
+    );
     if (!shouldRetryNetworkError(options)) {
       throw networkError;
     }
     return retryWithFreshRuntime<T>(path, options, networkError);
   }
   if (resp.status === 401) {
-    return retryWithFreshRuntime<T>(path, options, new Error(await readApiError(resp)));
+    return retryWithFreshRuntime<T>(path, options, await readApiFailure(resp));
   }
   return parseApiResponse<T>(resp);
 }

@@ -1,3 +1,4 @@
+import { useTranslation } from "@/contexts/LocaleContext";
 import { useEffect, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -30,6 +31,7 @@ import {
 import { useNavigate } from "react-router-dom";
 
 export function Dashboard() {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const { servers } = useServerList();
   const { profiles } = useProfiles();
@@ -50,7 +52,7 @@ export function Dashboard() {
 
   return (
     <div className="space-y-8 animate-fade-in-up">
-      <PageHeader title="Dashboard" subtitle="Monitor your MCP servers and activity" />
+      <PageHeader title={t("Dashboard")} subtitle={t("Monitor your MCP servers and activity")} />
 
       {/* Global MCP Endpoint */}
       <Card className="animate-fade-in-up stagger-1 border-[var(--fg-08)] bg-gradient-to-r from-surface-400 to-surface-300/50">
@@ -62,13 +64,13 @@ export function Dashboard() {
             <div className="min-w-0">
               <div className="flex items-center gap-2 mb-1">
                 <span className="font-headline text-sm font-medium text-cursor-dark">
-                  Global MCP Endpoint
+                  {t("Global MCP Endpoint")}
                 </span>
                 <span className="relative flex h-2 w-2">
                   <span className="animate-ping-slow absolute inline-flex h-full w-full rounded-full bg-success-muted opacity-50" />
                   <span className="relative inline-flex rounded-full h-2 w-2 bg-success-muted" />
                 </span>
-                <Badge variant="success">Active</Badge>
+                <Badge variant="success">{t("Active")}</Badge>
               </div>
               <div className="flex items-center gap-2 bg-surface-100 border border-[var(--fg-08)] rounded-lg px-3 py-1.5 font-mono text-xs text-[var(--fg-55)] w-fit">
                 {mcpEndpoint}
@@ -83,28 +85,28 @@ export function Dashboard() {
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard
           icon={Server}
-          label="Running"
+          label={t("Running")}
           value={running}
           accent="bg-success-muted/10 text-success-muted border-success-muted/20"
           delay={2}
         />
         <StatCard
           icon={ActivitySquare}
-          label="Stopped"
+          label={t("Stopped")}
           value={stopped}
           accent="bg-[var(--fg-06)] text-[var(--fg-40)] border-[var(--fg-10)]"
           delay={3}
         />
         <StatCard
           icon={AlertTriangle}
-          label="Errors"
+          label={t("Errors")}
           value={errored}
           accent="bg-error-warm/10 text-error-warm border-error-warm/20"
           delay={4}
         />
         <StatCard
           icon={FolderOpen}
-          label="Active Profile"
+          label={t("Active Profile")}
           value={activeProfile?.name || "—"}
           accent="bg-cursor-orange/10 text-cursor-orange border-cursor-orange/20"
           delay={5}
@@ -118,15 +120,16 @@ export function Dashboard() {
           <CardHeader className="pb-3 flex flex-row items-center justify-between">
             <CardTitle className="text-base flex items-center gap-2">
               <Activity className="h-4 w-4 text-[var(--fg-40)]" />
-              Recent Activity
+              {t("Recent Activity")}
             </CardTitle>
             <Button variant="ghost" size="sm" onClick={() => navigate("/logs")}>
-              View All <ChevronRight className="h-3.5 w-3.5 ml-1" />
+              {t("View All")}
+              <ChevronRight className="h-3.5 w-3.5 ml-1" />
             </Button>
           </CardHeader>
           <CardContent>
             {recentLogs.length === 0 ? (
-              <EmptyState icon={Clock} message="No recent activity" />
+              <EmptyState icon={Clock} message={t("No recent activity")} />
             ) : (
               <div className="space-y-1">
                 {recentLogs.map((log) => (
@@ -147,7 +150,7 @@ export function Dashboard() {
                       </span>
                       {log.error && (
                         <Badge variant="error" className="text-[10px]">
-                          failed
+                          {t("failed")}
                         </Badge>
                       )}
                     </div>
@@ -166,15 +169,16 @@ export function Dashboard() {
           <CardHeader className="pb-3 flex flex-row items-center justify-between">
             <CardTitle className="text-base flex items-center gap-2">
               <Server className="h-4 w-4 text-[var(--fg-40)]" />
-              Server Status
+              {t("Server Status")}
             </CardTitle>
             <Button variant="ghost" size="sm" onClick={() => navigate("/servers")}>
-              Manage <ChevronRight className="h-3.5 w-3.5 ml-1" />
+              {t("Manage")}
+              <ChevronRight className="h-3.5 w-3.5 ml-1" />
             </Button>
           </CardHeader>
           <CardContent>
             {recentServers.length === 0 ? (
-              <EmptyState icon={Server} message="No servers configured" />
+              <EmptyState icon={Server} message={t("No servers configured")} />
             ) : (
               <div className="space-y-1">
                 {recentServers.map((server) => (

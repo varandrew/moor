@@ -1,3 +1,4 @@
+import { useTranslation } from "@/contexts/LocaleContext";
 import { CopyButton } from "./CopyButton";
 
 interface CodeBlockProps {
@@ -6,11 +7,12 @@ interface CodeBlockProps {
 }
 
 export function CodeBlock({ code, label }: CodeBlockProps) {
+  const { text } = useTranslation();
   return (
     <div className="relative group">
       {label && (
         <p className="font-headline text-[11px] text-[var(--fg-50)] mb-1.5 uppercase tracking-wider">
-          {label}
+          {text(label)}
         </p>
       )}
       <div className="bg-surface-inverted rounded-xl border border-[var(--fg-15)] p-4 relative overflow-hidden">

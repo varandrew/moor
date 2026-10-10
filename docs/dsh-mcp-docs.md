@@ -1,8 +1,9 @@
 # DeepSeek Harness (dsh) MCP Reference
 
 > Source: https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/mcp/mcp-client/README.md
+> Checked: 2026-10-08
+> Applicable version: Current official documentation; version-specific requirements are noted below.
 > Additional sources: https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/mcp/README.md, https://github.com/deepseek-ai/deepseek-harness/blob/master/examples/mcp-memory/mcp-reference-memory.cordis.yml, https://github.com/deepseek-ai/deepseek-harness/blob/master/README.md, https://www.deepseek.com/harness/
-> Accessed: 2026-08-29
 >
 > Note: This document is an edited, user-oriented excerpt of the sources above (the primary source is a package-level, developer-facing README), not a verbatim mirror. Copyright belongs to the original site; content may be outdated, please refer to the official links. Follow the original site's license when citing or redistributing.
 
@@ -12,29 +13,30 @@ DeepSeek Harness (`dsh`) is an open-source agent harness developed by DeepSeek A
 
 dsh is currently in _developer preview_ and iterating rapidly. **There will be compatibility-breaking changes.**
 
-## Configuring MCP servers (cordis.yml)
+## Configuring MCP servers (cordis.patch.yml)
 
-MCP servers are configured as Cordis plugin rows — **one plugin instance per MCP server** in `cordis.yml`:
+MCP servers are configured as Cordis plugin rows — **one plugin instance per MCP server** in the user patch `cordis.patch.yml`:
 
 ```yaml
-- id: mcp-github
-  name: "@deepseek-ai/dsh-mcp-client"
-  config:
-    serverName: github
-    transport: stdio
-    command: npx
-    args: ["-y", "@modelcontextprotocol/server-github"]
-    env:
-      GITHUB_TOKEN: !!js process.env.GITHUB_TOKEN
+- insert:
+    - id: mcp-github
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: github
+        transport: stdio
+        command: npx
+        args: ["-y", "@modelcontextprotocol/server-github"]
+        env:
+          GITHUB_TOKEN: !!js process.env.GITHUB_TOKEN
 
-- id: mcp-web
-  name: "@deepseek-ai/dsh-mcp-client"
-  config:
-    serverName: web
-    transport: streamable-http
-    url: http://localhost:3000/mcp
-    headers:
-      Authorization: !!js "`Bearer ${process.env.MCP_TOKEN}`"
+    - id: mcp-web
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: web
+        transport: streamable-http
+        url: http://localhost:3000/mcp
+        headers:
+          Authorization: !!js "`Bearer ${process.env.MCP_TOKEN}`"
 ```
 
 Notes on configuration:
@@ -102,8 +104,14 @@ Every MCP tool has two names: the raw MCP name (sent on the wire in `tools/call`
 
 ## Known limitations
 
-- **Tools are the only bridged MCP capability** — Resources and Prompts have no harness consumer and are deferred.
+- **Resources** are read on demand; Prompts remain unsupported.
 - **Startup timeout is inherited from the MCP SDK** — dsh does not yet expose a connection/discovery timeout. Each initialize or paginated `tools/list` request uses the SDK's 60-second default, so an unresponsive server can delay activation and teardown.
 - **Reconnect triggers on transport close** — a crashed stdio child fires it; Streamable HTTP failures surface per request and through the SDK transport's own SSE-stream recovery, so an unreachable HTTP server is retried per call rather than respawned by the supervisor.
-- **Non-text rendering is lossy** — image, audio, and resource payloads become placeholders in model context.
-- **Unsupported MCP output schemas are not enforced** — `structuredContent` falls back to `JsonValue` when the advertised schema uses vocabulary outside the harness subset.
+- **Images** can enter model context after capability verification; other non-text support depends on the harness.
+- **Output validation** is performed by the MCP SDK; unsupported model representations still require harness-specific handling.
+
+## Current configuration notes
+
+User patch: `$DSH_HOME/cordis.patch.yml` (default `~/.dsh/cordis.patch.yml`). Profile patch: `$DSH_HOME/profiles/<name>/cordis.patch.yml`. Append plugin rows under `- insert:`. Disable a Cordis row using its row-level `disabled` field, not `config.enabled`. `maxInstructionBytes` defaults to 32768.
+
+Moor supports DSH generation/export only. YAML scanning and paste import are unsupported, and dynamic `!!js` expressions are never evaluated.

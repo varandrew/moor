@@ -1,3 +1,5 @@
+import type { MessageKey } from "@/lib/messages";
+import { getErrorMessage } from "@/lib/utils";
 import { useCallback, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { apiPost } from "@/lib/api/client";
@@ -14,7 +16,9 @@ export function useConfigImport() {
 
   const [scanCandidates, setScanCandidates] = useState<ScannedServer[]>([]);
   const [selectedImports, setSelectedImports] = useState<Set<string>>(new Set());
-  const [scanStatus, setScanStatus] = useState<string | null>(null);
+  const [scanStatus, setScanStatus] = useState<
+    string | { key: MessageKey; params: Record<string, number> } | null
+  >(null);
   const [importPreview, setImportPreview] = useState<ImportPreview | null>(null);
 
   const [jsonImport, setJsonImport] = useState("");
@@ -27,7 +31,12 @@ export function useConfigImport() {
     setScanCandidates(result.servers);
     setSelectedImports(new Set(result.servers.map((server) => server.name)));
     setScanStatus(
-      result.newServers === 0 ? `Scanned ${result.scanned} configs. No new servers found.` : null,
+      result.newServers === 0
+        ? {
+            key: "Scanned {count} configs. No new servers found.",
+            params: { count: result.scanned },
+          }
+        : null,
     );
   }, []);
 
@@ -36,7 +45,7 @@ export function useConfigImport() {
       const result = await apiPost<ImportPreview>(routes.import.scan(), {});
       applyImportPreview(result);
     } catch (err) {
-      setScanStatus((err as Error).message);
+      setScanStatus(getErrorMessage(err));
     }
   }, [applyImportPreview]);
 
@@ -82,7 +91,7 @@ export function useConfigImport() {
       setJsonImportStatus(null);
       return true;
     } catch (err) {
-      setJsonImportErrors([(err as Error).message]);
+      setJsonImportErrors([getErrorMessage(err)]);
       setJsonImportStatus(null);
       return false;
     }
@@ -99,9 +108,10 @@ export function useConfigImport() {
     },
     {
       onSuccess: (result) => {
-        setScanStatus(
-          `Imported ${result.imported.length} servers. Skipped ${result.skipped.length}.`,
-        );
+        setScanStatus({
+          key: "Imported {imported} servers. Skipped {skipped}.",
+          params: { imported: result.imported.length, skipped: result.skipped.length },
+        });
         setScanCandidates([]);
         setSelectedImports(new Set());
         setImportPreview(null);

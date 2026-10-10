@@ -12,6 +12,8 @@ const ALL_CLIENT_IDS = [
   "dsh",
   "grok-build",
   "pi",
+  "zcode",
+  "minimax-code",
 ] as const;
 
 describe("client icons", () => {

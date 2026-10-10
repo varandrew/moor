@@ -1,7 +1,8 @@
 # Grok Build Model Context Protocol (MCP)
 
 > Source: https://docs.x.ai/build/features/mcp-servers
-> Accessed: 2026-08-29
+> Checked: 2026-10-08
+> Applicable version: Current official documentation; version-specific requirements are noted below.
 >
 > Note: This document is an external documentation mirror/reference. Copyright belongs to the original site; content may be outdated, please refer to the official link. Follow the original site's license when citing or redistributing.
 
@@ -26,7 +27,7 @@ command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
 env = { API_KEY = "${MY_API_KEY}" }
 startup_timeout_sec = 30              # default 30
-tool_timeout_sec = 6000               # default 6000
+tool_timeout_sec = 60                 # example; defaults differ between official references
 ```
 
 ### HTTP server (remote)
@@ -37,19 +38,19 @@ url = "https://mcp.linear.app/mcp"
 headers = { "x-mcp-session-id" = "{{session_id}}" }
 ```
 
-Only `stdio` (local) and `http` (remote) transports are documented; SSE is not named.
+The website documents stdio and HTTP; the current official repository additionally documents SSE.
 
 ### Fields
 
-| Field                 | Applies to | Description                                   |
-| --------------------- | ---------- | --------------------------------------------- |
-| `command`             | stdio      | Executable to spawn                           |
-| `args`                | stdio      | Arguments passed to the command               |
-| `env`                 | stdio      | Environment variables for the child process   |
-| `url`                 | http       | Server URL                                    |
-| `headers`             | http       | Static request headers                        |
-| `startup_timeout_sec` | both       | Startup timeout in seconds (default `30`)     |
-| `tool_timeout_sec`    | both       | Tool-call timeout in seconds (default `6000`) |
+| Field                 | Applies to | Description                                            |
+| --------------------- | ---------- | ------------------------------------------------------ |
+| `command`             | stdio      | Executable to spawn                                    |
+| `args`                | stdio      | Arguments passed to the command                        |
+| `env`                 | stdio      | Environment variables for the child process            |
+| `url`                 | http       | Server URL                                             |
+| `headers`             | http       | Static request headers                                 |
+| `startup_timeout_sec` | both       | Startup timeout in seconds (default `30`)              |
+| `tool_timeout_sec`    | both       | Tool-call timeout in seconds; verify installed version |
 
 Variable expansion: Grok expands `${VAR}` (and `${VAR:-default}`) in `url`, `command`, `args`, `env`, and `headers`. Only these two forms are documented — `${env:VAR}` is not expanded (inferred; the official docs list no such syntax). The `{{session_id}}` template is available in headers. Auth headers can also be passed via the `--header` CLI flag; OAuth is handled through a browser flow.
 
@@ -84,3 +85,13 @@ First step is `grok mcp doctor`. Cold-start `npx` servers may need a raised `sta
 
 - Only connect to servers from trusted sources; stdio entries execute local commands
 - Review the transport and launch target before enabling project-level servers from repositories you don't own
+
+## Current repository additions
+
+Additional source: https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/07-mcp-servers.md
+
+The website was last updated 2026-07-02. The repository additionally documents `enabled`, `tool_timeouts`, `bearer_token_file`, and `grok mcp enable` / `disable`. Personal disabled names can live in root `disabled_mcp_servers`; Moor respects this list when scanning Grok configuration. The website and repository disagree on the tool timeout default (6000 versus 60 seconds); verify your installed version.
+
+```bash
+grok mcp add --transport sse legacy https://example.com/sse
+```

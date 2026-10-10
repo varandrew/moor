@@ -40,6 +40,7 @@ pub struct GeneralSettings {
 #[serde(rename_all = "camelCase")]
 pub struct AppearanceSettings {
     pub theme: String,
+    pub locale: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -52,6 +53,8 @@ pub struct AdvancedSettings {
     pub mcp_request_timeout_ms: u32,
     pub mcp_server_start_timeout_ms: u32,
     pub mcp_session_idle_ttl_ms: u32,
+    pub mcp_health_checks_enabled: bool,
+    pub mcp_health_check_interval_seconds: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -75,6 +78,7 @@ pub fn default_settings() -> Settings {
         },
         appearance: AppearanceSettings {
             theme: "system".to_string(),
+            locale: "system".to_string(),
         },
         advanced: AdvancedSettings {
             log_retention_days: 30,
@@ -84,6 +88,8 @@ pub fn default_settings() -> Settings {
             mcp_request_timeout_ms: MCP_TIMEOUT_MS_DEFAULT,
             mcp_server_start_timeout_ms: MCP_TIMEOUT_MS_DEFAULT,
             mcp_session_idle_ttl_ms: MCP_SESSION_IDLE_TTL_MS_DEFAULT,
+            mcp_health_checks_enabled: false,
+            mcp_health_check_interval_seconds: 60,
         },
     }
 }
@@ -234,6 +240,7 @@ fn merge_objects(base: &mut Map<String, Value>, patch: &Map<String, Value>) {
 
 // 数值范围收拢在一张表；新增一个有界设置只需加一行。
 const NUMERIC_BOUNDS: &[(&str, u64, u64)] = &[
+    ("advanced.mcpHealthCheckIntervalSeconds", 30, 600),
     ("advanced.logRetentionDays", 0, 365),
     ("advanced.sidecarPort", 1024, 65535),
     (
@@ -260,6 +267,12 @@ fn setting_at<'a>(value: &'a Value, dotted: &str) -> Option<&'a Value> {
 }
 
 fn validate_settings_value(value: &Value) -> Result<(), String> {
+    if !matches!(
+        setting_at(value, "appearance.locale").and_then(Value::as_str),
+        Some("system" | "zh-CN" | "en")
+    ) {
+        return Err("appearance.locale must be system, zh-CN, or en".to_string());
+    }
     if setting_at(value, "version").and_then(Value::as_u64) == Some(0) {
         return Err("version must be at least 1".to_string());
     }
@@ -315,6 +328,35 @@ mod tests {
         let db = Database::open(&data_dir.join("moor.db")).expect("failed to open settings db");
         db.run_migrations().expect("failed to migrate settings db");
         db
+    }
+
+    #[test]
+    fn locale_and_health_defaults_preserve_existing_settings() {
+        let data_dir = temp_data_dir("locale-health");
+        let db = test_db(&data_dir);
+        let legacy = update_settings(&db, serde_json::json!({ "general": { "autoStartOnLogin": true }, "advanced": { "sidecarPort": 9333 } })).unwrap();
+        assert_eq!(legacy.appearance.locale, "system");
+        assert!(!legacy.advanced.mcp_health_checks_enabled);
+        assert_eq!(legacy.advanced.mcp_health_check_interval_seconds, 60);
+        update_settings(&db, serde_json::json!({ "appearance": { "locale": "zh-CN" }, "advanced": { "mcpHealthChecksEnabled": true, "mcpHealthCheckIntervalSeconds": 30 } })).unwrap();
+        let persisted = get_settings(&db).unwrap();
+        assert_eq!(persisted.appearance.locale, "zh-CN");
+        assert!(persisted.general.auto_start_on_login);
+        assert_eq!(persisted.advanced.sidecar_port, 9333);
+        for invalid in [
+            serde_json::json!({"appearance":{"locale":"de"}}),
+            serde_json::json!({"advanced":{"mcpHealthCheckIntervalSeconds":29}}),
+            serde_json::json!({"advanced":{"mcpHealthCheckIntervalSeconds":601}}),
+            serde_json::json!({"advanced":{"mcpHealthCheckIntervalSeconds":30.5}}),
+        ] {
+            assert!(update_settings(&db, invalid).is_err());
+        }
+        assert_eq!(get_settings(&db).unwrap(), persisted);
+        drop(db);
+        let reopened = test_db(&data_dir);
+        assert_eq!(get_settings(&reopened).unwrap(), persisted);
+        drop(reopened);
+        let _ = fs::remove_dir_all(data_dir);
     }
 
     #[test]

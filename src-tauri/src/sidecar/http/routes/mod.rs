@@ -3,5 +3,7 @@ pub mod health;
 pub mod import_routes;
 pub mod logs;
 pub mod profiles;
+pub mod server_health;
 pub mod servers;
 pub mod settings;
+pub mod updates;

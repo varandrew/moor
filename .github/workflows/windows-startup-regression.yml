@@ -1,0 +1,43 @@
+name: Windows 启动回归验证
+
+on:
+  pull_request:
+    paths:
+      - "src-tauri/**"
+      - ".github/workflows/windows-startup-regression.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  startup:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: 安装 Rust 工具链
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache-workspaces: "src-tauri -> target"
+          cache-bin: false
+          rustflags: ""
+
+      - name: 验证 Windows 路径和缺失命令处理
+        # 只验证后端启动链路，不嵌入尚未构建的前端资源。
+        run: cargo test --locked --no-default-features --manifest-path src-tauri/Cargo.toml --lib windows_
+
+      - name: 验证解析结果
+        run: cargo test --locked --no-default-features --manifest-path src-tauri/Cargo.toml --lib resolved_path
+
+      - name: 验证带空格的批处理命令完成 MCP 握手
+        run: cargo test --locked --no-default-features --manifest-path src-tauri/Cargo.toml --lib resolved_batch_command_performs_handshake_with_spaces_and_path_alias

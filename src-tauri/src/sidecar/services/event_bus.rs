@@ -8,6 +8,9 @@ use tokio::sync::broadcast;
 /// 事件名常量集中在 [Evt::name],是事件词汇表的单一事实来源。
 #[derive(Debug, Clone)]
 pub enum Evt {
+    ServerHealth {
+        snapshot: super::server_manager::ServerHealthSnapshot,
+    },
     /// 服务器状态变更(stopped/starting/running/error)。
     ServerStatus {
         server_id: String,
@@ -26,6 +29,7 @@ impl Evt {
     /// 还原 SSE 事件名字符串。前端按这个值分发处理函数。
     pub fn name(&self) -> &'static str {
         match self {
+            Evt::ServerHealth { .. } => "server:health",
             Evt::ServerStatus { .. } => "server:status",
             Evt::ServerTools { .. } => "server:tools",
             Evt::ProfileActivated { .. } => "profile:activated",
@@ -36,6 +40,9 @@ impl Evt {
     /// 序列化载荷成 SSE data 字段。
     pub fn payload(&self) -> Value {
         match self {
+            Evt::ServerHealth { snapshot } => {
+                serde_json::to_value(snapshot).expect("health snapshot serializes")
+            }
             Evt::ServerStatus {
                 server_id,
                 status,

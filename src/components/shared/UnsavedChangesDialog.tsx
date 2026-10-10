@@ -1,3 +1,4 @@
+import { useTranslation } from "@/contexts/LocaleContext";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -26,20 +27,21 @@ export function UnsavedChangesDialog({
   onCancel,
   onConfirm,
 }: UnsavedChangesDialogProps) {
+  const { t, text } = useTranslation();
   return (
     <AlertDialog open={open}>
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>{title}</AlertDialogTitle>
-          <AlertDialogDescription>{description}</AlertDialogDescription>
+          <AlertDialogTitle>{text(title)}</AlertDialogTitle>
+          <AlertDialogDescription>{text(description)}</AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
-          <AlertDialogCancel onClick={onCancel}>Cancel</AlertDialogCancel>
+          <AlertDialogCancel onClick={onCancel}>{t("Cancel")}</AlertDialogCancel>
           <AlertDialogAction
             className="bg-error-warm text-surface-200 hover:bg-error-warm/90"
             onClick={onConfirm}
           >
-            {actionLabel}
+            {text(actionLabel)}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>

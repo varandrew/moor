@@ -1,7 +1,8 @@
 # Connect Claude Code to tools via MCP
 
 > Source: https://code.claude.com/docs/en/mcp
-> Accessed: 2026-08-29
+> Checked: 2026-10-08
+> Applicable version: Current official documentation; version-specific requirements are noted below.
 >
 > Note: This document is an external documentation mirror/reference. Copyright belongs to the original site; content may be outdated, please refer to the official link. Follow the original site's license when citing or redistributing.
 
@@ -299,7 +300,7 @@ Environment variables can be expanded in:
 }
 ```
 
-If a required environment variable is not set and has no default value, Claude Code will fail to parse the config.
+Unset variables without defaults remain literal `${VAR}` references and produce a warning. Protected credential variables may be cleared in remote URLs and headers; consult the official security rules.
 
 ## Practical examples
 
@@ -551,7 +552,7 @@ You can use this in Claude Desktop by adding this configuration to claude_deskto
 | Server startup timeout   | `MCP_TIMEOUT` env var (ms)                              | e.g. `MCP_TIMEOUT=10000 claude`                                                                  |
 | Per-tool-call wall clock | `timeout` field (ms) in the server entry                | Hard wall-clock limit per tool call; overrides `MCP_TOOL_TIMEOUT`; values below 1000 are ignored |
 | Global tool timeout      | `MCP_TOOL_TIMEOUT` env var                              | Defaults to roughly 28 hours when unset                                                          |
-| Idle disconnect          | `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (ms), `0` disables  | Default 5 min (HTTP/SSE/WS/claude.ai), 30 min (stdio); v2.1.187+                                 |
+| Idle disconnect          | `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (ms), `0` disables  | Default 5 min (HTTP/SSE/WS/claude.ai), 30 min (stdio); v2.1.203+                                 |
 | Auto-backgrounding       | `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` (ms), `0` disables | Tools running longer than 2 min are backgrounded; v2.1.212+                                      |
 
 For HTTP/SSE/claude.ai connectors, each request timer is the greatest of 60s, the server tool timeout, and `MCP_TIMEOUT`.
@@ -819,3 +820,7 @@ URL patterns support wildcards using `*` to match any sequence of characters.
 - **Option 1 and Option 2 can be combined**: If `managed-mcp.json` exists, it has exclusive control and users cannot add servers. Allowlists/denylists still apply to the managed servers themselves.
 - **Denylist takes absolute precedence**: If a server matches a denylist entry (by name, command, or URL), it will be blocked even if it's on the allowlist.
 - Name-based, command-based, and URL-based restrictions work together: a server passes if it matches **either** a name entry, a command entry, or a URL pattern (unless blocked by denylist).
+
+## Current transport and helper behavior
+
+HTTP connections can fall back to SSE from v2.1.265. Since v2.1.238, `headersHelper` execution follows the configuration origin and workspace trust: project helpers require trust and run from the project directory; user helpers use the user scope. Since v2.1.268, `${VAR}` references in helper headers are redacted in displayed output. Moor imports helper field names as conversion warnings and never runs helpers.

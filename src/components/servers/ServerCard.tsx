@@ -1,3 +1,6 @@
+import { HealthBadge } from "./ServerHealth";
+import type { ServerHealth } from "@moor/types";
+import { useTranslation } from "@/contexts/LocaleContext";
 import { useState, type ReactNode } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -46,6 +49,7 @@ function getRemoveFeedback({
 
 interface ServerCardProps {
   server: Server;
+  health?: ServerHealth;
   action?: ServerAction;
   dragHandle?: ReactNode;
   isSorting?: boolean;
@@ -79,13 +83,16 @@ function ServerAvatar({ isRunning, isError }: { isRunning: boolean; isError: boo
 
 function ServerIdentity({
   server,
+  health,
   commandPreview,
   displayStatus,
 }: {
   server: Server;
+  health?: ServerHealth;
   commandPreview: string;
   displayStatus: string;
 }) {
+  const { t } = useTranslation();
   return (
     <div className="min-w-0 flex-1">
       <div className="flex items-center gap-2 mb-0.5">
@@ -93,11 +100,12 @@ function ServerIdentity({
           {server.name}
         </span>
         {server.autoStart && (
-          <span title="Auto Start" className="inline-flex shrink-0">
+          <span title={t("Auto Start")} className="inline-flex shrink-0">
             <Zap className="h-3 w-3 text-gold" />
           </span>
         )}
         <StatusBadge status={displayStatus} />
+        {health && health.status !== "unknown" && <HealthBadge snapshot={health} />}
       </div>
       {commandPreview && (
         <p className="font-mono text-[11px] text-[var(--fg-40)] truncate">{commandPreview}</p>
@@ -123,6 +131,7 @@ function LifecycleButton({
   onStart: (id: string) => Promise<void>;
   onStop: (id: string) => Promise<void>;
 }) {
+  const { t } = useTranslation();
   if (isRunning) {
     return (
       <Button
@@ -131,7 +140,7 @@ function LifecycleButton({
         className="text-[var(--fg-45)] hover:text-error-warm hover:bg-error-warm/10 active:bg-error-warm/20 transition-all duration-150"
         disabled={isBusy}
         onClick={() => void onStop(serverId)}
-        title={isStopping ? "Stopping server" : "Stop server"}
+        title={isStopping ? t("Stopping server") : t("Stop server")}
       >
         {isStopping ? <Loader2 className="h-4 w-4 animate-spin" /> : <Square className="h-4 w-4" />}
       </Button>
@@ -145,7 +154,7 @@ function LifecycleButton({
       className="text-[var(--fg-45)] hover:text-success-muted hover:bg-success-muted/10 active:bg-success-muted/20 transition-all duration-150"
       disabled={isBusy}
       onClick={() => void onStart(serverId)}
-      title={isStarting ? "Starting server" : "Start server"}
+      title={isStarting ? t("Starting server") : t("Start server")}
     >
       {isStarting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
     </Button>
@@ -171,6 +180,7 @@ function ServerControls({
   onStop: (id: string) => Promise<void>;
   onRequestRemove: () => void;
 }) {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const controlsDisabled = isBusy || isRemoving;
 
@@ -191,8 +201,8 @@ function ServerControls({
         className="text-[var(--fg-45)] hover:text-cursor-dark hover:bg-surface-400 active:bg-surface-500 transition-all duration-150"
         disabled={controlsDisabled}
         onClick={() => navigate(`/servers/${server.id}`)}
-        title="Server details"
-        aria-label={`Open details for ${server.name}`}
+        title={t("Server details")}
+        aria-label={t("Open details for {name}", { name: server.name })}
       >
         <PanelRightOpen className="h-4 w-4" />
       </Button>
@@ -202,8 +212,8 @@ function ServerControls({
         className="text-[var(--fg-45)] hover:text-error-warm hover:bg-error-warm/10 active:bg-error-warm/20 transition-all duration-150"
         disabled={controlsDisabled}
         onClick={onRequestRemove}
-        title="Remove server"
-        aria-label={`Remove ${server.name}`}
+        title={t("Remove server")}
+        aria-label={t("Remove {name}", { name: server.name })}
       >
         {isRemoving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
       </Button>
@@ -213,13 +223,16 @@ function ServerControls({
 
 function RemoveFeedbackRow({
   feedback,
+  serverName,
   onCancel,
   onConfirm,
 }: {
   feedback: NonNullable<RemoveFeedback>;
+  serverName: string;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
+  const { t } = useTranslation();
   const isError = feedback.kind === "error";
   const isRemoving = feedback.kind === "removing";
 
@@ -238,20 +251,26 @@ function RemoveFeedbackRow({
             className={cn("h-3.5 w-3.5 shrink-0", isError ? "text-error-warm" : "text-gold")}
           />
         )}
-        <p
+        <div
           className={cn(
             "truncate font-body text-xs",
             isError ? "text-error-warm" : "text-[var(--fg-55)]",
           )}
           title={feedback.message}
         >
-          {feedback.message}
-        </p>
+          {isError ? (
+            <ErrorBanner message={feedback.message} />
+          ) : (
+            t(isRemoving ? "Removing {name}..." : 'Remove "{name}"? This cannot be undone.', {
+              name: serverName,
+            })
+          )}
+        </div>
       </div>
       {feedback.kind === "confirm" && (
         <div className="flex shrink-0 items-center gap-1.5">
           <Button variant="ghost" size="sm" onClick={onCancel}>
-            Cancel
+            {t("Cancel")}
           </Button>
           <Button
             variant="ghost"
@@ -259,13 +278,13 @@ function RemoveFeedbackRow({
             className="text-error-warm hover:bg-error-warm/10 hover:text-error-warm"
             onClick={onConfirm}
           >
-            Remove
+            {t("Remove")}
           </Button>
         </div>
       )}
       {feedback.kind === "error" && (
         <Button variant="ghost" size="sm" onClick={onCancel}>
-          Dismiss
+          {t("Dismiss")}
         </Button>
       )}
     </div>
@@ -274,6 +293,7 @@ function RemoveFeedbackRow({
 
 export function ServerCard({
   server,
+  health,
   action,
   dragHandle,
   isSorting,
@@ -329,6 +349,7 @@ export function ServerCard({
               <ServerAvatar isRunning={isRunning} isError={isError} />
               <ServerIdentity
                 server={server}
+                health={health}
                 commandPreview={commandPreview}
                 displayStatus={displayStatus}
               />
@@ -350,6 +371,7 @@ export function ServerCard({
           {removeFeedback && (
             <RemoveFeedbackRow
               feedback={removeFeedback}
+              serverName={server.name}
               onCancel={clearRemoveFeedback}
               onConfirm={() => void handleRemove()}
             />

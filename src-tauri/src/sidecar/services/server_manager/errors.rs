@@ -6,7 +6,7 @@ use std::collections::HashMap;
 pub(crate) fn verify_command_available(
     command: &str,
     env: &HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let path = std::path::Path::new(command);
     if path.is_absolute() {
         if !path.exists() {
@@ -14,14 +14,11 @@ pub(crate) fn verify_command_available(
                 "Command \"{command}\" is not executable while starting this stdio server."
             ));
         }
-        return Ok(());
+        return Ok(command.to_string());
     }
-    if find_executable_on_path(command, env).is_none() {
-        return Err(format!(
-            "Command \"{command}\" was not found on PATH while starting this stdio server."
-        ));
-    }
-    Ok(())
+    find_executable_on_path(command, env).ok_or_else(|| {
+        format!("Command \"{command}\" was not found on PATH while starting this stdio server.")
+    })
 }
 
 pub fn public_server_start_error_message(err: &str) -> String {
@@ -64,4 +61,18 @@ fn extract_remote_mcp_error_message(err: &str) -> Option<&str> {
     err.strip_prefix("Remote MCP server error: ")
         .map(str::trim)
         .filter(|message| !message.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn resolved_path_is_returned_and_missing_command_is_rejected() {
+        let env = std::env::vars().collect();
+        let resolved = verify_command_available("node", &env)
+            .expect("Node.js is required for transport tests");
+        assert!(std::path::Path::new(&resolved).is_absolute());
+        assert_eq!(verify_command_available(&resolved, &env).unwrap(), resolved);
+        assert!(verify_command_available("moor-missing-command-2183720", &env).is_err());
+    }
 }

@@ -88,7 +88,7 @@ export function useServerList() {
   return {
     servers,
     loading,
-    error: error?.message ?? null,
+    error: error ? getErrorMessage(error) : null,
     refresh,
     refreshSilently,
     serverActions,

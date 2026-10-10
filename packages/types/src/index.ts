@@ -42,9 +42,11 @@ export type {
   SettingsGroup,
   SettingsUpdatePayload,
   ThemeMode,
+  LocalePreference,
 } from "./settings.js";
 export type { SidecarInfo } from "./sidecar.js";
 export type { ApiErrorCode, ApiError } from "./error.js";
+export type { ServerHealth, ServerHealthStatus, UpdateCheck } from "./health.js";
 export {
   MCP_SESSION_IDLE_TTL_MS_DEFAULT,
   MCP_SESSION_IDLE_TTL_MS_MAX,

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import type { SidecarInfo } from "@moor/types";
+import { ApiRequestError } from "./api-error";
 import { api } from "./api/client";
 import { formatApiNetworkError } from "./api/errors";
 import { resetRuntime } from "./api/runtime";
@@ -144,6 +145,16 @@ describe("api runtime recovery", () => {
     await expect(api("/api/settings")).rejects.toThrow("Invalid settings");
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains structured error codes and status for localized UI explanations", async () => {
+    invokeMock.mockResolvedValueOnce(runtime(9223, "token"));
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      jsonResponse({ error: { code: "SERVER_BUSY", message: "Server is busy" } }, { status: 409 }),
+    );
+    const error = await api("/api/servers/demo/check-health").catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(ApiRequestError);
+    expect(error).toMatchObject({ code: "SERVER_BUSY", status: 409, message: "Server is busy" });
   });
 
   it("uses structured API error messages when available", async () => {

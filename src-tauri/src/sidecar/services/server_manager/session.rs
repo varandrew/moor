@@ -6,17 +6,23 @@ use crate::sidecar::db::tool_discovery_repo::ToolInsert;
 use crate::sidecar::mcp::transport::mcp_client::{
     HttpConnectConfig, McpClient, StdioConnectConfig,
 };
+use crate::sidecar::mcp::transport::request_error::RequestError;
 use crate::sidecar::mcp::transport::stdio_client::build_stdio_environment;
 use crate::sidecar::services::server_log::DiagnosticAttempt;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 /// 运行时 MCP 会话接口。连接建立后,ServerManager 通过它列工具、调工具、断开、
 /// 读存活信号。真实适配器是 McpClient;测试里用假适配器实现它。
 /// async 方法手写 BoxFuture,让 trait 可作 `dyn McpSession` 用。
 pub trait McpSession: Send {
+    fn ping(
+        &self,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RequestError>> + Send + '_>>;
     #[allow(dead_code)]
     fn list_tools(
         &self,
@@ -90,7 +96,7 @@ impl StdioHttpConnector {
             .and_then(|v| serde_json::from_value(v.clone()).ok());
         let env = build_stdio_environment(&parent_env, server_env.as_ref());
 
-        verify_command_available(command, &env)?;
+        let command = verify_command_available(command, &env)?;
 
         let args: Vec<String> = config
             .args
@@ -105,7 +111,7 @@ impl StdioHttpConnector {
 
         let mut client = McpClient::connect_stdio(StdioConnectConfig {
             server_name: config.name.clone(),
-            command: command.to_string(),
+            command,
             args,
             cwd: config.working_dir.clone(),
             env,
@@ -153,5 +159,79 @@ impl StdioHttpConnector {
         client.set_request_timeout_ms(timeouts.request_ms);
 
         Ok((tools, Box::new(client)))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use crate::sidecar::mcp::transport::stdio_client::find_executable_on_path;
+    use crate::sidecar::services::server_log::ServerDiagnostics;
+
+    #[tokio::test]
+    async fn resolved_batch_command_performs_handshake_with_spaces_and_path_alias() {
+        let dir = std::env::temp_dir().join(format!("moor windows {}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent: HashMap<String, String> = std::env::vars().collect();
+        let node = find_executable_on_path("node", &parent)
+            .expect("Node.js is required for the Windows integration test");
+        let node_dir = std::path::Path::new(&node)
+            .parent()
+            .unwrap()
+            .to_string_lossy();
+        let script = dir.join("server with spaces.mjs");
+        std::fs::write(&script, r#"import readline from 'node:readline';
+for await (const line of readline.createInterface({ input: process.stdin })) {
+ const request = JSON.parse(line);
+ if (request.id === undefined) continue;
+ const result = request.method === 'initialize' ? { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'batch', version: '1.0.0' } } : request.method === 'tools/list' ? { tools: [] } : {};
+ process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\n');
+}"#).unwrap();
+        for extension in ["cmd"] {
+            std::fs::write(
+                dir.join(format!("npx.{extension}")),
+                "@echo off\r\nnode %*\r\n",
+            )
+            .unwrap();
+        }
+        for command in [
+            "npx".to_string(),
+            dir.join("npx.cmd").to_string_lossy().into_owned(),
+            dir.join("npx.bat").to_string_lossy().into_owned(),
+        ] {
+            if command.ends_with(".bat") {
+                std::fs::write(dir.join("npx.bat"), "@echo off\r\nnode %*\r\n").unwrap();
+            }
+            let config = StoredServerConfig {
+                name: "windows".into(),
+                connection_type: "stdio".into(),
+                command: Some(command.clone()),
+                args: Some(serde_json::json!([script.to_string_lossy()])),
+                url: None,
+                env: Some(
+                    serde_json::json!({"pAtH": format!("{};{}", dir.to_string_lossy(), node_dir), "PATHEXT": ".CMD;.EXE;.BAT"}),
+                ),
+                headers: None,
+                working_dir: Some(dir.to_string_lossy().into_owned()),
+            };
+            let diagnostics = ServerDiagnostics::default().begin_attempt("windows", "npx");
+            let (_, mut client) = StdioHttpConnector::connect_stdio(
+                &config,
+                ServerTimeouts {
+                    request_ms: 30_000,
+                    start_ms: 30_000,
+                },
+                diagnostics,
+            )
+            .await
+            .expect("resolved batch command should initialize");
+            client
+                .ping(Duration::from_secs(5))
+                .await
+                .expect("batch server should respond to ping");
+            client.disconnect().await.unwrap();
+            assert_eq!(config.command.as_deref(), Some(command.as_str()));
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

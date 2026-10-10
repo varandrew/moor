@@ -1,5 +1,11 @@
 import type { ServerStatus } from "./server.js";
 import type { Settings } from "./settings.js";
+import type { ServerHealth } from "./health.js";
+
+export interface ServerHealthEvent {
+  type: "server:health";
+  data: ServerHealth;
+}
 
 export interface ServerStatusEvent {
   type: "server:status";
@@ -30,6 +36,7 @@ export interface SettingsChangedEvent {
 }
 
 export type MoorEvent =
+  | ServerHealthEvent
   | ServerStatusEvent
   | ServerToolsEvent
   | ProfileActivatedEvent

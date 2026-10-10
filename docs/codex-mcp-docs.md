@@ -1,7 +1,8 @@
 # Codex MCP Configuration Guide
 
 > Source: https://learn.chatgpt.com/docs/extend/mcp?surface=cli (formerly https://developers.openai.com/codex/mcp, now a permanent redirect)
-> Accessed: 2026-08-29
+> Checked: 2026-10-08
+> Applicable version: Current official documentation; version-specific requirements are noted below.
 >
 > Note: This document is an external documentation mirror/reference. Copyright belongs to the original site; content may be outdated, please refer to the official link. Follow the original site's license when citing or redistributing.
 
@@ -208,3 +209,11 @@ enabled = true
 | [Chrome Developer Tools](https://github.com/ChromeDevTools/chrome-devtools-mcp/)                                                                                                        | Control and inspect Chrome                  |
 | [Sentry](https://docs.sentry.io/product/sentry-mcp/#codex)                                                                                                                              | Access Sentry logs                          |
 | [GitHub](https://github.com/github/github-mcp-server)                                                                                                                                   | Manage GitHub (PRs, Issues, etc.)           |
+
+## Current local configuration additions
+
+`http_headers_helper` can provide HTTP credentials locally; Moor does not execute it during import or conversion. `tools.<tool>.output_token_limit` controls per-tool output size. Top-level `mcp_optional_startup_grace_ms` defaults to 1000 milliseconds. These client options are not part of Moor's common connection model and are reported as unmapped fields when applicable.
+
+For credential selection, explicit `http_headers` and `bearer_token_env_var` take precedence over `auth`; `auth = "chatgpt"` uses ChatGPT credentials with OAuth fallback. Refer to the official documentation for current authorization behavior.
+
+In the IDE, open MCP servers → Add server → Save → Restart extension.

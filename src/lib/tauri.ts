@@ -13,9 +13,9 @@ export async function getServerLogPath(serverId: string): Promise<string> {
   return invoke<string>("get_server_log_path", { serverId });
 }
 
-export async function syncRuntimeSettings(): Promise<void> {
+export async function syncRuntimeSettings(locale?: "zh-CN" | "en"): Promise<void> {
   if (!isTauriRuntime()) return;
-  await invoke("sync_runtime_settings");
+  await invoke("sync_runtime_settings", { locale });
 }
 
 export async function applyLoginAutostartSetting(enabled: boolean): Promise<void> {

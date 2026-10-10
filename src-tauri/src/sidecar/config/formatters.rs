@@ -138,6 +138,26 @@ fn json_dialect(client_id: &str) -> JsonDialect {
             http_type: Some("http"),
             ..DEFAULT_JSON_DIALECT
         },
+        "pi" => JsonDialect {
+            env_ref: EnvRefStyle::Dollar,
+            cwd_key: Some("cwd"),
+            ..DEFAULT_JSON_DIALECT
+        },
+        "kimi-code" => JsonDialect {
+            cwd_key: Some("cwd"),
+            ..DEFAULT_JSON_DIALECT
+        },
+        "zcode" => JsonDialect {
+            stdio_type: Some("stdio"),
+            http_type: Some("http"),
+            ..DEFAULT_JSON_DIALECT
+        },
+        "minimax-code" => JsonDialect {
+            stdio_type: Some("stdio"),
+            http_type: Some("streamable-http"),
+            env_ref: EnvRefStyle::Dollar,
+            ..DEFAULT_JSON_DIALECT
+        },
         "opencode" => JsonDialect {
             stdio_type: Some("local"),
             command_array: true,
@@ -259,14 +279,31 @@ fn stdio_entry(server: &ScannedServer, dialect: &JsonDialect) -> Value {
 fn http_entry(server: &ScannedServer, client: &ClientMeta, dialect: &JsonDialect) -> Value {
     let mut entry = serde_json::Map::new();
 
-    if let Some(t) = dialect.http_type {
-        entry.insert("type".to_string(), Value::String(t.to_string()));
+    if let Some(t) = if server.connection_type == "sse" && dialect.http_type != Some("remote") {
+        Some("sse")
+    } else {
+        dialect.http_type
+    } {
+        entry.insert(
+            if client.id == "kimi-code" {
+                "transport"
+            } else {
+                "type"
+            }
+            .to_string(),
+            Value::String(t.to_string()),
+        );
     }
     entry.insert(
         "url".to_string(),
         Value::String(server.url.clone().unwrap_or_default()),
     );
-    if let Some(headers) = rewrite_headers(&server.headers, client) {
+    let headers = if client.id == "zcode" {
+        server.headers.clone()
+    } else {
+        rewrite_headers(&server.headers, client)
+    };
+    if let Some(headers) = headers {
         entry.insert(
             dialect.headers_key.to_string(),
             serde_json::to_value(&headers).unwrap_or(Value::Null),
@@ -418,8 +455,7 @@ pub fn format_for_cursor(servers: &[ScannedServer], client: &ClientMeta) -> Form
     format_json_mcp_servers(servers, client, "mcpServers", extra)
 }
 
-// kimi-code / pi 的 headers 是静态值，官方不展开 `{env:VAR}` 插值；凭据
-// 的正规机制是独立字段（bearerTokenEnvVar / bearerTokenEnv）。把 Bearer
+// Kimi Code 的 headers 是静态值，凭据通过 bearerTokenEnvVar 引用。把 Bearer
 // 引用提升为该字段；其余 env 引用无法落地，降级为警告。
 fn hoist_bearer_env(result: &mut FormatResult, field: &str, client_name: &str) {
     let Ok(mut root) = serde_json::from_str::<Value>(&result.content) else {
@@ -576,12 +612,51 @@ pub fn format_for_grok_build(servers: &[ScannedServer], client: &ClientMeta) -> 
     }
 }
 
-// Plain mcpServers JSON — stdio and bare-url HTTP entries, no type markers.
-// HTTP 凭据经 bearerTokenEnv 引用（pi-mcp-adapter ≥ v2.27.0）。
 pub fn format_for_pi(servers: &[ScannedServer], client: &ClientMeta) -> FormatResult {
-    let mut result = format_json_mcp_servers(servers, client, "mcpServers", vec![]);
-    hoist_bearer_env(&mut result, "bearerTokenEnv", client.name);
+    let supported: Vec<_> = servers
+        .iter()
+        .filter(|s| s.connection_type != "sse")
+        .cloned()
+        .collect();
+    let mut result = format_json_mcp_servers(&supported, client, "mcpServers", vec![]);
+    if supported.len() != servers.len() {
+        result
+            .warnings
+            .push("Pi native MCP does not support SSE. SSE servers were skipped.".to_string());
+    }
+    let mut root: Value = serde_json::from_str(&result.content).unwrap_or_default();
+    if let Some(entries) = root.get_mut("mcpServers").and_then(Value::as_object_mut) {
+        for entry in entries.values_mut() {
+            if let Some(env) = entry.get_mut("env").and_then(Value::as_object_mut) {
+                for value in env.values_mut() {
+                    if let Some(raw) = value.as_str() {
+                        *value = Value::String(rewrite_header_value(raw, client));
+                    }
+                }
+            }
+        }
+    }
+    result.content = serde_json::to_string_pretty(&root).unwrap_or_default();
     result
+}
+
+pub fn format_for_zcode(servers: &[ScannedServer], client: &ClientMeta) -> FormatResult {
+    let mut result = format_json_mcp_servers(servers, client, "servers", vec![]);
+    let entries: Value = serde_json::from_str(&result.content).unwrap_or_default();
+    result.content =
+        serde_json::to_string_pretty(&serde_json::json!({ "mcp": entries })).unwrap_or_default();
+    if servers.iter().any(|s| {
+        s.headers
+            .as_ref()
+            .is_some_and(|h| h.values().any(|v| v.contains("${") || v.contains("{env:")))
+    }) {
+        result.warnings.push("ZCode header references were preserved; native configuration interpolation is not verified. Check them manually.".to_string());
+    }
+    result
+}
+
+pub fn format_for_minimax_code(servers: &[ScannedServer], client: &ClientMeta) -> FormatResult {
+    format_json_mcp_servers(servers, client, "mcpServers", vec![])
 }
 
 // mcp-remote reads `${VAR}` refs from its own process environment; the
@@ -660,6 +735,8 @@ pub fn format_for_client(
         "dsh" => Some(format_for_dsh),
         "grok-build" => Some(format_for_grok_build),
         "pi" => Some(format_for_pi),
+        "zcode" => Some(format_for_zcode),
+        "minimax-code" => Some(format_for_minimax_code),
         "claude-desktop" => Some(format_for_claude_desktop),
         _ => None,
     }
@@ -833,6 +910,64 @@ mod tests {
     }
 
     #[test]
+    fn new_clients_preserve_connection_fields_on_round_trip() {
+        for id in ["zcode", "minimax-code"] {
+            let result =
+                format_for_client(id).unwrap()(&[http_server(), stdio_server()], client(id));
+            let parsed = super::super::import_parser::parse_json_mcp_config(&result.content, id);
+            assert!(parsed.errors.is_empty(), "{id}");
+            assert_eq!(parsed.servers.len(), 2, "{id}");
+            let remote = parsed.servers.iter().find(|s| s.url.is_some()).unwrap();
+            assert_eq!(remote.connection_type, "http");
+            assert_eq!(remote.url, http_server().url);
+            assert!(remote
+                .headers
+                .as_ref()
+                .unwrap()
+                .contains_key("Authorization"));
+            let local = parsed.servers.iter().find(|s| s.command.is_some()).unwrap();
+            assert_eq!(local.command, stdio_server().command);
+            assert_eq!(local.args, stdio_server().args);
+            assert_eq!(local.env, stdio_server().env);
+            let json: Value = serde_json::from_str(&result.content).unwrap();
+            let entry = if id == "zcode" {
+                &json["mcp"]["servers"]["moor-mcp"]
+            } else {
+                &json["mcpServers"]["moor-mcp"]
+            };
+            assert_eq!(
+                entry["type"],
+                if id == "zcode" {
+                    "http"
+                } else {
+                    "streamable-http"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn pi_preserves_cwd_and_env_but_rejects_sse() {
+        let mut local = stdio_server();
+        local.working_dir = Some("/tmp/project".to_string());
+        local.env = Some(std::collections::HashMap::from([(
+            "TOKEN".to_string(),
+            "{env:API_TOKEN}".to_string(),
+        )]));
+        let mut sse = http_server();
+        sse.connection_type = "sse".to_string();
+        let result = format_for_pi(&[local, sse], client("pi"));
+        let json: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(json["mcpServers"]["filesystem"]["cwd"], "/tmp/project");
+        assert_eq!(
+            json["mcpServers"]["filesystem"]["env"]["TOKEN"],
+            "${API_TOKEN}"
+        );
+        assert!(json["mcpServers"].get("moor-mcp").is_none());
+        assert!(result.warnings.iter().any(|w| w.contains("SSE")));
+    }
+
+    #[test]
     fn pi_formats_plain_mcp_servers() {
         let result = format_for_pi(&[http_server()], client("pi"));
         let parsed: Value = serde_json::from_str(&result.content).unwrap();
@@ -840,9 +975,9 @@ mod tests {
         let remote = servers.get("moor-mcp").unwrap();
         assert!(remote.get("type").is_none());
         assert_eq!(remote.get("url").unwrap(), "http://127.0.0.1:9223/mcp");
-        // pi-mcp-adapter 的凭据机制是 bearerTokenEnv，headers 不展开插值。
-        assert_eq!(remote.get("bearerTokenEnv").unwrap(), "MOOR_TOKEN");
-        assert!(remote.get("headers").is_none());
+        // Pi 原生 headers 通过环境变量引用凭据。
+        assert!(remote.get("bearerTokenEnv").is_none());
+        assert_eq!(remote["headers"]["Authorization"], "Bearer ${MOOR_TOKEN}");
     }
 
     #[test]

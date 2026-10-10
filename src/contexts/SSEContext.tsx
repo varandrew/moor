@@ -59,6 +59,17 @@ export function parseMoorSSEEvent(
   switch (event) {
     case "server:status":
       return isServerStatusEvent(data) ? { type: event, data } : invalidEvent(event, warn);
+    case "server:health":
+      return isRecord(data) &&
+        typeof data.serverId === "string" &&
+        ["unknown", "healthy", "unhealthy", "unsupported"].includes(String(data.status)) &&
+        (data.checkedAt === null || typeof data.checkedAt === "string") &&
+        typeof data.consecutiveFailures === "number" &&
+        Number.isInteger(data.consecutiveFailures) &&
+        data.consecutiveFailures >= 0 &&
+        (data.errorMessage === null || typeof data.errorMessage === "string")
+        ? { type: event, data: data as unknown as MoorEventData<"server:health"> }
+        : invalidEvent(event, warn);
     case "server:tools":
       return isServerToolsEvent(data) ? { type: event, data } : invalidEvent(event, warn);
     case "profile:activated":

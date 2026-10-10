@@ -1,3 +1,5 @@
+import { translateCurrentText } from "@/lib/messages";
+import { ApiRequestError, API_ERROR_SUMMARIES } from "@/lib/api-error";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 
@@ -16,5 +18,14 @@ export function createErrorWithCause(message: string, cause: unknown): Error {
 }
 
 export function getErrorMessage(err: unknown, fallback = "Unknown error"): string {
+  if (err instanceof ApiRequestError) {
+    const summary = API_ERROR_SUMMARIES[err.code] ?? "Moor could not complete this operation.";
+    return `${summary}\n${err.message}`;
+  }
   return err instanceof Error ? err.message : fallback;
+}
+
+export function getNoticeErrorMessage(error: unknown): string {
+  const [summary, ...details] = getErrorMessage(error).split("\n");
+  return [translateCurrentText(summary), ...details].join("\n");
 }
