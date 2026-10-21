@@ -35,29 +35,51 @@ pub struct ToolDetail {
 
 pub struct ToolCatalogService;
 
+/// 一次解析出的 Profile 工具集与它的两项曝光设置。
+/// 三个读取入口共用它，避免同一段「取 Active Profile + 取工具」重复三遍。
+struct LoadedProfileTools {
+    tools: Vec<ProfileTool>,
+    mode: ExposureMode,
+    policy: RiskPolicy,
+}
+
+fn load_profile_tools(db: &Database, profile_id: Option<&str>) -> Option<LoadedProfileTools> {
+    let profile_repo = ProfileRepository::new(db);
+    let id = match profile_id {
+        Some(id) => id.to_string(),
+        None => profile_repo.find_active_id().ok().flatten()?,
+    };
+    let tools = ToolDiscoveryRepository::new(db)
+        .find_by_profile_id(&id)
+        .ok()?;
+    let profile = profile_repo.find_by_id(&id).ok().flatten();
+    let mode = profile
+        .as_ref()
+        .map(|profile| ExposureMode::from_db(&profile.exposure_mode))
+        .unwrap_or(ExposureMode::Direct);
+    let policy = profile
+        .as_ref()
+        .map(|profile| RiskPolicy::from_db(&profile.risk_policy))
+        .unwrap_or(RiskPolicy::Advisory);
+    Some(LoadedProfileTools { tools, mode, policy })
+}
+
 impl ToolCatalogService {
     pub fn get_tool_catalog(
         db: &Database,
         profile_id: Option<&str>,
         visible_server_ids: Option<&std::collections::HashSet<String>>,
     ) -> Vec<ToolCatalogEntry> {
-        let profile_repo = ProfileRepository::new(db);
-        let active_id = match profile_id {
-            Some(id) => id.to_string(),
-            None => match profile_repo.find_active_id() {
-                Ok(Some(id)) => id,
-                _ => return vec![],
-            },
+        let Some(loaded) = load_profile_tools(db, profile_id) else {
+            return vec![];
         };
-
-        let tool_repo = ToolDiscoveryRepository::new(db);
-        let profile_tools = match tool_repo.find_by_profile_id(&active_id) {
-            Ok(t) => t,
-            Err(_) => return vec![],
-        };
-
-        let (mode, policy) = profile_exposure(db, &active_id);
-        build_tool_catalog_entries(&profile_tools, visible_server_ids, mode, policy)
+        catalog_entries(
+            &loaded.tools,
+            visible_server_ids,
+            loaded.mode,
+            loaded.policy,
+            Selection::Listed,
+        )
     }
 
     /// `tools/call` 的归属解析用：策展模式下未置顶的工具仍可被调用。
@@ -66,23 +88,16 @@ impl ToolCatalogService {
         profile_id: Option<&str>,
         visible_server_ids: Option<&std::collections::HashSet<String>>,
     ) -> Vec<ToolCatalogEntry> {
-        let profile_repo = ProfileRepository::new(db);
-        let active_id = match profile_id {
-            Some(id) => id.to_string(),
-            None => match profile_repo.find_active_id() {
-                Ok(Some(id)) => id,
-                _ => return vec![],
-            },
+        let Some(loaded) = load_profile_tools(db, profile_id) else {
+            return vec![];
         };
-
-        let tool_repo = ToolDiscoveryRepository::new(db);
-        let profile_tools = match tool_repo.find_by_profile_id(&active_id) {
-            Ok(t) => t,
-            Err(_) => return vec![],
-        };
-
-        let (_, policy) = profile_exposure(db, &active_id);
-        build_callable_catalog_entries(&profile_tools, visible_server_ids, policy)
+        catalog_entries(
+            &loaded.tools,
+            visible_server_ids,
+            loaded.mode,
+            loaded.policy,
+            Selection::Callable,
+        )
     }
 
     /// `tools/call` 的错误分类需要完整判定（含被策略拦下的工具），而不只是可调用集合。
@@ -91,21 +106,10 @@ impl ToolCatalogService {
         profile_id: Option<&str>,
         visible_server_ids: Option<&std::collections::HashSet<String>>,
     ) -> Vec<ToolVisibility> {
-        let profile_repo = ProfileRepository::new(db);
-        let active_id = match profile_id {
-            Some(id) => id.to_string(),
-            None => match profile_repo.find_active_id() {
-                Ok(Some(id)) => id,
-                _ => return vec![],
-            },
+        let Some(loaded) = load_profile_tools(db, profile_id) else {
+            return vec![];
         };
-        let tool_repo = ToolDiscoveryRepository::new(db);
-        let profile_tools = match tool_repo.find_by_profile_id(&active_id) {
-            Ok(t) => t,
-            Err(_) => return vec![],
-        };
-        let (mode, policy) = profile_exposure(db, &active_id);
-        resolve_tool_visibility(&profile_tools, visible_server_ids, mode, policy)
+        resolve_tool_visibility(&loaded.tools, visible_server_ids, loaded.mode, loaded.policy)
     }
 
     pub fn get_tool_details(
@@ -230,31 +234,11 @@ fn profile_exposure(db: &Database, profile_id: &str) -> (ExposureMode, RiskPolic
         .unwrap_or((ExposureMode::Direct, RiskPolicy::Advisory))
 }
 
-/// Agent 看到的目录：`tools/list` 的输入。
-fn build_tool_catalog_entries(
-    profile_tools: &[ProfileTool],
-    callable_server_ids: Option<&HashSet<String>>,
-    mode: ExposureMode,
-    policy: RiskPolicy,
-) -> Vec<ToolCatalogEntry> {
-    catalog_entries(profile_tools, callable_server_ids, mode, policy, |item| {
-        item.listed
-    })
-}
-
-/// 可调用的完整集合：`tools/call` 的归属解析用，不受置顶影响。
-fn build_callable_catalog_entries(
-    profile_tools: &[ProfileTool],
-    callable_server_ids: Option<&HashSet<String>>,
-    policy: RiskPolicy,
-) -> Vec<ToolCatalogEntry> {
-    catalog_entries(
-        profile_tools,
-        callable_server_ids,
-        ExposureMode::Direct,
-        policy,
-        |item| item.access.is_callable(),
-    )
+/// 目录的两种投影：Agent 看到的（listed）与可调用的（callable）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Selection {
+    Listed,
+    Callable,
 }
 
 fn catalog_entries(
@@ -262,11 +246,14 @@ fn catalog_entries(
     callable_server_ids: Option<&HashSet<String>>,
     mode: ExposureMode,
     policy: RiskPolicy,
-    keep: impl Fn(&ToolVisibility) -> bool,
+    selection: Selection,
 ) -> Vec<ToolCatalogEntry> {
     resolve_tool_visibility(profile_tools, callable_server_ids, mode, policy)
         .into_iter()
-        .filter(keep)
+        .filter(|item| match selection {
+            Selection::Listed => item.listed,
+            Selection::Callable => item.access.is_callable(),
+        })
         .filter_map(|visible| {
             Some(ToolCatalogEntry {
                 server_name: visible.server_name,

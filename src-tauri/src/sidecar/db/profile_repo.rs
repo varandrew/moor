@@ -32,6 +32,14 @@ pub struct ProfileDetailServer {
     pub profile_server: ProfileServerState,
 }
 
+/// Profile 的可选更新补丁：每一项缺省都表示「保持不变」。
+#[derive(Debug, Clone, Default)]
+pub struct ProfileUpdate<'a> {
+    pub name: Option<&'a str>,
+    pub exposure_mode: Option<&'a str>,
+    pub risk_policy: Option<&'a str>,
+}
+
 /// 批量 upsert 的单项输入：enabled 与 disabled_tools 均为可选补丁，语义与单条接口一致。
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,13 +138,7 @@ impl<'a> ProfileRepository<'a> {
             .and_then(|p| p.ok_or_else(|| "Created profile could not be reloaded".into()))
     }
 
-    pub fn update(
-        &self,
-        id: &str,
-        name: Option<&str>,
-        exposure_mode: Option<&str>,
-        risk_policy: Option<&str>,
-    ) -> Result<Option<Profile>, String> {
+    pub fn update(&self, id: &str, update: ProfileUpdate<'_>) -> Result<Option<Profile>, String> {
         let exists = self
             .db
             .query_one("SELECT id FROM profiles WHERE id = ?1", &[&id], |row| {
@@ -145,11 +147,17 @@ impl<'a> ProfileRepository<'a> {
         if exists.is_none() {
             return Ok(None);
         }
-        if name.is_some() || exposure_mode.is_some() || risk_policy.is_some() {
+        if update.name.is_some() || update.exposure_mode.is_some() || update.risk_policy.is_some() {
             let now = chrono::Utc::now().to_rfc3339();
             self.db.run(
                 "UPDATE profiles SET name = COALESCE(?1, name), exposure_mode = COALESCE(?2, exposure_mode), risk_policy = COALESCE(?3, risk_policy), updated_at = ?4 WHERE id = ?5",
-                &[&name, &exposure_mode, &risk_policy, &now, &id],
+                &[
+                    &update.name,
+                    &update.exposure_mode,
+                    &update.risk_policy,
+                    &now,
+                    &id,
+                ],
             )?;
         }
         self.find_by_id(id)

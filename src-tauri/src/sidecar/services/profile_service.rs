@@ -71,18 +71,16 @@ impl ProfileService {
     pub fn update(
         db: &Database,
         id: &str,
-        name: Option<&str>,
-        exposure_mode: Option<&str>,
-        risk_policy: Option<&str>,
+        update: crate::sidecar::db::profile_repo::ProfileUpdate<'_>,
     ) -> Result<Profile, ProfileServiceError> {
-        if let Some(mode) = exposure_mode {
+        if let Some(mode) = update.exposure_mode {
             if !matches!(mode, "direct" | "curated") {
                 return Err(ProfileServiceError::Validation(
                     "exposureMode must be direct or curated".into(),
                 ));
             }
         }
-        if let Some(policy) = risk_policy {
+        if let Some(policy) = update.risk_policy {
             if !matches!(policy, "advisory" | "block_destructive") {
                 return Err(ProfileServiceError::Validation(
                     "riskPolicy must be advisory or block_destructive".into(),
@@ -90,7 +88,7 @@ impl ProfileService {
             }
         }
         ProfileRepository::new(db)
-            .update(id, name, exposure_mode, risk_policy)
+            .update(id, update)
             .map_err(ProfileServiceError::Internal)?
             .ok_or_else(|| ProfileServiceError::NotFound("Profile not found".into()))
     }

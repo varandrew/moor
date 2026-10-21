@@ -87,9 +87,11 @@ async fn update(
     let profile = ProfileService::update(
         &state.db,
         &id,
-        body.name.as_deref(),
-        body.exposure_mode.as_deref(),
-        body.risk_policy.as_deref(),
+        crate::sidecar::db::profile_repo::ProfileUpdate {
+            name: body.name.as_deref(),
+            exposure_mode: body.exposure_mode.as_deref(),
+            risk_policy: body.risk_policy.as_deref(),
+        },
     )
     .map_err(AppError::from)?;
     if touches_exposure {

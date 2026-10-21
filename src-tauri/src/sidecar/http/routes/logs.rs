@@ -154,6 +154,8 @@ mod tests {
             10,
             None,
             "direct",
+
+            None,
         )
         .expect("failed to insert first log");
         repo.insert(
@@ -168,6 +170,8 @@ mod tests {
             10,
             None,
             "direct",
+
+            None,
         )
         .expect("failed to insert second log");
 
@@ -204,6 +208,7 @@ mod tests {
         ] {
             repo.insert(
                 id, timestamp, None, None, "search", None, None, None, 10, None, "direct",
+ None,
             )
             .unwrap();
         }
@@ -270,6 +275,8 @@ mod tests {
             10,
             None,
             "direct",
+
+            None,
         )
         .expect("failed to insert first log");
         repo.insert(
@@ -284,6 +291,8 @@ mod tests {
             20,
             None,
             "direct",
+
+            None,
         )
         .expect("failed to insert second log");
 

@@ -1,19 +1,16 @@
 use super::jsonrpc;
 use crate::sidecar::http::AppState;
-use crate::sidecar::services::audit_recorder::{AuditRecorder, ToolCallRecord, ToolCallVia};
+use crate::sidecar::services::audit_recorder::ToolCallVia;
 use crate::sidecar::services::server_manager::ToolCallError;
-use crate::sidecar::services::tool_catalog::ToolCatalogEntry;
+use crate::sidecar::services::tool_search::MAX_SEARCH_LIMIT;
 use crate::sidecar::services::tool_visibility::ExposureMode;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-/// 策展模式下注入的检索元工具。名字只有单个下划线，与 `{slug}__{tool}` 不冲突。
-pub const SEARCH_TOOL_NAME: &str = "moor_search_tools";
+pub use crate::sidecar::services::tool_search::SEARCH_TOOL_NAME;
 /// 策展模式下注入的转发元工具。
 pub const CALL_TOOL_NAME: &str = "moor_call_tool";
 
-const DEFAULT_SEARCH_LIMIT: usize = 10;
-const MAX_SEARCH_LIMIT: usize = 50;
 
 /// Handle an incoming MCP JSON-RPC request and produce a response.
 /// This implements the MCP Gateway: aggregates tools from all running servers
@@ -127,29 +124,17 @@ async fn handle_tools_call(
         .unwrap_or_else(|| json!({}));
 
     if tool_name == SEARCH_TOOL_NAME {
-        let started = std::time::Instant::now();
-        let catalog = state.server_manager.get_callable_tools().await;
-        let result = search_catalog(&catalog, &arguments);
-        let hits = result["tools"].as_array().map_or(0, Vec::len);
-        let profile_id = state.server_manager.active_profile_id();
-        AuditRecorder::record(
+        let outcome = crate::sidecar::services::tool_search::search(
+            &state.server_manager,
             &state.db,
-            ToolCallRecord {
-                profile_id: profile_id.as_deref(),
-                server_id: None,
-                tool_name: SEARCH_TOOL_NAME,
-                arguments: &arguments,
-                result: Some(&json!({ "hits": hits })),
-                error: None,
-                duration_ms: started.elapsed().as_millis() as i64,
-                agent_info,
-                via: ToolCallVia::Meta,
-            },
-        );
+            &arguments,
+            agent_info,
+        )
+        .await;
         return jsonrpc::make_response(
             id,
             json!({
-                "content": [{ "type": "text", "text": result.to_string() }],
+                "content": [{ "type": "text", "text": outcome.payload.to_string() }],
             }),
         );
     }
@@ -229,75 +214,6 @@ async fn call_and_map(
             jsonrpc::make_error(id, jsonrpc::INTERNAL_ERROR, &err)
         }
     }
-}
-
-/// 检索可调用工具。关键词按空格分隔且全部命中（大小写不敏感），在工具名与描述上匹配。
-fn search_catalog(catalog: &[ToolCatalogEntry], params: &Value) -> Value {
-    let query = params.get("query").and_then(Value::as_str).unwrap_or("");
-    let terms: Vec<String> = query
-        .split_whitespace()
-        .map(|term| term.to_lowercase())
-        .collect();
-    let server_filter = params
-        .get("server")
-        .and_then(Value::as_str)
-        .map(|server| server.to_lowercase());
-    let limit = params
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(DEFAULT_SEARCH_LIMIT as u64)
-        .clamp(1, MAX_SEARCH_LIMIT as u64) as usize;
-    let offset = params
-        .get("cursor")
-        .and_then(Value::as_str)
-        .and_then(|cursor| cursor.parse::<usize>().ok())
-        .unwrap_or(0);
-
-    let matched: Vec<&ToolCatalogEntry> = catalog
-        .iter()
-        .filter(|entry| {
-            if let Some(server) = &server_filter {
-                if !entry.server_name.to_lowercase().contains(server) {
-                    return false;
-                }
-            }
-            if terms.is_empty() {
-                return true;
-            }
-            let haystack = format!(
-                "{} {} {}",
-                entry.tool_name,
-                entry.exposed_name,
-                entry.description.clone().unwrap_or_default()
-            )
-            .to_lowercase();
-            terms.iter().all(|term| haystack.contains(term))
-        })
-        .collect();
-
-    let tools: Vec<Value> = matched
-        .iter()
-        .skip(offset)
-        .take(limit)
-        .map(|entry| {
-            json!({
-                "name": entry.exposed_name,
-                "description": entry.description,
-                "inputSchema": entry
-                    .input_schema
-                    .clone()
-                    .unwrap_or_else(|| json!({"type": "object"})),
-                "serverName": entry.server_name,
-                "riskLevel": entry.risk_level,
-            })
-        })
-        .collect();
-
-    let mut result = json!({ "tools": tools });
-    if matched.len() > offset + limit {
-        result["nextCursor"] = json!((offset + limit).to_string());
-    }
-    result
 }
 
 #[cfg(test)]
@@ -593,7 +509,13 @@ process.stdin.on("data", (chunk) => {
             .expect("failed to read active profile")
             .expect("active profile should exist");
         profile_repo
-            .update(&profile_id, None, Some("curated"), None)
+            .update(
+                &profile_id,
+                crate::sidecar::db::profile_repo::ProfileUpdate {
+                    exposure_mode: Some("curated"),
+                    ..Default::default()
+                },
+            )
             .expect("failed to switch exposure mode");
         profile_repo
             .upsert_profile_servers_batch(
@@ -719,7 +641,13 @@ process.stdin.on("data", (chunk) => {
             .expect("failed to read active profile")
             .expect("active profile should exist");
         profile_repo
-            .update(&profile_id, None, Some("curated"), None)
+            .update(
+                &profile_id,
+                crate::sidecar::db::profile_repo::ProfileUpdate {
+                    exposure_mode: Some("curated"),
+                    ..Default::default()
+                },
+            )
             .expect("failed to switch exposure mode");
         gateway
     }
@@ -818,7 +746,13 @@ process.stdin.on("data", (chunk) => {
             .expect("failed to read active profile")
             .expect("active profile should exist");
         profile_repo
-            .update(&profile_id, None, None, Some("block_destructive"))
+            .update(
+                &profile_id,
+                crate::sidecar::db::profile_repo::ProfileUpdate {
+                    risk_policy: Some("block_destructive"),
+                    ..Default::default()
+                },
+            )
             .expect("failed to set the risk policy");
 
         let tools_response = handle_request(
@@ -972,7 +906,13 @@ process.stdin.on("data", (chunk) => {
             .expect("read active profile")
             .expect("active profile");
         profile_repo
-            .update(&profile_id, None, None, Some("block_destructive"))
+            .update(
+                &profile_id,
+                crate::sidecar::db::profile_repo::ProfileUpdate {
+                    risk_policy: Some("block_destructive"),
+                    ..Default::default()
+                },
+            )
             .expect("set policy");
 
         handle_request(

@@ -40,6 +40,8 @@ pub struct AuditLogEntry {
     pub agent_info: Option<String>,
     /// `direct`（Agent 直接调用）或 `meta`（经元工具检索/转发）。
     pub via: String,
+    /// 被拒绝时的结构化原因，例如 `policy_risk`。
+    pub refusal: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +127,7 @@ fn map_audit_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditLogEntry> {
         duration_ms: row.get("duration_ms")?,
         agent_info: row.get("agent_info")?,
         via: row.get("via")?,
+        refusal: row.get("refusal")?,
     })
 }
 
@@ -202,16 +205,17 @@ impl<'a> AuditLogRepository<'a> {
         duration_ms: i64,
         agent_info: Option<&str>,
         via: &str,
+        refusal: Option<&str>,
     ) -> Result<(), String> {
         let timestamp = normalize_timestamp(timestamp)?;
         let args_json = arguments.map(|v| serde_json::to_string(v).unwrap_or_default());
         let result_json = result.map(|v| serde_json::to_string(v).unwrap_or_default());
         // 同次写入解析失效关联，避免调用结束前删除归属导致整条审计丢失。
         self.db.run(
-            "INSERT INTO audit_logs (id, timestamp, profile_id, server_id, tool_name, arguments, result, error, duration_ms, agent_info, via)
+            "INSERT INTO audit_logs (id, timestamp, profile_id, server_id, tool_name, arguments, result, error, duration_ms, agent_info, via, refusal)
              VALUES (?1, ?2, (SELECT id FROM profiles WHERE id = ?3),
-                     (SELECT id FROM mcp_servers WHERE id = ?4), ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            &[&id, &timestamp, &profile_id, &server_id, &tool_name, &args_json, &result_json, &error, &duration_ms, &agent_info, &via],
+                     (SELECT id FROM mcp_servers WHERE id = ?4), ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            &[&id, &timestamp, &profile_id, &server_id, &tool_name, &args_json, &result_json, &error, &duration_ms, &agent_info, &via, &refusal],
         )
     }
 
@@ -243,7 +247,7 @@ impl<'a> AuditLogRepository<'a> {
                     "SELECT COUNT(*),
                             COALESCE(SUM(CASE WHEN a.error IS NOT NULL THEN 1 ELSE 0 END), 0),
                             AVG(a.duration_ms),
-                            COALESCE(SUM(CASE WHEN a.error LIKE 'Tool blocked by risk policy%' THEN 1 ELSE 0 END), 0)
+                            COALESCE(SUM(CASE WHEN a.refusal IS NOT NULL THEN 1 ELSE 0 END), 0)
                      FROM audit_logs a WHERE 1=1{conditions}"
                 ),
                 &param_refs,
@@ -464,6 +468,8 @@ mod tests {
             duration_ms,
             None,
             "direct",
+
+            None,
         )
         .expect("insert log");
     }
@@ -589,6 +595,8 @@ mod tests {
             5,
             None,
             "direct",
+
+            None,
         )
         .expect("insert");
         repo.insert(
@@ -603,6 +611,8 @@ mod tests {
             9,
             None,
             "direct",
+
+            None,
         )
         .expect("insert");
 
@@ -634,6 +644,8 @@ mod tests {
                 *duration,
                 None,
                 "direct",
+
+                None,
             )
             .expect("insert");
         }
@@ -681,6 +693,7 @@ mod tests {
         ] {
             repo.insert(
                 id, timestamp, None, None, "search", None, None, None, 10, None, "direct",
+ None,
             )
             .expect("insert");
         }
@@ -702,6 +715,7 @@ mod tests {
         assert!(repo
             .insert(
                 "invalid", "garbage", None, None, "search", None, None, None, 10, None, "direct",
+ None,
             )
             .is_err());
         assert_eq!(repo.purge_before("2026-01-01T08:00:01+08:00").unwrap(), 1);
@@ -724,6 +738,8 @@ mod tests {
             1,
             None,
             "direct",
+
+            None,
         )
         .expect("insert");
         repo.insert(
@@ -738,6 +754,8 @@ mod tests {
             2,
             None,
             "direct",
+
+            None,
         )
         .expect("insert");
 

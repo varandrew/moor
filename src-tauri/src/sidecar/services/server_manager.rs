@@ -510,6 +510,10 @@ impl ServerManager {
             },
         };
         let error = result.as_ref().err().map(ToString::to_string);
+        let refusal = match &result {
+            Err(ToolCallError::PolicyDenied { .. }) => Some("policy_risk"),
+            _ => None,
+        };
         AuditRecorder::record(
             &self.db,
             ToolCallRecord {
@@ -526,6 +530,7 @@ impl ServerManager {
                 },
                 agent_info,
                 via,
+                refusal,
             },
         );
         result
@@ -554,12 +559,13 @@ impl ServerManager {
         Ok(tools.len())
     }
 
-    /// 可调用的完整集合（不受置顶影响）：元工具的检索池。
-    pub async fn get_callable_tools(
+    /// 指定 Profile 的可调用集合：调用方先固定归属，避免一次调用读两次 Active Profile。
+    pub async fn get_callable_tools_for(
         &self,
+        profile_id: Option<&str>,
     ) -> Vec<crate::sidecar::services::tool_catalog::ToolCatalogEntry> {
         let callable_ids = self.get_callable_server_ids().await;
-        ToolCatalogService::get_callable_tool_catalog(&self.db, None, Some(&callable_ids))
+        ToolCatalogService::get_callable_tool_catalog(&self.db, profile_id, Some(&callable_ids))
     }
 
     /// 当前 Active Profile 的 id。

@@ -60,7 +60,8 @@ pub fn run_migrations(db: &Database) -> Result<(), String> {
             error TEXT,
             duration_ms INTEGER,
             agent_info TEXT,
-            via TEXT NOT NULL DEFAULT 'direct'
+            via TEXT NOT NULL DEFAULT 'direct',
+            refusal TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp);
@@ -121,6 +122,7 @@ pub fn run_migrations(db: &Database) -> Result<(), String> {
         "TEXT NOT NULL DEFAULT 'heuristic'",
     )?;
     ensure_column(db, "audit_logs", "via", "TEXT NOT NULL DEFAULT 'direct'")?;
+    ensure_column(db, "audit_logs", "refusal", "TEXT")?;
     backfill_server_sort_order(db)?;
     normalize_audit_timestamps(db)?;
     // 版本号在列补齐之后才推进：迁移中途失败时下一次启动仍会重跑 ensure_column（幂等）。
