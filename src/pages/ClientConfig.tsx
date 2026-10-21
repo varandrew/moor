@@ -27,6 +27,7 @@ import {
 import { routes } from "@/lib/api-routes";
 import { ConverterPanel } from "@/components/converter/ConverterPanel";
 import { importKeys } from "@/lib/query-keys";
+import { useProfiles } from "@/hooks/useProfiles";
 import type { ClientSnippet } from "@moor/types";
 
 // Per-client glyphs keyed by registry id; Terminal is the fallback.
@@ -47,6 +48,8 @@ export const CLIENT_ICONS: Record<string, LucideIcon> = {
 export function ClientConfig() {
   const { t, text } = useTranslation();
   const [activeTab, setActiveTab] = useState("snippets");
+  const { profiles } = useProfiles();
+  const activeProfile = profiles.find((profile) => profile.isActive);
   const {
     data: snippets,
     isPending,
@@ -66,6 +69,13 @@ export function ClientConfig() {
         title={t("Client Configuration")}
         subtitle={t("Configure your AI agents to connect to Moor")}
       />
+
+      {activeProfile && (
+        <p className="font-body text-xs text-[var(--fg-45)]">
+          {t("Exposure mode")}:{" "}
+          {t(activeProfile.exposureMode === "curated" ? "Curated listing" : "Direct listing")}
+        </p>
+      )}
 
       <Tabs
         value={activeTab}

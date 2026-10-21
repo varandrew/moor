@@ -24,7 +24,15 @@ import { DetailPageHeader } from "@/components/shared/DetailPageHeader";
 import { PageLoading } from "@/components/shared/PageLoading";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { cn } from "@/lib/utils";
-import { needsPinWarning, summarizeExposure } from "@/lib/tool-exposure";
+import { PinPicker } from "@/components/shared/PinPicker";
+import { RiskBadge } from "@/components/shared/RiskBadge";
+import {
+  CURATION_HINT_STORAGE_KEY,
+  needsPinWarning,
+  shouldSuggestCuration,
+  suggestDefaultPins,
+  summarizeExposure,
+} from "@/lib/tool-exposure";
 import type { ExposureMode, ProfileToolGroup, RiskPolicy, ToolDetail } from "@moor/types";
 
 export function ProfileDetail() {
@@ -294,6 +302,33 @@ function ToolGovernanceCard({
 
   const totalTools = groups.reduce((sum, group) => sum + group.tools.length, 0);
   const summary = summarizeExposure(groups, exposureMode, riskPolicy);
+  const [pinPicker, setPinPicker] = useState<ToolSelection[] | null>(null);
+  const [hintDismissed, setHintDismissed] = useState(
+    () =>
+      typeof localStorage !== "undefined" &&
+      localStorage.getItem(CURATION_HINT_STORAGE_KEY) === "1",
+  );
+
+  const requestCuratedMode = () => {
+    if (exposureMode === "curated") return;
+    setPinPicker(suggestDefaultPins(groups));
+  };
+
+  const confirmCuratedMode = async () => {
+    if (!pinPicker) return;
+    if (pinPicker.length > 0) {
+      await setPinned(pinPicker, true);
+    }
+    onChangeMode("curated");
+    setPinPicker(null);
+  };
+
+  const dismissHint = () => {
+    setHintDismissed(true);
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(CURATION_HINT_STORAGE_KEY, "1");
+    }
+  };
 
   const applyPin = async (pinned: boolean) => {
     const count = selection.length;
@@ -327,7 +362,7 @@ function ToolGovernanceCard({
             size="sm"
             variant={exposureMode === "curated" ? "default" : "outline"}
             disabled={modeBusy}
-            onClick={() => onChangeMode("curated")}
+            onClick={requestCuratedMode}
           >
             {t("Curated listing")}
           </Button>
@@ -352,6 +387,39 @@ function ToolGovernanceCard({
             {t("Block destructive")}
           </Button>
         </div>
+        {shouldSuggestCuration(totalTools, exposureMode, hintDismissed) && (
+          <p className="mt-2 flex items-center gap-2 rounded-lg bg-surface-300/40 px-3 py-2 font-body text-xs text-[var(--fg-55)]">
+            {t("This profile lists {count} tools. Consider curating it.", { count: totalTools })}
+            <Button size="sm" variant="ghost" className="h-6 px-2 text-xs" onClick={dismissHint}>
+              {t("Got it")}
+            </Button>
+          </p>
+        )}
+        {pinPicker && (
+          <PinPicker
+            groups={groups}
+            selection={pinPicker}
+            busy={governanceBusy || modeBusy}
+            onToggle={(item) =>
+              setPinPicker((prev) =>
+                prev?.some(
+                  (candidate) =>
+                    candidate.serverId === item.serverId && candidate.toolName === item.toolName,
+                )
+                  ? prev.filter(
+                      (candidate) =>
+                        !(
+                          candidate.serverId === item.serverId &&
+                          candidate.toolName === item.toolName
+                        ),
+                    )
+                  : [...(prev ?? []), item],
+              )
+            }
+            onConfirm={() => void confirmCuratedMode()}
+            onCancel={() => setPinPicker(null)}
+          />
+        )}
         {needsPinWarning(exposureMode, summary) && (
           <p className="mt-2 flex items-center gap-2 rounded-lg bg-cursor-orange/8 px-3 py-2 font-body text-xs text-cursor-orange">
             <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
@@ -621,6 +689,7 @@ function ToolRow({
       <div className="flex-1 min-w-0">
         <div className="flex items-baseline gap-2">
           <span className="font-mono text-xs text-cursor-dark truncate">{tool.toolName}</span>
+          <RiskBadge level={tool.riskLevel} source={tool.riskSource} />
           {tool.exposedName !== tool.toolName && (
             <span className="font-mono text-[10px] text-[var(--fg-35)] truncate">
               → {tool.exposedName}

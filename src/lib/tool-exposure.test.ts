@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vite-plus/test";
 import type { ProfileToolGroup, ToolDetail } from "@moor/types";
-import { isToolListed, needsPinWarning, summarizeExposure } from "./tool-exposure";
+import {
+  CURATION_HINT_THRESHOLD,
+  isToolListed,
+  needsPinWarning,
+  shouldSuggestCuration,
+  suggestDefaultPins,
+  summarizeExposure,
+} from "./tool-exposure";
 
 function tool(toolName: string, pinned: boolean, disabled = false): ToolDetail {
   return {
@@ -94,5 +101,39 @@ describe("needsPinWarning", () => {
     expect(needsPinWarning("curated", pinned)).toBe(false);
     expect(needsPinWarning("curated", pinnedButBlocked)).toBe(true);
     expect(needsPinWarning("direct", empty)).toBe(false);
+  });
+});
+
+describe("suggestDefaultPins", () => {
+  it("pins one usable tool per enabled server", () => {
+    const groups = [
+      group(true, [tool("search", false), tool("read", false)]),
+      { ...group(true, [tool("hidden", false, true), tool("write", false)]), serverId: "server-2" },
+      { ...group(false, [tool("ignored", false)]), serverId: "server-3" },
+    ];
+
+    expect(suggestDefaultPins(groups)).toEqual([
+      { serverId: "server-1", toolName: "search" },
+      { serverId: "server-2", toolName: "write" },
+    ]);
+  });
+
+  it("honours a per-server budget", () => {
+    const groups = [group(true, [tool("a", false), tool("b", false), tool("c", false)])];
+
+    expect(suggestDefaultPins(groups, 2).map((item) => item.toolName)).toEqual(["a", "b"]);
+  });
+
+  it("returns nothing when every server is disabled", () => {
+    expect(suggestDefaultPins([group(false, [tool("a", false)])])).toEqual([]);
+  });
+});
+
+describe("shouldSuggestCuration", () => {
+  it("suggests curation only for a large direct profile", () => {
+    expect(shouldSuggestCuration(CURATION_HINT_THRESHOLD, "direct", false)).toBe(true);
+    expect(shouldSuggestCuration(CURATION_HINT_THRESHOLD - 1, "direct", false)).toBe(false);
+    expect(shouldSuggestCuration(CURATION_HINT_THRESHOLD, "curated", false)).toBe(false);
+    expect(shouldSuggestCuration(CURATION_HINT_THRESHOLD, "direct", true)).toBe(false);
   });
 });

@@ -406,6 +406,15 @@ export const messages = {
   "Unknown risk": "未知",
   "Risk level updated": "风险等级已更新",
   "{count} calls blocked by policy": "{count} 次调用被风险策略拒绝",
+  "Pick the tools to keep": "选择要常驻的工具",
+  "Only these tools are listed to agents. Everything else stays reachable through search.":
+    "只有这些工具会直出给 Agent，其余仍可通过检索调用。",
+  "Switch to curated": "切换到策展",
+  "This profile lists {count} tools. Consider curating it.":
+    "这个 Profile 直出了 {count} 个工具，建议切到策展模式。",
+  "Got it": "知道了",
+  "Corrected by you": "你纠正过",
+  "Inferred from the tool name": "根据工具名推断",
 } as const;
 
 export type MessageKey = keyof typeof messages;

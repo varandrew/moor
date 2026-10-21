@@ -57,3 +57,38 @@ export function summarizeExposure(
 export function needsPinWarning(mode: ExposureMode, summary: ExposureSummary): boolean {
   return mode === "curated" && summary.listed === 0;
 }
+
+/** 直出模式下提示「考虑策展」的工具数阈值。 */
+export const CURATION_HINT_THRESHOLD = 24;
+
+/** 记录用户已关闭策展提示。 */
+export const CURATION_HINT_STORAGE_KEY = "moor-curation-hint-dismissed";
+
+export interface ToolSelection {
+  serverId: string;
+  toolName: string;
+}
+
+/**
+ * 切换到策展模式时的默认置顶建议：每个启用的 Server 挑前 `perServer` 个可用工具。
+ *
+ * 不默认全选：全选等于没策展；也不默认空选：空目录会让 Agent 看不到任何工具。
+ */
+export function suggestDefaultPins(groups: ProfileToolGroup[], perServer = 1): ToolSelection[] {
+  return groups.flatMap((group) => {
+    if (!group.serverEnabled) return [];
+    return group.tools
+      .filter((tool) => !tool.disabled)
+      .slice(0, perServer)
+      .map((tool) => ({ serverId: group.serverId, toolName: tool.toolName }));
+  });
+}
+
+/** 直出模式下工具已经很多时，提示用户考虑切到策展模式。 */
+export function shouldSuggestCuration(
+  totalTools: number,
+  mode: ExposureMode,
+  dismissed: boolean,
+): boolean {
+  return mode === "direct" && !dismissed && totalTools >= CURATION_HINT_THRESHOLD;
+}
