@@ -1,6 +1,5 @@
 use crate::sidecar::http::AppState;
 use crate::sidecar::mcp::jsonrpc;
-use crate::sidecar::services::event_bus::Evt;
 use axum::{
     body::Body,
     extract::State,
@@ -12,8 +11,6 @@ use axum::{
 };
 use futures::stream::Stream;
 use std::{convert::Infallible, sync::Arc, time::Duration};
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt as TokioStreamExt;
 
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 
@@ -105,39 +102,86 @@ async fn handle_mcp_get(state: Arc<AppState>, headers: &HeaderMap) -> Response {
             .into_response();
     }
 
-    // 只有完成 initialize 的会话才可能带 session id，所以这里的流天然只服务已初始化的客户端。
-    // 目录类事件折叠成 tools/list_changed；500ms 内的多次变更只发一条，避免批量操作刷屏。
-    let mut last_sent: Option<tokio::time::Instant> = None;
-    let notifications = BroadcastStream::new(state.event_bus.subscribe()).filter_map(move |item| {
-        let event = item.ok()?;
-        if !matches!(
-            event,
-            Evt::ServerTools { .. }
-                | Evt::ServerStatus { .. }
-                | Evt::ProfileActivated { .. }
-                | Evt::ToolsChanged { .. }
-        ) {
-            return None;
-        }
-        let now = tokio::time::Instant::now();
-        if last_sent.is_some_and(|last| now.duration_since(last) < TOOLS_CHANGED_DEBOUNCE) {
-            return None;
-        }
-        last_sent = Some(now);
-        Some(Ok::<_, Infallible>(
-            Event::default().event("message").data(
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/tools/list_changed",
-                })
-                .to_string(),
-            ),
-        ))
-    });
+    // 事件先进入会话自己的通道，每个流各自合并：窗口内继续到来的变更会推后窗口结束，
+    // 因此客户端收到通知时看到的一定是这一批变更的最终状态。
+    state
+        .mcp_sessions
+        .ensure_event_forwarder(state.event_bus.clone())
+        .await;
+    let Some(receiver) = state.mcp_sessions.subscribe(session_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": { "code": jsonrpc::INVALID_REQUEST, "message": "Unknown MCP session" }
+            })
+            .to_string(),
+        )
+            .into_response();
+    };
 
-    let bounded =
-        futures::StreamExt::take_until(notifications, tokio::time::sleep(SSE_STREAM_MAX_LIFETIME));
+    let bounded = futures::StreamExt::take_until(
+        merged_tool_notifications(receiver),
+        tokio::time::sleep(SSE_STREAM_MAX_LIFETIME),
+    );
     sse_keep_alive(bounded).into_response()
+}
+
+struct MergeState {
+    receiver: tokio::sync::broadcast::Receiver<()>,
+    pending: bool,
+    deadline: tokio::time::Instant,
+}
+
+/// 把窗口内的一串信号合并成一条 `notifications/tools/list_changed`。
+fn merged_tool_notifications(
+    receiver: tokio::sync::broadcast::Receiver<()>,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    futures::stream::unfold(
+        MergeState {
+            receiver,
+            pending: false,
+            deadline: tokio::time::Instant::now(),
+        },
+        |mut state| async move {
+            loop {
+                if !state.pending {
+                    if state.receiver.recv().await.is_err() {
+                        return None;
+                    }
+                    state.pending = true;
+                    state.deadline = tokio::time::Instant::now() + TOOLS_CHANGED_DEBOUNCE;
+                    continue;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep_until(state.deadline) => {
+                        state.pending = false;
+                        return Some((Ok::<_, Infallible>(tools_changed_event()), state));
+                    }
+                    received = state.receiver.recv() => {
+                        if received.is_err() {
+                            state.pending = false;
+                            return Some((Ok(tools_changed_event()), state));
+                        }
+                        // 窗口内又有变更：推后结束，保证只播报最终状态。
+                        state.deadline = tokio::time::Instant::now() + TOOLS_CHANGED_DEBOUNCE;
+                    }
+                }
+            }
+        },
+    )
+}
+
+fn tools_changed_event() -> Event {
+    Event::default().event("message").data(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed",
+        })
+        .to_string(),
+    )
 }
 
 async fn handle_mcp_delete(state: Arc<AppState>, headers: &HeaderMap) -> Response {
@@ -343,8 +387,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sidecar::services::event_bus::Evt;
     use axum::{body::Body, http::Request, Router};
     use std::time::SystemTime;
+    use tokio_stream::StreamExt as _;
     use tower::ServiceExt;
 
     fn temp_data_dir(test_name: &str) -> std::path::PathBuf {
@@ -731,6 +777,48 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&frame).contains("notifications/tools/list_changed"),
             "a stop hides tools, so the list changed"
+        );
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn a_burst_is_announced_once_after_the_window_closes() {
+        let data_dir = temp_data_dir("tools-changed-burst");
+        let state = test_state(data_dir.clone());
+        let session_id = state.mcp_sessions.create().await.expect("session created");
+        state
+            .mcp_sessions
+            .ensure_event_forwarder(state.event_bus.clone())
+            .await;
+        let receiver = state
+            .mcp_sessions
+            .subscribe(&session_id)
+            .await
+            .expect("session has a channel");
+        let mut notifications = Box::pin(merged_tool_notifications(receiver));
+
+        for _ in 0..5 {
+            state.event_bus.emit(Evt::ToolsChanged {
+                reason: "burst".into(),
+            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let started = std::time::Instant::now();
+        let first = tokio::time::timeout(Duration::from_secs(2), notifications.next())
+            .await
+            .expect("a merged notification must arrive");
+        assert!(first.is_some(), "the burst must produce one notification");
+        assert!(
+            started.elapsed() >= Duration::from_millis(400),
+            "the window must close before announcing, so readers see the final state"
+        );
+
+        let second = tokio::time::timeout(Duration::from_millis(300), notifications.next()).await;
+        assert!(
+            second.is_err(),
+            "a single burst must not produce a second notification"
         );
 
         let _ = std::fs::remove_dir_all(data_dir);

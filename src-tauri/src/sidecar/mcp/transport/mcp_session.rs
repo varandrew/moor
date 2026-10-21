@@ -1,21 +1,31 @@
+use crate::sidecar::services::event_bus::{EventBus as EvtBus, Evt};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tokio::time::Instant;
 
 /// Safety cap for a local single-user gateway; hitting it signals a leak or
 /// client bug, so new sessions are rejected (503) instead of evicting.
 const MAX_SESSIONS: usize = 128;
 
+/// 一个 MCP 会话：空闲时间 + 只属于它的目录变更通知通道。
+struct SessionEntry {
+    last_active: Instant,
+    notify: broadcast::Sender<()>,
+}
+
 /// Tracks Streamable HTTP MCP sessions with idle-TTL expiry.
 pub struct McpSessionStore {
-    sessions: RwLock<HashMap<String, Instant>>,
+    sessions: RwLock<HashMap<String, SessionEntry>>,
+    forwarder_started: tokio::sync::OnceCell<()>,
 }
 
 impl McpSessionStore {
     pub fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            forwarder_started: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -26,7 +36,14 @@ impl McpSessionStore {
             return None;
         }
         let id = uuid::Uuid::new_v4().to_string();
-        sessions.insert(id.clone(), Instant::now());
+        let (notify, _) = broadcast::channel(8);
+        sessions.insert(
+            id.clone(),
+            SessionEntry {
+                last_active: Instant::now(),
+                notify,
+            },
+        );
         Some(id)
     }
 
@@ -35,8 +52,8 @@ impl McpSessionStore {
     pub async fn validate_and_touch(&self, session_id: &str, ttl: Duration) -> bool {
         let mut sessions = self.sessions.write().await;
         match sessions.get_mut(session_id) {
-            Some(last_active) if last_active.elapsed() <= ttl => {
-                *last_active = Instant::now();
+            Some(entry) if entry.last_active.elapsed() <= ttl => {
+                entry.last_active = Instant::now();
                 true
             }
             Some(_) => {
@@ -55,14 +72,56 @@ impl McpSessionStore {
     pub async fn sweep_expired(&self, ttl: Duration) -> usize {
         let mut sessions = self.sessions.write().await;
         let before = sessions.len();
-        sessions.retain(|_, last_active| last_active.elapsed() <= ttl);
+        sessions.retain(|_, entry| entry.last_active.elapsed() <= ttl);
         before - sessions.len()
+    }
+
+    /// 订阅这个会话自己的通知通道。会话不存在时返回 None。
+    pub async fn subscribe(&self, session_id: &str) -> Option<broadcast::Receiver<()>> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .map(|entry| entry.notify.subscribe())
+    }
+
+    /// 把目录类事件转成会话通知。只在第一次调用时启动转发任务。
+    pub async fn ensure_event_forwarder(self: &Arc<Self>, event_bus: Arc<EvtBus>) {
+        if self.forwarder_started.set(()).is_err() {
+            return;
+        }
+        let store = Arc::clone(self);
+        let mut events = event_bus.subscribe();
+        tokio::spawn(async move {
+            while let Ok(event) = events.recv().await {
+                if affects_tool_list(&event) {
+                    store.notify_all().await;
+                }
+            }
+        });
+    }
+
+    async fn notify_all(&self) {
+        let sessions = self.sessions.read().await;
+        for entry in sessions.values() {
+            let _ = entry.notify.send(());
+        }
     }
 
     #[cfg(test)]
     pub async fn len(&self) -> usize {
         self.sessions.read().await.len()
     }
+}
+
+fn affects_tool_list(event: &Evt) -> bool {
+    matches!(
+        event,
+        Evt::ServerTools { .. }
+            | Evt::ServerStatus { .. }
+            | Evt::ProfileActivated { .. }
+            | Evt::ToolsChanged { .. }
+    )
 }
 
 impl Default for McpSessionStore {
@@ -106,7 +165,9 @@ mod tests {
         let keys: Vec<String> = sessions.keys().cloned().collect();
         for key in keys {
             if key != idle {
-                sessions.insert(key, Instant::now());
+                if let Some(entry) = sessions.get_mut(&key) {
+                    entry.last_active = Instant::now();
+                }
             }
         }
         drop(sessions);
