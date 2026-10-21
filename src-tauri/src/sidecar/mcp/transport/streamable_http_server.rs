@@ -1,5 +1,6 @@
 use crate::sidecar::http::AppState;
 use crate::sidecar::mcp::jsonrpc;
+use crate::sidecar::services::event_bus::Evt;
 use axum::{
     body::Body,
     extract::State,
@@ -9,15 +10,18 @@ use axum::{
         IntoResponse, Response,
     },
 };
-use futures::stream::{self, Stream};
-use futures::StreamExt;
+use futures::stream::Stream;
 use std::{convert::Infallible, sync::Arc, time::Duration};
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt as TokioStreamExt;
 
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 
 /// Total GET SSE stream lifetime; the server closes the stream afterwards and
 /// clients are expected to reconnect (MCP Streamable HTTP spec).
 const SSE_STREAM_MAX_LIFETIME: Duration = Duration::from_secs(30 * 60);
+/// 目录变更通知的去抖窗口。
+const TOOLS_CHANGED_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Handle incoming MCP Streamable HTTP requests at `/mcp`.
 /// Supports POST JSON-RPC, GET SSE streams, and DELETE session teardown.
@@ -101,10 +105,35 @@ async fn handle_mcp_get(state: Arc<AppState>, headers: &HeaderMap) -> Response {
             .into_response();
     }
 
-    // The stream carries no real events today (placeholder keep-alive only),
-    // so ending it at a fixed lifetime loses nothing; clients reconnect per spec.
-    let bounded = stream::pending::<Result<Event, Infallible>>()
-        .take_until(tokio::time::sleep(SSE_STREAM_MAX_LIFETIME));
+    // 只有完成 initialize 的会话才可能带 session id，所以这里的流天然只服务已初始化的客户端。
+    // 目录类事件折叠成 tools/list_changed；500ms 内的多次变更只发一条，避免批量操作刷屏。
+    let mut last_sent: Option<tokio::time::Instant> = None;
+    let notifications = BroadcastStream::new(state.event_bus.subscribe()).filter_map(move |item| {
+        let event = item.ok()?;
+        if !matches!(
+            event,
+            Evt::ServerTools { .. } | Evt::ProfileActivated { .. } | Evt::ToolsChanged { .. }
+        ) {
+            return None;
+        }
+        let now = tokio::time::Instant::now();
+        if last_sent.is_some_and(|last| now.duration_since(last) < TOOLS_CHANGED_DEBOUNCE) {
+            return None;
+        }
+        last_sent = Some(now);
+        Some(Ok::<_, Infallible>(
+            Event::default().event("message").data(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/tools/list_changed",
+                })
+                .to_string(),
+            ),
+        ))
+    });
+
+    let bounded =
+        futures::StreamExt::take_until(notifications, tokio::time::sleep(SSE_STREAM_MAX_LIFETIME));
     sse_keep_alive(bounded).into_response()
 }
 
@@ -544,9 +573,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn get_stream_ends_after_max_lifetime() {
         let data_dir = temp_data_dir("sse-lifetime");
+        let state = test_state(data_dir.clone());
         let app = Router::new()
             .route("/mcp", axum::routing::any(handle_mcp_request))
-            .with_state(test_state(data_dir.clone()));
+            .with_state(state.clone());
 
         let response = app
             .clone()
@@ -615,6 +645,48 @@ mod tests {
             .await
             .expect("request should succeed");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn get_stream_delivers_tools_list_changed() {
+        let data_dir = temp_data_dir("tools-list-changed");
+        let state = test_state(data_dir.clone());
+        let session_id = state.mcp_sessions.create().await.expect("session created");
+        let app = Router::new()
+            .route("/mcp", axum::routing::any(handle_mcp_request))
+            .with_state(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/mcp")
+                    .header(header::ACCEPT, "text/event-stream")
+                    .header(MCP_SESSION_ID_HEADER, &session_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut stream = response.into_body().into_data_stream();
+        state.event_bus.emit(Evt::ToolsChanged {
+            reason: "test".into(),
+        });
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("a notification should arrive within the timeout")
+            .expect("stream should yield a frame")
+            .expect("frame should be readable");
+        let text = String::from_utf8_lossy(&frame);
+        assert!(
+            text.contains("notifications/tools/list_changed"),
+            "unexpected frame: {text}"
+        );
+
         let _ = std::fs::remove_dir_all(data_dir);
     }
 }

@@ -34,6 +34,7 @@ import {
   useServer,
   useServerTools,
   useUpdateToolRisk,
+  useRefreshServerTools,
 } from "@/hooks/useServers";
 import { useEditSession } from "@/hooks/useEditSession";
 import { findDuplicateHeaderKeys, type EditForm } from "@/lib/server-form";
@@ -151,6 +152,7 @@ export function ServerDetail() {
   const { server, isLoading: loading } = useServer(id);
   const { tools } = useServerTools(id, activeProfile?.id);
   const updateToolRisk = useUpdateToolRisk(id);
+  const refreshTools = useRefreshServerTools(id);
 
   const {
     isEditing,
@@ -179,8 +181,8 @@ export function ServerDetail() {
 
   const handleDiscoverTools = async () => {
     if (server.status === "running") {
-      await stopServer(id!);
-      await startServer(id!);
+      // 重新发现不重启进程：重启会打断正在使用这个 Server 的 Agent。
+      await refreshTools();
     } else {
       await startServer(id!);
     }

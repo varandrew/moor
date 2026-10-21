@@ -83,6 +83,7 @@ async fn update(
     Path(id): Path<String>,
     axum::Json(body): axum::Json<UpdateBody>,
 ) -> Result<Json<Value>, AppError> {
+    let touches_exposure = body.exposure_mode.is_some() || body.risk_policy.is_some();
     let profile = ProfileService::update(
         &state.db,
         &id,
@@ -91,6 +92,13 @@ async fn update(
         body.risk_policy.as_deref(),
     )
     .map_err(AppError::from)?;
+    if touches_exposure {
+        state
+            .event_bus
+            .emit(crate::sidecar::services::event_bus::Evt::ToolsChanged {
+                reason: "profile".into(),
+            });
+    }
     Ok(Json(
         serde_json::to_value(profile).map_err(|e| AppError::internal(e.to_string()))?,
     ))
@@ -213,6 +221,11 @@ async fn bulk_upsert_servers(
         .collect();
     ProfileService::upsert_profile_servers_batch(&state.db, &profile_id, &items)
         .map_err(AppError::from)?;
+    state
+        .event_bus
+        .emit(crate::sidecar::services::event_bus::Evt::ToolsChanged {
+            reason: "governance".into(),
+        });
     Ok(Json(json!({ "success": true, "updated": items.len() })))
 }
 

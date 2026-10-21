@@ -23,7 +23,6 @@ pub trait McpSession: Send {
         &self,
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<(), RequestError>> + Send + '_>>;
-    #[allow(dead_code)]
     fn list_tools(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<ToolInsert>, String>> + Send + '_>>;

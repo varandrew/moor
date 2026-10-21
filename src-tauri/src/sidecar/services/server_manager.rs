@@ -512,6 +512,29 @@ impl ServerManager {
         result
     }
 
+    /// 对运行中的 Server 重新发现工具，不重启进程。
+    pub async fn refresh_server_tools(&self, server_id: &str) -> Result<usize, String> {
+        let session = {
+            let slots = self.slots.lock().await;
+            let slot = slots
+                .get(server_id)
+                .ok_or_else(|| "Server not found".to_string())?;
+            if !matches!(slot.status, ServerStatus::Running) {
+                return Err("Server is not running".to_string());
+            }
+            slot.session
+                .clone()
+                .ok_or_else(|| "Server is not running".to_string())?
+        };
+
+        let tools = {
+            let client = session.lock().await;
+            client.list_tools().await?
+        };
+        self.cache_tools(server_id, &tools);
+        Ok(tools.len())
+    }
+
     /// 可调用的完整集合（不受置顶影响）：元工具的检索池。
     pub async fn get_callable_tools(
         &self,

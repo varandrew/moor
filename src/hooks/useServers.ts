@@ -239,6 +239,22 @@ export function useServerActions(callbacks?: {
   };
 }
 
+/** 对运行中的 Server 重新发现工具：不重启进程，也不中断已连接的 Agent。 */
+export function useRefreshServerTools(serverId: string | undefined) {
+  const queryClient = useQueryClient();
+  const mutation = useMutation({
+    mutationFn: async () => {
+      if (!serverId) throw new Error("Server not found");
+      return apiPost<{ tools: number }>(routes.servers.refreshTools(serverId), {});
+    },
+    onSuccess: () => {
+      if (!serverId) return;
+      void queryClient.invalidateQueries({ queryKey: serverKeys.toolsRoot(serverId) });
+    },
+  });
+  return mutation.mutateAsync;
+}
+
 /** 手动纠正工具风险等级：启发式一定会误判，这是纠错通道。 */
 export function useUpdateToolRisk(serverId: string | undefined) {
   const queryClient = useQueryClient();

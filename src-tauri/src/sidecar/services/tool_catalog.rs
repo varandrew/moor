@@ -12,7 +12,6 @@ use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct ToolCatalogEntry {
-    pub server_id: String,
     pub server_name: String,
     pub tool_name: String,
     pub exposed_name: String,
@@ -269,7 +268,6 @@ fn catalog_entries(
         .filter(keep)
         .filter_map(|visible| {
             Some(ToolCatalogEntry {
-                server_id: visible.server_id,
                 server_name: visible.server_name,
                 tool_name: visible.tool_name,
                 exposed_name: visible.exposed_name?,

@@ -23,6 +23,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/servers/{id}/start", post(start))
         .route("/api/servers/{id}/stop", post(stop))
         .route("/api/servers/{id}/tools", get(tools))
+        .route("/api/servers/{id}/tools/refresh", post(refresh_tools))
         .route(
             "/api/servers/{id}/tools/{toolName}/risk",
             patch(set_tool_risk),
@@ -33,6 +34,19 @@ pub fn router() -> Router<Arc<AppState>> {
 #[serde(rename_all = "camelCase")]
 struct RiskBody {
     risk_level: String,
+}
+
+/// 对运行中的 Server 重新发现工具，不重启进程。
+async fn refresh_tools(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let count = state
+        .server_manager
+        .refresh_server_tools(&id)
+        .await
+        .map_err(|message| AppError::conflict("server_not_running", message))?;
+    Ok(Json(serde_json::json!({ "tools": count })))
 }
 
 /// 用户手动纠正风险等级。启发式一定会误判，这个入口是纠错通道。
@@ -52,6 +66,11 @@ async fn set_tool_risk(
     crate::sidecar::db::tool_discovery_repo::ToolDiscoveryRepository::new(&state.db)
         .set_tool_risk(&server_id, &tool_name, level)
         .map_err(AppError::not_found)?;
+    state
+        .event_bus
+        .emit(crate::sidecar::services::event_bus::Evt::ToolsChanged {
+            reason: "risk".into(),
+        });
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
