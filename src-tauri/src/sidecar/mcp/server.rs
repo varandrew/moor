@@ -1,7 +1,18 @@
 use super::jsonrpc;
 use crate::sidecar::http::AppState;
 use crate::sidecar::services::server_manager::ToolCallError;
+use crate::sidecar::services::tool_catalog::ToolCatalogEntry;
+use crate::sidecar::services::tool_visibility::ExposureMode;
+use serde_json::{json, Value};
 use std::sync::Arc;
+
+/// 策展模式下注入的检索元工具。名字只有单个下划线，与 `{slug}__{tool}` 不冲突。
+pub const SEARCH_TOOL_NAME: &str = "moor_search_tools";
+/// 策展模式下注入的转发元工具。
+pub const CALL_TOOL_NAME: &str = "moor_call_tool";
+
+const DEFAULT_SEARCH_LIMIT: usize = 10;
+const MAX_SEARCH_LIMIT: usize = 50;
 
 /// Handle an incoming MCP JSON-RPC request and produce a response.
 /// This implements the MCP Gateway: aggregates tools from all running servers
@@ -39,21 +50,60 @@ fn handle_initialize(id: jsonrpc::Id) -> serde_json::Value {
 
 async fn handle_tools_list(id: jsonrpc::Id, state: Arc<AppState>) -> serde_json::Value {
     let catalog = state.server_manager.get_tool_catalog(None).await;
-    let tools: Vec<serde_json::Value> = catalog
+    let mut tools: Vec<serde_json::Value> = catalog
         .iter()
         .map(|tool| {
-            serde_json::json!({
+            json!({
                 "name": tool.exposed_name,
                 "description": tool.description,
                 "inputSchema": tool
                     .input_schema
                     .clone()
-                    .unwrap_or_else(|| serde_json::json!({"type": "object"})),
+                    .unwrap_or_else(|| json!({"type": "object"})),
                 "_meta": { "serverName": tool.server_name },
             })
         })
         .collect();
-    jsonrpc::make_response(id, serde_json::json!({ "tools": tools }))
+    if matches!(
+        state.server_manager.active_exposure_mode(),
+        ExposureMode::Curated
+    ) {
+        tools.extend(meta_tool_definitions());
+    }
+    jsonrpc::make_response(id, json!({ "tools": tools }))
+}
+
+/// 策展模式的两个元工具。`moor_search_tools` 的描述是产品文案——它决定模型会不会先搜索。
+fn meta_tool_definitions() -> Vec<Value> {
+    vec![
+        json!({
+            "name": SEARCH_TOOL_NAME,
+            "description": "Search the tools this gateway can expose but is not listing right now. Call this before claiming a tool is unavailable: when the tool you need is not in the current list, search first.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Space-separated keywords; all must match" },
+                    "server": { "type": "string", "description": "Only search tools from servers whose name contains this" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": MAX_SEARCH_LIMIT },
+                    "cursor": { "type": "string", "description": "Opaque cursor from a previous search" }
+                }
+            },
+            "_meta": { "provider": "moor" }
+        }),
+        json!({
+            "name": CALL_TOOL_NAME,
+            "description": "Call a tool by the name returned from moor_search_tools. The result has the same shape as tools/call.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "arguments": { "type": "object" }
+                },
+                "required": ["name"]
+            },
+            "_meta": { "provider": "moor" }
+        }),
+    ]
 }
 
 async fn handle_tools_call(
@@ -73,8 +123,44 @@ async fn handle_tools_call(
     let arguments = params
         .get("arguments")
         .cloned()
-        .unwrap_or(serde_json::json!({}));
+        .unwrap_or_else(|| json!({}));
 
+    if tool_name == SEARCH_TOOL_NAME {
+        let catalog = state.server_manager.get_callable_tools().await;
+        let result = search_catalog(&catalog, &arguments);
+        return jsonrpc::make_response(
+            id,
+            json!({
+                "content": [{ "type": "text", "text": result.to_string() }],
+            }),
+        );
+    }
+
+    if tool_name == CALL_TOOL_NAME {
+        let Some(inner_name) = arguments.get("name").and_then(Value::as_str) else {
+            return jsonrpc::make_error(
+                id,
+                jsonrpc::INVALID_PARAMS,
+                &format!("{CALL_TOOL_NAME} requires a tool name"),
+            );
+        };
+        let inner_arguments = arguments
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        return call_and_map(id, state, inner_name, inner_arguments, agent_info).await;
+    }
+
+    call_and_map(id, state, tool_name, arguments, agent_info).await
+}
+
+async fn call_and_map(
+    id: jsonrpc::Id,
+    state: Arc<AppState>,
+    tool_name: &str,
+    arguments: Value,
+    agent_info: Option<&str>,
+) -> Value {
     match state
         .server_manager
         .call_tool(tool_name, arguments, agent_info)
@@ -88,6 +174,74 @@ async fn handle_tools_call(
             jsonrpc::make_error(id, jsonrpc::INTERNAL_ERROR, &err)
         }
     }
+}
+
+/// 检索可调用工具。关键词按空格分隔且全部命中（大小写不敏感），在工具名与描述上匹配。
+fn search_catalog(catalog: &[ToolCatalogEntry], params: &Value) -> Value {
+    let query = params.get("query").and_then(Value::as_str).unwrap_or("");
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(|term| term.to_lowercase())
+        .collect();
+    let server_filter = params
+        .get("server")
+        .and_then(Value::as_str)
+        .map(|server| server.to_lowercase());
+    let limit = params
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_SEARCH_LIMIT as u64)
+        .clamp(1, MAX_SEARCH_LIMIT as u64) as usize;
+    let offset = params
+        .get("cursor")
+        .and_then(Value::as_str)
+        .and_then(|cursor| cursor.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    let matched: Vec<&ToolCatalogEntry> = catalog
+        .iter()
+        .filter(|entry| {
+            if let Some(server) = &server_filter {
+                if !entry.server_name.to_lowercase().contains(server) {
+                    return false;
+                }
+            }
+            if terms.is_empty() {
+                return true;
+            }
+            let haystack = format!(
+                "{} {} {}",
+                entry.tool_name,
+                entry.exposed_name,
+                entry.description.clone().unwrap_or_default()
+            )
+            .to_lowercase();
+            terms.iter().all(|term| haystack.contains(term))
+        })
+        .collect();
+
+    let tools: Vec<Value> = matched
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(|entry| {
+            json!({
+                "name": entry.exposed_name,
+                "description": entry.description,
+                "inputSchema": entry
+                    .input_schema
+                    .clone()
+                    .unwrap_or_else(|| json!({"type": "object"})),
+                "serverName": entry.server_name,
+            })
+        })
+        .collect();
+
+    let mut result = json!({ "tools": tools });
+    if matched.len() > offset + limit {
+        result["nextCursor"] = json!((offset + limit).to_string());
+    }
+    result
 }
 
 #[cfg(test)]
@@ -404,8 +558,20 @@ process.stdin.on("data", (chunk) => {
         let listed = tools_response["result"]["tools"]
             .as_array()
             .expect("tools should be an array");
-        assert_eq!(listed.len(), 1, "curated mode lists pinned tools only");
-        assert_eq!(listed[0]["name"], "fake__echo");
+        let names: Vec<&str> = listed
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"fake__echo"),
+            "curated mode lists the pinned tool"
+        );
+        assert!(
+            !names.contains(&"fake__report"),
+            "curated mode hides unpinned tools"
+        );
+        assert!(names.contains(&SEARCH_TOOL_NAME));
+        assert!(names.contains(&CALL_TOOL_NAME));
 
         let response = handle_request(
             jsonrpc::Id::Number(1),
@@ -457,5 +623,124 @@ process.stdin.on("data", (chunk) => {
             .as_array()
             .expect("tools should be an array");
         assert_eq!(listed.len(), 2, "direct mode ignores pinning");
+    }
+
+    #[tokio::test]
+    async fn direct_profile_exposes_no_meta_tools() {
+        let gateway = start_test_gateway("no-meta").await;
+
+        let tools_response = handle_request(
+            jsonrpc::Id::Number(0),
+            "tools/list",
+            None,
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+        let names: Vec<&str> = tools_response["result"]["tools"]
+            .as_array()
+            .expect("tools should be an array")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert!(!names.contains(&SEARCH_TOOL_NAME));
+        assert!(!names.contains(&CALL_TOOL_NAME));
+    }
+
+    async fn curated_gateway(test_name: &str) -> FakeGateway {
+        let gateway = start_test_gateway_with_tools(
+            test_name,
+            r#"[{ "name": "echo" }, { "name": "report" }]"#,
+        )
+        .await;
+        let profile_repo = ProfileRepository::new(&gateway.db);
+        let profile_id = profile_repo
+            .find_active_id()
+            .expect("failed to read active profile")
+            .expect("active profile should exist");
+        profile_repo
+            .update(&profile_id, None, Some("curated"))
+            .expect("failed to switch exposure mode");
+        gateway
+    }
+
+    async fn search(state: Arc<AppState>, arguments: serde_json::Value) -> serde_json::Value {
+        let response = handle_request(
+            jsonrpc::Id::Number(2),
+            "tools/call",
+            Some(serde_json::json!({ "name": SEARCH_TOOL_NAME, "arguments": arguments })),
+            state,
+            Some("test-agent"),
+        )
+        .await;
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("search should answer with a text payload");
+        serde_json::from_str(text).expect("search payload should be json")
+    }
+
+    #[tokio::test]
+    async fn search_tools_finds_unpinned_tools_by_keyword() {
+        let gateway = curated_gateway("search-keyword").await;
+
+        let result = search(
+            gateway.state.clone(),
+            serde_json::json!({ "query": "report" }),
+        )
+        .await;
+        let tools = result["tools"]
+            .as_array()
+            .expect("tools should be an array");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "fake__report");
+        assert_eq!(tools[0]["serverName"], "fake");
+        assert_eq!(tools[0]["inputSchema"]["type"], "object");
+    }
+
+    #[tokio::test]
+    async fn search_tools_paginates_with_a_cursor() {
+        let gateway = curated_gateway("search-cursor").await;
+
+        let first = search(gateway.state.clone(), serde_json::json!({ "limit": 1 })).await;
+        assert_eq!(
+            first["tools"].as_array().expect("tools array").len(),
+            1,
+            "limit must cap the page"
+        );
+        let cursor = first["nextCursor"]
+            .as_str()
+            .expect("a partial page must offer a cursor");
+
+        let second = search(
+            gateway.state.clone(),
+            serde_json::json!({ "limit": 1, "cursor": cursor }),
+        )
+        .await;
+        assert_eq!(second["tools"].as_array().expect("tools array").len(), 1);
+        assert_ne!(first["tools"][0]["name"], second["tools"][0]["name"]);
+    }
+
+    #[tokio::test]
+    async fn call_tool_forwards_to_the_named_tool() {
+        let gateway = curated_gateway("meta-call").await;
+
+        let response = handle_request(
+            jsonrpc::Id::Number(3),
+            "tools/call",
+            Some(serde_json::json!({
+                "name": CALL_TOOL_NAME,
+                "arguments": { "name": "fake__report", "arguments": { "value": "ok" } }
+            })),
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+
+        assert_eq!(response["result"]["content"][0]["type"], "text");
+        assert!(response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text payload")
+            .contains("\"value\":\"ok\""));
     }
 }

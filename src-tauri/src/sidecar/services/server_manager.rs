@@ -466,6 +466,29 @@ impl ServerManager {
         result
     }
 
+    /// 可调用的完整集合（不受置顶影响）：元工具的检索池。
+    pub async fn get_callable_tools(
+        &self,
+    ) -> Vec<crate::sidecar::services::tool_catalog::ToolCatalogEntry> {
+        let callable_ids = self.get_callable_server_ids().await;
+        ToolCatalogService::get_callable_tool_catalog(&self.db, None, Some(&callable_ids))
+    }
+
+    /// 当前 Active Profile 的曝光模式；没有 Active Profile 时按直出处理。
+    pub fn active_exposure_mode(&self) -> crate::sidecar::services::tool_visibility::ExposureMode {
+        let repo = ProfileRepository::new(&self.db);
+        repo.find_active_id()
+            .ok()
+            .flatten()
+            .and_then(|id| repo.find_by_id(&id).ok().flatten())
+            .map(|profile| {
+                crate::sidecar::services::tool_visibility::ExposureMode::from_db(
+                    &profile.exposure_mode,
+                )
+            })
+            .unwrap_or(crate::sidecar::services::tool_visibility::ExposureMode::Direct)
+    }
+
     pub async fn get_tool_catalog(
         &self,
         profile_id: Option<&str>,
