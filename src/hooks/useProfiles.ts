@@ -6,7 +6,13 @@ import { routes } from "@/lib/api-routes";
 import { serverKeys, profileKeys, logKeys } from "@/lib/query-keys";
 import { useSSEEvent } from "@/contexts/SSEContext";
 import { getErrorMessage } from "@/lib/utils";
-import type { ExposureMode, Profile, ProfileDetail, ProfileToolGroup } from "@moor/types";
+import type {
+  ExposureMode,
+  Profile,
+  ProfileDetail,
+  ProfileToolGroup,
+  RiskPolicy,
+} from "@moor/types";
 
 export function useProfiles() {
   const queryClient = useQueryClient();
@@ -63,7 +69,7 @@ export function useProfiles() {
       updates,
     }: {
       id: string;
-      updates: { name?: string; exposureMode?: ExposureMode };
+      updates: { name?: string; exposureMode?: ExposureMode; riskPolicy?: RiskPolicy };
     }) => {
       await apiPut(routes.profiles.update(id), updates);
       invalidateProfileUndo(queryClient, id);

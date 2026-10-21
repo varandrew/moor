@@ -170,6 +170,18 @@ async fn call_and_map(
         Err(ToolCallError::InvalidTool(err)) => {
             jsonrpc::make_error(id, jsonrpc::INVALID_PARAMS, &err)
         }
+        Err(ToolCallError::PolicyDenied { risk_level, hint }) => jsonrpc::make_error_with_data(
+            id,
+            jsonrpc::POLICY_DENIED,
+            "Tool blocked by risk policy",
+            json!({ "policy": "risk", "riskLevel": risk_level, "hint": hint }),
+        ),
+        Err(ToolCallError::ServerUnavailable(err)) => {
+            jsonrpc::make_error(id, jsonrpc::SERVER_UNAVAILABLE, &err)
+        }
+        Err(ToolCallError::Timeout(err)) => {
+            jsonrpc::make_error(id, jsonrpc::UPSTREAM_TIMEOUT, &err)
+        }
         Err(ToolCallError::Execution(err)) => {
             jsonrpc::make_error(id, jsonrpc::INTERNAL_ERROR, &err)
         }
@@ -533,7 +545,7 @@ process.stdin.on("data", (chunk) => {
             .expect("failed to read active profile")
             .expect("active profile should exist");
         profile_repo
-            .update(&profile_id, None, Some("curated"))
+            .update(&profile_id, None, Some("curated"), None)
             .expect("failed to switch exposure mode");
         profile_repo
             .upsert_profile_servers_batch(
@@ -659,7 +671,7 @@ process.stdin.on("data", (chunk) => {
             .expect("failed to read active profile")
             .expect("active profile should exist");
         profile_repo
-            .update(&profile_id, None, Some("curated"))
+            .update(&profile_id, None, Some("curated"), None)
             .expect("failed to switch exposure mode");
         gateway
     }
@@ -742,5 +754,103 @@ process.stdin.on("data", (chunk) => {
             .as_str()
             .expect("text payload")
             .contains("\"value\":\"ok\""));
+    }
+
+    #[tokio::test]
+    async fn blocking_policy_hides_and_rejects_destructive_tools() {
+        let gateway =
+            start_test_gateway_with_tools("risk-blocked", r#"[{ "name": "delete_repo" }]"#).await;
+        let profile_repo = ProfileRepository::new(&gateway.db);
+        let profile_id = profile_repo
+            .find_active_id()
+            .expect("failed to read active profile")
+            .expect("active profile should exist");
+        profile_repo
+            .update(&profile_id, None, None, Some("block_destructive"))
+            .expect("failed to set the risk policy");
+
+        let tools_response = handle_request(
+            jsonrpc::Id::Number(0),
+            "tools/list",
+            None,
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+        assert_eq!(
+            tools_response["result"]["tools"]
+                .as_array()
+                .expect("tools should be an array")
+                .len(),
+            0,
+            "a blocked tool must not be listed"
+        );
+
+        let response = handle_request(
+            jsonrpc::Id::Number(1),
+            "tools/call",
+            Some(serde_json::json!({ "name": "fake__delete_repo", "arguments": {} })),
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], jsonrpc::POLICY_DENIED);
+        assert_eq!(response["error"]["data"]["policy"], "risk");
+        assert_eq!(response["error"]["data"]["riskLevel"], "destructive");
+        assert!(response["error"]["data"]["hint"].is_string());
+    }
+
+    #[tokio::test]
+    async fn advisory_policy_still_lists_destructive_tools() {
+        let gateway =
+            start_test_gateway_with_tools("risk-advisory", r#"[{ "name": "delete_repo" }]"#).await;
+
+        let tools_response = handle_request(
+            jsonrpc::Id::Number(0),
+            "tools/list",
+            None,
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+        assert_eq!(
+            tools_response["result"]["tools"]
+                .as_array()
+                .expect("tools should be an array")
+                .len(),
+            1
+        );
+
+        let response = handle_request(
+            jsonrpc::Id::Number(1),
+            "tools/call",
+            Some(serde_json::json!({ "name": "fake__delete_repo", "arguments": {} })),
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+        assert!(response.get("result").is_some(), "advisory mode only marks");
+    }
+
+    #[tokio::test]
+    async fn a_stopped_server_answers_with_server_unavailable() {
+        let gateway = start_test_gateway("server-unavailable").await;
+        gateway
+            .state
+            .server_manager
+            .stop_server(&gateway.server_id)
+            .await
+            .expect("failed to stop the fake server");
+
+        let response = handle_request(
+            jsonrpc::Id::Number(1),
+            "tools/call",
+            Some(serde_json::json!({ "name": "fake__echo", "arguments": {} })),
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+
+        assert_eq!(response["error"]["code"], jsonrpc::SERVER_UNAVAILABLE);
     }
 }

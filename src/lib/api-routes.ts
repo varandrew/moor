@@ -36,6 +36,8 @@ export const routes = {
     order: () => "/api/servers/order",
     tools: (id: string, profileId?: string) =>
       withQuery(`/api/servers/${pathSegment(id)}/tools`, { profile_id: profileId }),
+    toolRisk: (id: string, toolName: string) =>
+      `/api/servers/${pathSegment(id)}/tools/${pathSegment(toolName)}/risk`,
   },
   profiles: {
     list: () => "/api/profiles",

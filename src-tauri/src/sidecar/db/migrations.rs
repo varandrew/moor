@@ -43,6 +43,8 @@ pub fn run_migrations(db: &Database) -> Result<(), String> {
             exposed_name TEXT NOT NULL,
             description TEXT,
             input_schema TEXT,
+            risk_level TEXT NOT NULL DEFAULT 'unknown',
+            risk_source TEXT NOT NULL DEFAULT 'heuristic',
             discovered_at TEXT NOT NULL,
             PRIMARY KEY (server_id, tool_name)
         );
@@ -98,6 +100,24 @@ pub fn run_migrations(db: &Database) -> Result<(), String> {
         "profile_servers",
         "pinned_tools",
         "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        db,
+        "profiles",
+        "risk_policy",
+        "TEXT NOT NULL DEFAULT 'advisory'",
+    )?;
+    ensure_column(
+        db,
+        "tool_discoveries",
+        "risk_level",
+        "TEXT NOT NULL DEFAULT 'unknown'",
+    )?;
+    ensure_column(
+        db,
+        "tool_discoveries",
+        "risk_source",
+        "TEXT NOT NULL DEFAULT 'heuristic'",
     )?;
     backfill_server_sort_order(db)?;
     normalize_audit_timestamps(db)?;

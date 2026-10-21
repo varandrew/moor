@@ -3,6 +3,7 @@ use crate::sidecar::db::tool_discovery_repo::{
     ProfileTool, ToolDiscovery, ToolDiscoveryRepository,
 };
 use crate::sidecar::db::Database;
+use crate::sidecar::services::tool_risk::{RiskLevel, RiskPolicy};
 use crate::sidecar::services::tool_visibility::{
     normalize_server_name, resolve_tool_visibility, ExposureMode, ToolVisibility,
 };
@@ -28,6 +29,8 @@ pub struct ToolDetail {
     pub input_schema: Option<serde_json::Value>,
     pub disabled: bool,
     pub pinned: bool,
+    pub risk_level: String,
+    pub risk_source: String,
 }
 
 pub struct ToolCatalogService;
@@ -53,11 +56,8 @@ impl ToolCatalogService {
             Err(_) => return vec![],
         };
 
-        build_tool_catalog_entries(
-            &profile_tools,
-            visible_server_ids,
-            exposure_mode(db, &active_id),
-        )
+        let (mode, policy) = profile_exposure(db, &active_id);
+        build_tool_catalog_entries(&profile_tools, visible_server_ids, mode, policy)
     }
 
     /// `tools/call` 的归属解析用：策展模式下未置顶的工具仍可被调用。
@@ -81,7 +81,31 @@ impl ToolCatalogService {
             Err(_) => return vec![],
         };
 
-        build_callable_catalog_entries(&profile_tools, visible_server_ids)
+        let (_, policy) = profile_exposure(db, &active_id);
+        build_callable_catalog_entries(&profile_tools, visible_server_ids, policy)
+    }
+
+    /// `tools/call` 的错误分类需要完整判定（含被策略拦下的工具），而不只是可调用集合。
+    pub fn resolve_profile_tools(
+        db: &Database,
+        profile_id: Option<&str>,
+        visible_server_ids: Option<&std::collections::HashSet<String>>,
+    ) -> Vec<ToolVisibility> {
+        let profile_repo = ProfileRepository::new(db);
+        let active_id = match profile_id {
+            Some(id) => id.to_string(),
+            None => match profile_repo.find_active_id() {
+                Ok(Some(id)) => id,
+                _ => return vec![],
+            },
+        };
+        let tool_repo = ToolDiscoveryRepository::new(db);
+        let profile_tools = match tool_repo.find_by_profile_id(&active_id) {
+            Ok(t) => t,
+            Err(_) => return vec![],
+        };
+        let (mode, policy) = profile_exposure(db, &active_id);
+        resolve_tool_visibility(&profile_tools, visible_server_ids, mode, policy)
     }
 
     pub fn get_tool_details(
@@ -112,10 +136,12 @@ impl ToolCatalogService {
             .map(|server| server.name)
             .unwrap_or_else(|| "server".to_string());
 
+        let (mode, policy) = profile_exposure(db, &active_id);
         let visibility = visibility_by_server(resolve_tool_visibility(
             &profile_tools,
             visible_server_ids,
-            exposure_mode(db, &active_id),
+            mode,
+            policy,
         ));
         let discovered = match tool_repo.find_by_server_id(server_id) {
             Ok(tools) => tools,
@@ -145,11 +171,9 @@ impl ToolCatalogService {
             Ok(tools) => tools,
             Err(_) => return vec![],
         };
-        let visibility = visibility_by_server(resolve_tool_visibility(
-            &profile_tools,
-            None,
-            exposure_mode(db, profile_id),
-        ));
+        let (mode, policy) = profile_exposure(db, profile_id);
+        let visibility =
+            visibility_by_server(resolve_tool_visibility(&profile_tools, None, mode, policy));
         let mut discovered_by_server = std::collections::HashMap::<String, Vec<_>>::new();
         for tool in tool_repo.find_all().unwrap_or_default() {
             discovered_by_server
@@ -191,13 +215,19 @@ pub struct ProfileToolGroup {
     pub tools: Vec<ToolDetail>,
 }
 
-fn exposure_mode(db: &Database, profile_id: &str) -> ExposureMode {
+/// Profile 的两项曝光设置：曝光模式与风险策略。
+fn profile_exposure(db: &Database, profile_id: &str) -> (ExposureMode, RiskPolicy) {
     ProfileRepository::new(db)
         .find_by_id(profile_id)
         .ok()
         .flatten()
-        .map(|profile| ExposureMode::from_db(&profile.exposure_mode))
-        .unwrap_or(ExposureMode::Direct)
+        .map(|profile| {
+            (
+                ExposureMode::from_db(&profile.exposure_mode),
+                RiskPolicy::from_db(&profile.risk_policy),
+            )
+        })
+        .unwrap_or((ExposureMode::Direct, RiskPolicy::Advisory))
 }
 
 /// Agent 看到的目录：`tools/list` 的输入。
@@ -205,19 +235,24 @@ fn build_tool_catalog_entries(
     profile_tools: &[ProfileTool],
     callable_server_ids: Option<&HashSet<String>>,
     mode: ExposureMode,
+    policy: RiskPolicy,
 ) -> Vec<ToolCatalogEntry> {
-    catalog_entries(profile_tools, callable_server_ids, mode, |item| item.listed)
+    catalog_entries(profile_tools, callable_server_ids, mode, policy, |item| {
+        item.listed
+    })
 }
 
 /// 可调用的完整集合：`tools/call` 的归属解析用，不受置顶影响。
 fn build_callable_catalog_entries(
     profile_tools: &[ProfileTool],
     callable_server_ids: Option<&HashSet<String>>,
+    policy: RiskPolicy,
 ) -> Vec<ToolCatalogEntry> {
     catalog_entries(
         profile_tools,
         callable_server_ids,
         ExposureMode::Direct,
+        policy,
         |item| item.access.is_callable(),
     )
 }
@@ -226,9 +261,10 @@ fn catalog_entries(
     profile_tools: &[ProfileTool],
     callable_server_ids: Option<&HashSet<String>>,
     mode: ExposureMode,
+    policy: RiskPolicy,
     keep: impl Fn(&ToolVisibility) -> bool,
 ) -> Vec<ToolCatalogEntry> {
-    resolve_tool_visibility(profile_tools, callable_server_ids, mode)
+    resolve_tool_visibility(profile_tools, callable_server_ids, mode, policy)
         .into_iter()
         .filter(keep)
         .filter_map(|visible| {
@@ -264,6 +300,9 @@ fn tool_detail(
     server_name: &str,
     tool: ToolDiscovery,
 ) -> ToolDetail {
+    let risk_level = resolved
+        .map(|item| item.risk.as_str().to_string())
+        .unwrap_or_else(|| RiskLevel::from_db(&tool.risk_level).as_str().to_string());
     ToolDetail {
         exposed_name: resolved
             .and_then(|item| item.exposed_name.clone())
@@ -272,6 +311,8 @@ fn tool_detail(
             }),
         disabled: resolved.is_some_and(|item| item.access.is_deny_listed()),
         pinned: resolved.is_some_and(|item| item.pinned),
+        risk_level,
+        risk_source: tool.risk_source,
         tool_name: tool.tool_name,
         description: tool.description,
         input_schema: tool.input_schema,

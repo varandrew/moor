@@ -25,7 +25,7 @@ import { PageLoading } from "@/components/shared/PageLoading";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { cn } from "@/lib/utils";
 import { needsPinWarning, summarizeExposure } from "@/lib/tool-exposure";
-import type { ExposureMode, ProfileToolGroup, ToolDetail } from "@moor/types";
+import type { ExposureMode, ProfileToolGroup, RiskPolicy, ToolDetail } from "@moor/types";
 
 export function ProfileDetail() {
   const { t } = useTranslation();
@@ -36,11 +36,14 @@ export function ProfileDetail() {
   const { updateProfile } = useProfiles();
   const [modeBusy, setModeBusy] = useState(false);
 
-  const changeExposureMode = async (mode: ExposureMode) => {
-    if (!id || mode === profile?.exposureMode) return;
+  const changeProfile = async (updates: {
+    exposureMode?: ExposureMode;
+    riskPolicy?: RiskPolicy;
+  }) => {
+    if (!id) return;
     setModeBusy(true);
     try {
-      await updateProfile({ id, updates: { exposureMode: mode } });
+      await updateProfile({ id, updates });
     } finally {
       setModeBusy(false);
     }
@@ -139,8 +142,10 @@ export function ProfileDetail() {
       <ToolGovernanceCard
         profileId={id}
         exposureMode={profile.exposureMode}
+        riskPolicy={profile.riskPolicy}
         modeBusy={modeBusy}
-        onChangeMode={(mode) => void changeExposureMode(mode)}
+        onChangeMode={(mode) => void changeProfile({ exposureMode: mode })}
+        onChangeRiskPolicy={(policy) => void changeProfile({ riskPolicy: policy })}
       />
     </div>
   );
@@ -149,13 +154,17 @@ export function ProfileDetail() {
 function ToolGovernanceCard({
   profileId,
   exposureMode,
+  riskPolicy,
   modeBusy,
   onChangeMode,
+  onChangeRiskPolicy,
 }: {
   profileId: string;
   exposureMode: ExposureMode;
+  riskPolicy: RiskPolicy;
   modeBusy: boolean;
   onChangeMode: (mode: ExposureMode) => void;
+  onChangeRiskPolicy: (policy: RiskPolicy) => void;
 }) {
   const { t } = useTranslation();
   const { groups, isLoading } = useProfileTools(profileId);
@@ -325,6 +334,23 @@ function ToolGovernanceCard({
           <Badge variant="subtle">
             {t("{listed} of {total} listed", { listed: summary.listed, total: summary.total })}
           </Badge>
+          <span className="font-body text-xs text-[var(--fg-45)] ml-2">{t("Risk policy")}</span>
+          <Button
+            size="sm"
+            variant={riskPolicy === "advisory" ? "default" : "outline"}
+            disabled={modeBusy}
+            onClick={() => onChangeRiskPolicy("advisory")}
+          >
+            {t("Advisory")}
+          </Button>
+          <Button
+            size="sm"
+            variant={riskPolicy === "block_destructive" ? "default" : "outline"}
+            disabled={modeBusy}
+            onClick={() => onChangeRiskPolicy("block_destructive")}
+          >
+            {t("Block destructive")}
+          </Button>
         </div>
         {needsPinWarning(exposureMode, summary) && (
           <p className="mt-2 flex items-center gap-2 rounded-lg bg-cursor-orange/8 px-3 py-2 font-body text-xs text-cursor-orange">

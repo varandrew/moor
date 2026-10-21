@@ -21,6 +21,7 @@ use crate::sidecar::services::event_bus::{EventBus, Evt};
 use crate::sidecar::services::server_log::{DiagnosticAttempt, ServerDiagnostics};
 use crate::sidecar::services::settings;
 use crate::sidecar::services::tool_catalog::{ToolCatalogService, ToolDetail};
+use crate::sidecar::services::tool_visibility::ToolAccess;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -46,15 +47,39 @@ pub struct ManagedServer {
 
 #[derive(Debug)]
 pub enum ToolCallError {
+    /// 工具不存在，或在 Profile 的禁用清单里。
     InvalidTool(String),
+    /// 风险策略拒绝：调用方需要把等级与建议透给 Agent。
+    PolicyDenied { risk_level: String, hint: String },
+    /// 所属 Server 已启用但当前不可调用。
+    ServerUnavailable(String),
+    /// 下游请求超时。
+    Timeout(String),
+    /// 其他执行失败。
     Execution(String),
 }
 
 impl std::fmt::Display for ToolCallError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidTool(message) | Self::Execution(message) => formatter.write_str(message),
+            Self::InvalidTool(message)
+            | Self::ServerUnavailable(message)
+            | Self::Timeout(message)
+            | Self::Execution(message) => formatter.write_str(message),
+            Self::PolicyDenied { risk_level, .. } => {
+                write!(formatter, "Tool blocked by risk policy ({risk_level})")
+            }
         }
+    }
+}
+
+/// 下游的执行错误是字符串，只能按关键字识别超时；其余一律归为执行失败。
+fn classify_call_failure(message: String) -> ToolCallError {
+    let lowered = message.to_lowercase();
+    if lowered.contains("timeout") || lowered.contains("timed out") {
+        ToolCallError::Timeout(message)
+    } else {
+        ToolCallError::Execution(message)
     }
 }
 
@@ -415,42 +440,63 @@ impl ServerManager {
             .ok()
             .flatten();
         let callable_ids = self.get_callable_server_ids().await;
-        let owner = profile_id.as_deref().and_then(|id| {
-            ToolCatalogService::get_callable_tool_catalog(&self.db, Some(id), Some(&callable_ids))
-                .into_iter()
-                .find(|tool| tool.exposed_name == exposed_name)
+        let resolved = profile_id.as_deref().map(|id| {
+            ToolCatalogService::resolve_profile_tools(&self.db, Some(id), Some(&callable_ids))
         });
+        let owner = resolved
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|tool| tool.exposed_name.as_deref() == Some(exposed_name));
 
         let start_time = Instant::now();
-        let result = match owner.as_ref() {
-            Some(owner) => async {
-                let session_arc = {
-                    let slots = self.slots.lock().await;
-                    let slot = slots.get(&owner.server_id).ok_or_else(|| {
-                        format!("Server \"{}\" is not running", owner.server_name)
-                    })?;
-                    slot.session
-                        .clone()
-                        .ok_or_else(|| format!("Server \"{}\" is not running", owner.server_name))
-                }?;
+        let not_found =
+            || ToolCallError::InvalidTool(format!("Tool \"{exposed_name}\" not found or disabled"));
+        let result = match owner {
+            None => Err(not_found()),
+            Some(tool) => match tool.access {
+                ToolAccess::Callable => {
+                    let server_id = tool.server_id.clone();
+                    let server_name = tool.server_name.clone();
+                    let tool_name = tool.tool_name.clone();
+                    async {
+                        let session_arc = {
+                            let slots = self.slots.lock().await;
+                            let slot = slots.get(&server_id).ok_or_else(|| {
+                                format!("Server \"{server_name}\" is not running")
+                            })?;
+                            slot.session
+                                .clone()
+                                .ok_or_else(|| {
+                                    format!("Server \"{server_name}\" is not running")
+                                })
+                        }?;
 
-                let request_timeout_ms = self.get_timeout_settings().request_ms;
-                let mut client = session_arc.lock().await;
-                client.set_request_timeout_ms(request_timeout_ms);
-                client.call_tool(&owner.tool_name, args.clone()).await
-            }
-            .await
-            .map_err(ToolCallError::Execution),
-            None => Err(ToolCallError::InvalidTool(format!(
-                "Tool \"{exposed_name}\" not found or disabled"
-            ))),
+                        let request_timeout_ms = self.get_timeout_settings().request_ms;
+                        let mut client = session_arc.lock().await;
+                        client.set_request_timeout_ms(request_timeout_ms);
+                        client.call_tool(&tool_name, args.clone()).await
+                    }
+                    .await
+                    .map_err(classify_call_failure)
+                }
+                ToolAccess::BlockedByRisk => Err(ToolCallError::PolicyDenied {
+                    risk_level: tool.risk.as_str().to_string(),
+                    hint: "This tool is marked destructive and the active profile blocks destructive tools. Ask the user to change the profile risk policy if it is really needed.".to_string(),
+                }),
+                ToolAccess::ServerUnavailable => Err(ToolCallError::ServerUnavailable(format!(
+                    "Server \"{}\" is not running",
+                    tool.server_name
+                ))),
+                ToolAccess::ToolDisabled | ToolAccess::ServerDisabled => Err(not_found()),
+            },
         };
         let error = result.as_ref().err().map(ToString::to_string);
         AuditRecorder::record(
             &self.db,
             ToolCallRecord {
                 profile_id: profile_id.as_deref(),
-                server_id: owner.as_ref().map(|tool| tool.server_id.as_str()),
+                server_id: owner.map(|tool| tool.server_id.as_str()),
                 tool_name: exposed_name,
                 arguments: &args,
                 result: result.as_ref().ok(),

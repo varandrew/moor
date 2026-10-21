@@ -75,6 +75,7 @@ async fn get_one(
 struct UpdateBody {
     name: Option<String>,
     exposure_mode: Option<String>,
+    risk_policy: Option<String>,
 }
 
 async fn update(
@@ -87,6 +88,7 @@ async fn update(
         &id,
         body.name.as_deref(),
         body.exposure_mode.as_deref(),
+        body.risk_policy.as_deref(),
     )
     .map_err(AppError::from)?;
     Ok(Json(

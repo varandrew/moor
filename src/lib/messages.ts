@@ -398,6 +398,13 @@ export const messages = {
   "Unpinned {count} tools": "已取消置顶 {count} 个工具",
   "No tools pinned — agents will see nothing from this profile.":
     "还没有置顶任何工具——Agent 将看不到这个 Profile 的任何工具。",
+  "Risk policy": "风险策略",
+  Advisory: "只标记",
+  "Block destructive": "阻止破坏性工具",
+  Safe: "只读",
+  Write: "写入",
+  "Unknown risk": "未知",
+  "Risk level updated": "风险等级已更新",
 } as const;
 
 export type MessageKey = keyof typeof messages;

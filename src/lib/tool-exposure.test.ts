@@ -10,6 +10,8 @@ function tool(toolName: string, pinned: boolean, disabled = false): ToolDetail {
     inputSchema: null,
     disabled,
     pinned,
+    riskLevel: "unknown",
+    riskSource: "heuristic",
   };
 }
 

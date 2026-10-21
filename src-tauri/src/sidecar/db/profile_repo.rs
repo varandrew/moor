@@ -9,6 +9,8 @@ pub struct Profile {
     pub is_active: bool,
     /// `direct`（全量直出）或 `curated`（置顶直出）。老库升级后恒为 `direct`。
     pub exposure_mode: String,
+    /// `advisory`（只标记）或 `block_destructive`（拒绝破坏性工具）。
+    pub risk_policy: String,
     pub server_count: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
@@ -70,6 +72,7 @@ fn map_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<Profile> {
         name: row.get("name")?,
         is_active: is_active != 0,
         exposure_mode: row.get("exposure_mode")?,
+        risk_policy: row.get("risk_policy")?,
         server_count,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
@@ -132,6 +135,7 @@ impl<'a> ProfileRepository<'a> {
         id: &str,
         name: Option<&str>,
         exposure_mode: Option<&str>,
+        risk_policy: Option<&str>,
     ) -> Result<Option<Profile>, String> {
         let exists = self
             .db
@@ -141,11 +145,11 @@ impl<'a> ProfileRepository<'a> {
         if exists.is_none() {
             return Ok(None);
         }
-        if name.is_some() || exposure_mode.is_some() {
+        if name.is_some() || exposure_mode.is_some() || risk_policy.is_some() {
             let now = chrono::Utc::now().to_rfc3339();
             self.db.run(
-                "UPDATE profiles SET name = COALESCE(?1, name), exposure_mode = COALESCE(?2, exposure_mode), updated_at = ?3 WHERE id = ?4",
-                &[&name, &exposure_mode, &now, &id],
+                "UPDATE profiles SET name = COALESCE(?1, name), exposure_mode = COALESCE(?2, exposure_mode), risk_policy = COALESCE(?3, risk_policy), updated_at = ?4 WHERE id = ?5",
+                &[&name, &exposure_mode, &risk_policy, &now, &id],
             )?;
         }
         self.find_by_id(id)
@@ -324,8 +328,8 @@ impl<'a> ProfileRepository<'a> {
         let now = chrono::Utc::now().to_rfc3339();
         self.db.transaction(|conn| {
             conn.execute(
-                "INSERT INTO profiles (id, name, is_active, exposure_mode, created_at, updated_at)
-                 SELECT ?1, ?2, 0, exposure_mode, ?3, ?3 FROM profiles WHERE id = ?4",
+                "INSERT INTO profiles (id, name, is_active, exposure_mode, risk_policy, created_at, updated_at)
+                 SELECT ?1, ?2, 0, exposure_mode, risk_policy, ?3, ?3 FROM profiles WHERE id = ?4",
                 rusqlite::params![&id, &new_name, &now, &source_id],
             )
             .map_err(|e| e.to_string())?;

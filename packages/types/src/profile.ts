@@ -1,5 +1,5 @@
 import type { Server } from "./server.js";
-import type { ToolDetail } from "./tool.js";
+import type { RiskPolicy, ToolDetail } from "./tool.js";
 
 /** Profile 的曝光模式：全量直出，或只直出置顶工具。 */
 export type ExposureMode = "direct" | "curated";
@@ -10,6 +10,8 @@ export interface Profile {
   isActive: boolean;
   /** 老库升级后恒为 direct；新 Profile 默认 direct。 */
   exposureMode: ExposureMode;
+  /** advisory = 只标记；block_destructive = 拒绝破坏性工具。 */
+  riskPolicy: RiskPolicy;
   serverCount?: number;
   createdAt: string;
   updatedAt: string;

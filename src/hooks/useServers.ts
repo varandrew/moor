@@ -1,10 +1,12 @@
 import { useCallback, useState, type SetStateAction } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { api, apiPost, apiPut, apiDelete } from "@/lib/api/client";
+import { api, apiPatch, apiPost, apiPut, apiDelete } from "@/lib/api/client";
 import { routes } from "@/lib/api-routes";
 import { serverKeys } from "@/lib/query-keys";
+import { translateCurrent } from "@/lib/messages";
+import { toast } from "sonner";
 import { useSSEEvent } from "@/contexts/SSEContext";
-import type { Server, ServerDetail, ServerUpdateInput, ToolDetail } from "@moor/types";
+import type { RiskLevel, Server, ServerDetail, ServerUpdateInput, ToolDetail } from "@moor/types";
 import { getErrorMessage } from "@/lib/utils";
 import {
   appendServerList,
@@ -235,6 +237,24 @@ export function useServerActions(callbacks?: {
     removeServer: removeServer.mutateAsync,
     reorderServers: reorderServers.mutateAsync,
   };
+}
+
+/** 手动纠正工具风险等级：启发式一定会误判，这是纠错通道。 */
+export function useUpdateToolRisk(serverId: string | undefined) {
+  const queryClient = useQueryClient();
+  const mutation = useMutation({
+    mutationFn: async ({ toolName, riskLevel }: { toolName: string; riskLevel: RiskLevel }) => {
+      if (!serverId) throw new Error("Server not found");
+      await apiPatch(routes.servers.toolRisk(serverId, toolName), { riskLevel });
+      return { toolName, riskLevel };
+    },
+    onSuccess: () => {
+      if (!serverId) return;
+      void queryClient.invalidateQueries({ queryKey: serverKeys.toolsRoot(serverId) });
+      toast.success(translateCurrent("Risk level updated"));
+    },
+  });
+  return mutation.mutateAsync;
 }
 
 export function useServers() {

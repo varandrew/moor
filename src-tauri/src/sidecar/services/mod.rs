@@ -8,5 +8,6 @@ pub mod server_manager;
 pub mod server_service;
 pub mod settings;
 pub mod tool_catalog;
+pub mod tool_risk;
 pub mod tool_visibility;
 pub mod updates;

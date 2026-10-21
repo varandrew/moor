@@ -73,6 +73,7 @@ impl ProfileService {
         id: &str,
         name: Option<&str>,
         exposure_mode: Option<&str>,
+        risk_policy: Option<&str>,
     ) -> Result<Profile, ProfileServiceError> {
         if let Some(mode) = exposure_mode {
             if !matches!(mode, "direct" | "curated") {
@@ -81,8 +82,15 @@ impl ProfileService {
                 ));
             }
         }
+        if let Some(policy) = risk_policy {
+            if !matches!(policy, "advisory" | "block_destructive") {
+                return Err(ProfileServiceError::Validation(
+                    "riskPolicy must be advisory or block_destructive".into(),
+                ));
+            }
+        }
         ProfileRepository::new(db)
-            .update(id, name, exposure_mode)
+            .update(id, name, exposure_mode, risk_policy)
             .map_err(ProfileServiceError::Internal)?
             .ok_or_else(|| ProfileServiceError::NotFound("Profile not found".into()))
     }

@@ -8,7 +8,7 @@ use crate::sidecar::services::server_service::{
 use axum::{
     extract::{Path, Query, State},
     response::Json,
-    routing::{get, post, put},
+    routing::{get, patch, post, put},
     Router,
 };
 use serde::Deserialize;
@@ -23,6 +23,36 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/api/servers/{id}/start", post(start))
         .route("/api/servers/{id}/stop", post(stop))
         .route("/api/servers/{id}/tools", get(tools))
+        .route(
+            "/api/servers/{id}/tools/{toolName}/risk",
+            patch(set_tool_risk),
+        )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RiskBody {
+    risk_level: String,
+}
+
+/// 用户手动纠正风险等级。启发式一定会误判，这个入口是纠错通道。
+async fn set_tool_risk(
+    State(state): State<Arc<AppState>>,
+    Path((server_id, tool_name)): Path<(String, String)>,
+    axum::Json(body): axum::Json<RiskBody>,
+) -> Result<Json<Value>, AppError> {
+    let level = crate::sidecar::services::tool_risk::RiskLevel::from_db(&body.risk_level);
+    if level == crate::sidecar::services::tool_risk::RiskLevel::Unknown
+        && body.risk_level != "unknown"
+    {
+        return Err(AppError::validation(
+            "riskLevel must be safe, write, destructive or unknown",
+        ));
+    }
+    crate::sidecar::db::tool_discovery_repo::ToolDiscoveryRepository::new(&state.db)
+        .set_tool_risk(&server_id, &tool_name, level)
+        .map_err(AppError::not_found)?;
+    Ok(Json(serde_json::json!({ "success": true })))
 }
 
 async fn list(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Server>>, AppError> {

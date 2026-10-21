@@ -4,6 +4,13 @@ import { useTranslation } from "@/contexts/LocaleContext";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
@@ -26,12 +33,13 @@ import {
   useServerActionsState,
   useServer,
   useServerTools,
+  useUpdateToolRisk,
 } from "@/hooks/useServers";
 import { useEditSession } from "@/hooks/useEditSession";
 import { findDuplicateHeaderKeys, type EditForm } from "@/lib/server-form";
 import { resolveDisplayStatus } from "@/lib/server-status";
 import { cn } from "@/lib/utils";
-import type { ConnectionType } from "@moor/types";
+import type { ConnectionType, RiskLevel } from "@moor/types";
 
 interface ServerEditFieldsProps {
   form: EditForm;
@@ -142,6 +150,7 @@ export function ServerDetail() {
 
   const { server, isLoading: loading } = useServer(id);
   const { tools } = useServerTools(id, activeProfile?.id);
+  const updateToolRisk = useUpdateToolRisk(id);
 
   const {
     isEditing,
@@ -426,11 +435,32 @@ export function ServerDetail() {
                       </p>
                     )}
                   </div>
-                  <Switch
-                    checked={!tool.disabled}
-                    disabled={!activeProfile || governanceBusy}
-                    onCheckedChange={(v) => toggleTool(tool.toolName, v)}
-                  />
+                  <div className="flex items-center gap-2 shrink-0">
+                    <Select
+                      value={tool.riskLevel}
+                      onValueChange={(value) =>
+                        void updateToolRisk({
+                          toolName: tool.toolName,
+                          riskLevel: value as RiskLevel,
+                        })
+                      }
+                    >
+                      <SelectTrigger className="h-7 w-[104px] text-[11px]">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="safe">{t("Safe")}</SelectItem>
+                        <SelectItem value="write">{t("Write")}</SelectItem>
+                        <SelectItem value="destructive">{t("Destructive")}</SelectItem>
+                        <SelectItem value="unknown">{t("Unknown risk")}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Switch
+                      checked={!tool.disabled}
+                      disabled={!activeProfile || governanceBusy}
+                      onCheckedChange={(v) => toggleTool(tool.toolName, v)}
+                    />
+                  </div>
                 </div>
               ))}
             </div>
