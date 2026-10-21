@@ -142,9 +142,21 @@ process.stdin.on("data", (chunk) => {
         script
     }
 
-    #[tokio::test]
-    async fn tools_call_routes_to_running_server_and_records_audit() {
-        let data_dir = temp_data_dir("tools-call");
+    struct FakeGateway {
+        data_dir: std::path::PathBuf,
+        db: Arc<Database>,
+        state: Arc<AppState>,
+        server_id: String,
+    }
+
+    impl Drop for FakeGateway {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.data_dir);
+        }
+    }
+
+    async fn start_test_gateway(test_name: &str) -> FakeGateway {
+        let data_dir = temp_data_dir(test_name);
         std::fs::create_dir_all(&data_dir).expect("failed to create temp data dir");
         let script = write_fake_mcp_server(&data_dir);
 
@@ -156,8 +168,7 @@ process.stdin.on("data", (chunk) => {
         profile_repo.seed_default().expect("failed to seed profile");
 
         let server_id = uuid::Uuid::new_v4().to_string();
-        let server_repo = ServerRepository::new(&db);
-        server_repo
+        ServerRepository::new(&db)
             .insert_one_with_id(
                 &server_id,
                 0,
@@ -186,7 +197,7 @@ process.stdin.on("data", (chunk) => {
             .await
             .expect("failed to start fake server");
 
-        let app_state = Arc::new(AppState {
+        let state = Arc::new(AppState {
             db: db.clone(),
             api_token: "test-token".to_string(),
             version: "test".to_string(),
@@ -198,11 +209,23 @@ process.stdin.on("data", (chunk) => {
             server_manager,
         });
 
+        FakeGateway {
+            data_dir,
+            db,
+            state,
+            server_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_call_routes_to_running_server_and_records_audit() {
+        let gateway = start_test_gateway("tools-call").await;
+
         let tools_response = handle_request(
             jsonrpc::Id::Number(0),
             "tools/list",
             None,
-            app_state.clone(),
+            gateway.state.clone(),
             Some("test-agent"),
         )
         .await;
@@ -221,7 +244,7 @@ process.stdin.on("data", (chunk) => {
                 "name": "fake__echo",
                 "arguments": { "token": "secret", "value": "ok" }
             })),
-            app_state,
+            gateway.state.clone(),
             Some("test-agent"),
         )
         .await;
@@ -232,14 +255,108 @@ process.stdin.on("data", (chunk) => {
             .unwrap()
             .contains("\"value\":\"ok\""));
 
-        let audit_repo = AuditLogRepository::new(&db);
+        let audit_repo = AuditLogRepository::new(&gateway.db);
         let logs = audit_repo
             .query_logs(None, Some("fake__echo"), None, None, Some(10), None)
             .expect("failed to query audit logs");
         assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0].server_id.as_deref(), Some(server_id.as_str()));
+        assert_eq!(
+            logs[0].server_id.as_deref(),
+            Some(gateway.server_id.as_str())
+        );
         assert_eq!(logs[0].arguments.as_ref().unwrap()["token"], "[REDACTED]");
+    }
 
-        let _ = std::fs::remove_dir_all(data_dir);
+    #[tokio::test]
+    async fn disabling_a_tool_removes_it_from_list_and_rejects_the_call() {
+        let gateway = start_test_gateway("disabled-tool").await;
+        let profile_repo = ProfileRepository::new(&gateway.db);
+        let profile_id = profile_repo
+            .find_active_id()
+            .expect("failed to read active profile")
+            .expect("active profile should exist");
+        profile_repo
+            .upsert_profile_server(
+                &profile_id,
+                &gateway.server_id,
+                None,
+                Some(&vec!["echo".to_string()]),
+            )
+            .expect("failed to disable tool");
+
+        let tools_response = handle_request(
+            jsonrpc::Id::Number(0),
+            "tools/list",
+            None,
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+        assert_eq!(
+            tools_response["result"]["tools"]
+                .as_array()
+                .expect("tools should be an array")
+                .len(),
+            0,
+            "a denied tool must not be listed"
+        );
+
+        let response = handle_request(
+            jsonrpc::Id::Number(1),
+            "tools/call",
+            Some(serde_json::json!({ "name": "fake__echo", "arguments": {} })),
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], jsonrpc::INVALID_PARAMS);
+        assert_eq!(
+            response["error"]["message"], "Tool \"fake__echo\" not found or disabled",
+            "the deny-list error must stay byte-identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_a_server_removes_its_tools_and_rejects_calls() {
+        let gateway = start_test_gateway("disabled-server").await;
+        let profile_repo = ProfileRepository::new(&gateway.db);
+        let profile_id = profile_repo
+            .find_active_id()
+            .expect("failed to read active profile")
+            .expect("active profile should exist");
+        profile_repo
+            .upsert_profile_server(&profile_id, &gateway.server_id, Some(false), None)
+            .expect("failed to disable server");
+
+        let tools_response = handle_request(
+            jsonrpc::Id::Number(0),
+            "tools/list",
+            None,
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+        assert_eq!(
+            tools_response["result"]["tools"]
+                .as_array()
+                .expect("tools should be an array")
+                .len(),
+            0,
+            "a disabled server must not contribute tools"
+        );
+
+        let response = handle_request(
+            jsonrpc::Id::Number(1),
+            "tools/call",
+            Some(serde_json::json!({ "name": "fake__echo", "arguments": {} })),
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+        assert_eq!(response["error"]["code"], jsonrpc::INVALID_PARAMS);
+        assert_eq!(
+            response["error"]["message"],
+            "Tool \"fake__echo\" not found or disabled"
+        );
     }
 }

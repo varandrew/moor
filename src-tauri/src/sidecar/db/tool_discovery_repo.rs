@@ -17,6 +17,8 @@ pub struct ToolDiscovery {
 pub struct ProfileTool {
     pub server_id: String,
     pub server_name: String,
+    /// 该 Server 在当前 Profile 内是否启用。查询会返回两种状态，可见性判定由调用方负责。
+    pub enabled: bool,
     pub disabled_tools: Vec<String>,
     pub tool_name: String,
     pub description: Option<String>,
@@ -92,11 +94,11 @@ impl<'a> ToolDiscoveryRepository<'a> {
 
     pub fn find_by_profile_id(&self, profile_id: &str) -> Result<Vec<ProfileTool>, String> {
         self.db.query_all(
-            "SELECT ps.server_id, ms.name AS server_name, ps.disabled_tools, td.tool_name, td.description, td.input_schema
+            "SELECT ps.server_id, ps.enabled, ms.name AS server_name, ps.disabled_tools, td.tool_name, td.description, td.input_schema
              FROM profile_servers ps
              JOIN mcp_servers ms ON ps.server_id = ms.id
              JOIN tool_discoveries td ON td.server_id = ms.id
-             WHERE ps.profile_id = ?1 AND ps.enabled = 1
+             WHERE ps.profile_id = ?1
              ORDER BY ms.name ASC, td.tool_name ASC",
             &[&profile_id],
             |row| {
@@ -105,6 +107,7 @@ impl<'a> ToolDiscoveryRepository<'a> {
                 Ok(ProfileTool {
                     server_id: row.get("server_id")?,
                     server_name: row.get("server_name")?,
+                    enabled: row.get::<_, i64>("enabled")? != 0,
                     disabled_tools: serde_json::from_str(&disabled_tools_str).unwrap_or_default(),
                     tool_name: row.get("tool_name")?,
                     description: row.get("description")?,
@@ -112,29 +115,6 @@ impl<'a> ToolDiscoveryRepository<'a> {
                 })
             },
         )
-    }
-
-    pub fn find_disabled_tools_for_server(
-        &self,
-        profile_id: Option<&str>,
-        server_id: &str,
-    ) -> Result<std::collections::HashSet<String>, String> {
-        let rows = match profile_id {
-            Some(pid) => self.db.query_all(
-                "SELECT disabled_tools FROM profile_servers WHERE profile_id = ?1 AND server_id = ?2",
-                &[&pid, &server_id],
-                |row| row.get::<_, String>(0),
-            )?,
-            None => self.db.query_all(
-                "SELECT disabled_tools FROM profile_servers WHERE server_id = ?1",
-                &[&server_id],
-                |row| row.get::<_, String>(0),
-            )?,
-        };
-        Ok(rows
-            .iter()
-            .flat_map(|s| serde_json::from_str::<Vec<String>>(s).unwrap_or_default())
-            .collect())
     }
 
     pub fn delete_by_server_id(&self, server_id: &str) -> Result<(), String> {

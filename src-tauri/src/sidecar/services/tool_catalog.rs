@@ -1,7 +1,13 @@
 use crate::sidecar::db::profile_repo::ProfileRepository;
-use crate::sidecar::db::tool_discovery_repo::{ProfileTool, ToolDiscoveryRepository};
+use crate::sidecar::db::tool_discovery_repo::{
+    ProfileTool, ToolDiscovery, ToolDiscoveryRepository,
+};
 use crate::sidecar::db::Database;
+use crate::sidecar::services::tool_visibility::{
+    normalize_server_name, resolve_tool_visibility, ToolVisibility,
+};
 use serde::Serialize;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct ToolCatalogEntry {
@@ -46,15 +52,7 @@ impl ToolCatalogService {
             Err(_) => return vec![],
         };
 
-        let visible = match visible_server_ids {
-            Some(ids) => profile_tools
-                .into_iter()
-                .filter(|t| ids.contains(&t.server_id))
-                .collect(),
-            None => profile_tools,
-        };
-
-        build_tool_catalog_entries(visible)
+        build_tool_catalog_entries(&profile_tools, visible_server_ids)
     }
 
     pub fn get_tool_details(
@@ -85,40 +83,19 @@ impl ToolCatalogService {
             .map(|server| server.name)
             .unwrap_or_else(|| "server".to_string());
 
-        let visible_tools: Vec<_> = match visible_server_ids {
-            Some(ids) => profile_tools
-                .into_iter()
-                .filter(|t| ids.contains(&t.server_id))
-                .collect(),
-            None => profile_tools,
-        };
-        let catalog = build_tool_catalog_entries(visible_tools);
-
-        let disabled = tool_repo
-            .find_disabled_tools_for_server(Some(&active_id), server_id)
-            .unwrap_or_default();
+        let visibility =
+            visibility_by_server(resolve_tool_visibility(&profile_tools, visible_server_ids));
         let discovered = match tool_repo.find_by_server_id(server_id) {
             Ok(tools) => tools,
             Err(_) => return vec![],
         };
 
+        let resolved = visibility.get(server_id);
         discovered
             .into_iter()
             .map(|tool| {
-                let server_slug = normalize_server_name(&server_name);
-                let is_disabled = disabled.contains(&tool.tool_name);
-                let exposed_name = catalog
-                    .iter()
-                    .find(|entry| entry.server_id == server_id && entry.tool_name == tool.tool_name)
-                    .map(|entry| entry.exposed_name.clone())
-                    .unwrap_or_else(|| format!("{server_slug}__{}", tool.tool_name));
-                ToolDetail {
-                    exposed_name,
-                    tool_name: tool.tool_name,
-                    description: tool.description,
-                    input_schema: tool.input_schema,
-                    disabled: is_disabled,
-                }
+                let resolved = resolved.and_then(|by_tool| by_tool.get(&tool.tool_name));
+                tool_detail(resolved, &server_name, tool)
             })
             .collect()
     }
@@ -136,11 +113,7 @@ impl ToolCatalogService {
             Ok(tools) => tools,
             Err(_) => return vec![],
         };
-        let exposed_names: std::collections::HashMap<_, _> =
-            build_tool_catalog_entries(profile_tools)
-                .into_iter()
-                .map(|entry| ((entry.server_id, entry.tool_name), entry.exposed_name))
-                .collect();
+        let visibility = visibility_by_server(resolve_tool_visibility(&profile_tools, None));
         let mut discovered_by_server = std::collections::HashMap::<String, Vec<_>>::new();
         for tool in tool_repo.find_all().unwrap_or_default() {
             discovered_by_server
@@ -151,23 +124,14 @@ impl ToolCatalogService {
         servers
             .into_iter()
             .map(|server| {
-                let server_slug = normalize_server_name(&server.server.name);
+                let resolved = visibility.get(&server.server.id);
                 let tools = discovered_by_server
                     .remove(&server.server.id)
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|tool| ToolDetail {
-                        exposed_name: exposed_names
-                            .get(&(server.server.id.clone(), tool.tool_name.clone()))
-                            .cloned()
-                            .unwrap_or_else(|| format!("{server_slug}__{}", tool.tool_name)),
-                        disabled: server
-                            .profile_server
-                            .disabled_tools
-                            .contains(&tool.tool_name),
-                        tool_name: tool.tool_name,
-                        description: tool.description,
-                        input_schema: tool.input_schema,
+                    .map(|tool| {
+                        let resolved = resolved.and_then(|by_tool| by_tool.get(&tool.tool_name));
+                        tool_detail(resolved, &server.server.name, tool)
                     })
                     .collect();
                 ProfileToolGroup {
@@ -191,75 +155,58 @@ pub struct ProfileToolGroup {
     pub tools: Vec<ToolDetail>,
 }
 
-fn build_tool_catalog_entries(profile_tools: Vec<ProfileTool>) -> Vec<ToolCatalogEntry> {
-    let enabled: Vec<_> = profile_tools
+fn build_tool_catalog_entries(
+    profile_tools: &[ProfileTool],
+    callable_server_ids: Option<&HashSet<String>>,
+) -> Vec<ToolCatalogEntry> {
+    resolve_tool_visibility(profile_tools, callable_server_ids)
         .into_iter()
-        .filter(|tool| !tool.disabled_tools.contains(&tool.tool_name))
-        .collect();
-    let mut server_ids_by_base_name = std::collections::HashMap::<String, Vec<String>>::new();
-    for tool in &enabled {
-        let server_slug = normalize_server_name(&tool.server_name);
-        let base_name = format!("{server_slug}__{}", tool.tool_name);
-        server_ids_by_base_name
-            .entry(base_name)
-            .or_default()
-            .push(tool.server_id.clone());
-    }
-
-    enabled
-        .into_iter()
-        .map(|tool| {
-            let server_slug = normalize_server_name(&tool.server_name);
-            let base_name = format!("{server_slug}__{}", tool.tool_name);
-            let server_ids = server_ids_by_base_name
-                .get(&base_name)
-                .expect("base name should exist");
-            let exposed_name = if server_ids.len() > 1 {
-                format!(
-                    "{server_slug}_{}__{}",
-                    shortest_unique_server_id_prefix(&tool.server_id, server_ids),
-                    tool.tool_name
-                )
-            } else {
-                base_name
-            };
-            ToolCatalogEntry {
-                server_id: tool.server_id,
-                server_name: tool.server_name,
-                tool_name: tool.tool_name,
-                exposed_name,
-                description: tool.description,
-                input_schema: tool.input_schema,
+        .filter_map(|visible| {
+            if !visible.access.is_exposed() {
+                return None;
             }
+            Some(ToolCatalogEntry {
+                server_id: visible.server_id,
+                server_name: visible.server_name,
+                tool_name: visible.tool_name,
+                exposed_name: visible.exposed_name?,
+                description: visible.description,
+                input_schema: visible.input_schema,
+            })
         })
         .collect()
 }
 
-fn shortest_unique_server_id_prefix(server_id: &str, server_ids: &[String]) -> String {
-    for length in std::cmp::min(8, server_id.len())..=server_id.len() {
-        let prefix = &server_id[..length];
-        if server_ids
-            .iter()
-            .all(|candidate| candidate == server_id || !candidate.starts_with(prefix))
-        {
-            return prefix.to_string();
-        }
+/// 按 Server 归档判定结果，供逐工具查询；`None` 表示该工具不属于当前 Profile。
+fn visibility_by_server(
+    items: Vec<ToolVisibility>,
+) -> std::collections::HashMap<String, std::collections::HashMap<String, ToolVisibility>> {
+    let mut index = std::collections::HashMap::new();
+    for item in items {
+        index
+            .entry(item.server_id.clone())
+            .or_insert_with(std::collections::HashMap::new)
+            .insert(item.tool_name.clone(), item);
     }
-    server_id.to_string()
+    index
 }
 
-fn normalize_server_name(name: &str) -> String {
-    let slug: String = name
-        .trim()
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    let slug = slug.trim_matches('_');
-    if slug.is_empty() {
-        "server".to_string()
-    } else {
-        slug.to_string()
+/// 治理面板与 Server 详情共用：可见工具用判定的暴露名，其余退回基础名。
+fn tool_detail(
+    resolved: Option<&ToolVisibility>,
+    server_name: &str,
+    tool: ToolDiscovery,
+) -> ToolDetail {
+    ToolDetail {
+        exposed_name: resolved
+            .and_then(|item| item.exposed_name.clone())
+            .unwrap_or_else(|| {
+                format!("{}__{}", normalize_server_name(server_name), tool.tool_name)
+            }),
+        disabled: resolved.is_some_and(|item| item.access.is_deny_listed()),
+        tool_name: tool.tool_name,
+        description: tool.description,
+        input_schema: tool.input_schema,
     }
 }
 
