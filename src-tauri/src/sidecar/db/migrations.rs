@@ -240,8 +240,29 @@ mod tests {
                 disabled_tools TEXT NOT NULL DEFAULT '[]',
                 PRIMARY KEY (profile_id, server_id)
             );
+            CREATE TABLE audit_logs (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                profile_id TEXT,
+                server_id TEXT,
+                tool_name TEXT NOT NULL,
+                arguments TEXT,
+                result TEXT,
+                error TEXT,
+                duration_ms INTEGER,
+                agent_info TEXT
+            );
+            CREATE TABLE settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             INSERT INTO profiles (id, name, is_active, created_at, updated_at)
-            VALUES ('legacy', 'Default', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+            VALUES ('legacy', 'Default', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+            INSERT INTO audit_logs (id, timestamp, tool_name, duration_ms)
+            VALUES ('old-call', '2026-01-01T00:00:00.000000000Z', 'search', 12);
+            INSERT INTO settings (key, value, updated_at)
+            VALUES ('appearance.theme', 'dark', '2026-01-01T00:00:00Z');",
         )
         .unwrap();
 
@@ -280,6 +301,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pinned.as_deref(), Some("[]"));
+
+        let legacy_audit = db
+            .query_one(
+                "SELECT tool_name, via FROM audit_logs WHERE id = 'old-call'",
+                &[],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap()
+            .expect("the legacy audit row must survive the upgrade");
+        assert_eq!(legacy_audit.0, "search");
+        assert_eq!(
+            legacy_audit.1, "direct",
+            "existing calls predate the provenance column"
+        );
+
+        let theme = db
+            .query_one(
+                "SELECT value FROM settings WHERE key = 'appearance.theme'",
+                &[],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(theme.as_deref(), Some("dark"));
     }
 
     #[test]

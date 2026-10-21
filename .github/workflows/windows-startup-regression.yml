@@ -41,3 +41,10 @@ jobs:
 
       - name: 验证带空格的批处理命令完成 MCP 握手
         run: cargo test --locked --no-default-features --manifest-path src-tauri/Cargo.toml --lib resolved_batch_command_performs_handshake_with_spaces_and_path_alias
+
+      - name: 验证 v0.9 策展、风险策略与工具调用链路
+        # 启动真实的 stdio Server（node 假服务器），跑通 tools/list、元工具检索与策略拒绝。
+        run: cargo test --locked --no-default-features --manifest-path src-tauri/Cargo.toml --lib sidecar::mcp::server::tests
+
+      - name: 验证 tools/list_changed 通知
+        run: cargo test --locked --no-default-features --manifest-path src-tauri/Cargo.toml --lib sidecar::mcp::transport::streamable_http_server::tests::get_stream_delivers_tools_list_changed

@@ -978,4 +978,28 @@ process.stdin.on("data", (chunk) => {
             .is_some_and(|error| error.contains("blocked by risk policy")));
         assert_eq!(repo.get_insights(None, None).unwrap().blocked_calls, 1);
     }
+
+    #[tokio::test]
+    async fn a_curated_profile_with_no_pins_only_lists_the_meta_tools() {
+        let gateway = curated_gateway("curated-empty").await;
+
+        let tools_response = handle_request(
+            jsonrpc::Id::Number(0),
+            "tools/list",
+            None,
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+        let names: Vec<&str> = tools_response["result"]["tools"]
+            .as_array()
+            .expect("tools should be an array")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+
+        assert_eq!(names.len(), 2, "the empty profile still explains itself");
+        assert!(names.contains(&SEARCH_TOOL_NAME));
+        assert!(names.contains(&CALL_TOOL_NAME));
+    }
 }
