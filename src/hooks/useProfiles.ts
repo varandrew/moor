@@ -6,7 +6,7 @@ import { routes } from "@/lib/api-routes";
 import { serverKeys, profileKeys, logKeys } from "@/lib/query-keys";
 import { useSSEEvent } from "@/contexts/SSEContext";
 import { getErrorMessage } from "@/lib/utils";
-import type { Profile, ProfileDetail, ProfileToolGroup } from "@moor/types";
+import type { ExposureMode, Profile, ProfileDetail, ProfileToolGroup } from "@moor/types";
 
 export function useProfiles() {
   const queryClient = useQueryClient();
@@ -58,12 +58,20 @@ export function useProfiles() {
   });
 
   const updateProfile = useMutation({
-    mutationFn: async ({ id, updates }: { id: string; updates: { name?: string } }) => {
+    mutationFn: async ({
+      id,
+      updates,
+    }: {
+      id: string;
+      updates: { name?: string; exposureMode?: ExposureMode };
+    }) => {
       await apiPut(routes.profiles.update(id), updates);
       invalidateProfileUndo(queryClient, id);
+      return id;
     },
-    onSuccess: () => {
+    onSuccess: (id) => {
       void queryClient.invalidateQueries({ queryKey: profileKeys.list() });
+      void queryClient.invalidateQueries({ queryKey: profileKeys.detail(id) });
     },
   });
 

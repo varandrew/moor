@@ -94,7 +94,7 @@ async fn handle_tools_call(
 mod tests {
     use super::*;
     use crate::sidecar::db::audit_log_repo::AuditLogRepository;
-    use crate::sidecar::db::profile_repo::ProfileRepository;
+    use crate::sidecar::db::profile_repo::{ProfileRepository, ProfileServerUpsertInput};
     use crate::sidecar::db::server_repo::ServerRepository;
     use crate::sidecar::db::Database;
     use crate::sidecar::services::event_bus::EventBus;
@@ -110,11 +110,12 @@ mod tests {
         std::env::temp_dir().join(format!("moor-mcp-{test_name}-{timestamp}"))
     }
 
-    fn write_fake_mcp_server(data_dir: &std::path::Path) -> std::path::PathBuf {
+    fn write_fake_mcp_server_with_tools(
+        data_dir: &std::path::Path,
+        tools: &str,
+    ) -> std::path::PathBuf {
         let script = data_dir.join("fake-mcp-server.mjs");
-        std::fs::write(
-            &script,
-            r#"
+        let template = r#"
 let buffer = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
@@ -129,16 +130,17 @@ process.stdin.on("data", (chunk) => {
     if (request.method === "initialize") {
       result = { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "fake", version: "1.0.0" } };
     } else if (request.method === "tools/list") {
-      result = { tools: [{ name: "echo", description: "Echo input", inputSchema: { type: "object" } }] };
+      const tools = __TOOLS__;
+      result = { tools: tools.map((tool) => ({ name: tool.name, description: "Fake tool", inputSchema: { type: "object" } })) };
     } else if (request.method === "tools/call") {
       result = { content: [{ type: "text", text: JSON.stringify(request.params.arguments ?? {}) }] };
     }
     process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) + "\n");
   }
 });
-"#,
-        )
-        .expect("failed to write fake MCP server");
+"#;
+        std::fs::write(&script, template.replace("__TOOLS__", tools))
+            .expect("failed to write fake MCP server");
         script
     }
 
@@ -156,9 +158,13 @@ process.stdin.on("data", (chunk) => {
     }
 
     async fn start_test_gateway(test_name: &str) -> FakeGateway {
+        start_test_gateway_with_tools(test_name, r#"[{ "name": "echo" }]"#).await
+    }
+
+    async fn start_test_gateway_with_tools(test_name: &str, tools: &str) -> FakeGateway {
         let data_dir = temp_data_dir(test_name);
         std::fs::create_dir_all(&data_dir).expect("failed to create temp data dir");
-        let script = write_fake_mcp_server(&data_dir);
+        let script = write_fake_mcp_server_with_tools(&data_dir, tools);
 
         let db = Arc::new(Database::open(&data_dir.join("moor.db")).expect("failed to open db"));
         db.run_migrations().expect("failed to migrate");
@@ -358,5 +364,98 @@ process.stdin.on("data", (chunk) => {
             response["error"]["message"],
             "Tool \"fake__echo\" not found or disabled"
         );
+    }
+
+    #[tokio::test]
+    async fn curated_profile_lists_only_pinned_tools_but_calls_unpinned_ones() {
+        let gateway = start_test_gateway_with_tools(
+            "curated",
+            r#"[{ "name": "echo" }, { "name": "report" }]"#,
+        )
+        .await;
+        let profile_repo = ProfileRepository::new(&gateway.db);
+        let profile_id = profile_repo
+            .find_active_id()
+            .expect("failed to read active profile")
+            .expect("active profile should exist");
+        profile_repo
+            .update(&profile_id, None, Some("curated"))
+            .expect("failed to switch exposure mode");
+        profile_repo
+            .upsert_profile_servers_batch(
+                &profile_id,
+                &[ProfileServerUpsertInput {
+                    server_id: gateway.server_id.clone(),
+                    enabled: None,
+                    disabled_tools: None,
+                    pinned_tools: Some(vec!["echo".to_string()]),
+                }],
+            )
+            .expect("failed to pin a tool");
+
+        let tools_response = handle_request(
+            jsonrpc::Id::Number(0),
+            "tools/list",
+            None,
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+        let listed = tools_response["result"]["tools"]
+            .as_array()
+            .expect("tools should be an array");
+        assert_eq!(listed.len(), 1, "curated mode lists pinned tools only");
+        assert_eq!(listed[0]["name"], "fake__echo");
+
+        let response = handle_request(
+            jsonrpc::Id::Number(1),
+            "tools/call",
+            Some(serde_json::json!({ "name": "fake__report", "arguments": {} })),
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["content"][0]["type"], "text",
+            "an unpinned tool stays callable so cached names keep working"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_profile_lists_unpinned_tools_too() {
+        let gateway = start_test_gateway_with_tools(
+            "direct-pinned",
+            r#"[{ "name": "echo" }, { "name": "report" }]"#,
+        )
+        .await;
+        let profile_repo = ProfileRepository::new(&gateway.db);
+        let profile_id = profile_repo
+            .find_active_id()
+            .expect("failed to read active profile")
+            .expect("active profile should exist");
+        profile_repo
+            .upsert_profile_servers_batch(
+                &profile_id,
+                &[ProfileServerUpsertInput {
+                    server_id: gateway.server_id.clone(),
+                    enabled: None,
+                    disabled_tools: None,
+                    pinned_tools: Some(vec!["echo".to_string()]),
+                }],
+            )
+            .expect("failed to pin a tool");
+
+        let tools_response = handle_request(
+            jsonrpc::Id::Number(0),
+            "tools/list",
+            None,
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+        let listed = tools_response["result"]["tools"]
+            .as_array()
+            .expect("tools should be an array");
+        assert_eq!(listed.len(), 2, "direct mode ignores pinning");
     }
 }

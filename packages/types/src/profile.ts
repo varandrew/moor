@@ -1,10 +1,15 @@
 import type { Server } from "./server.js";
 import type { ToolDetail } from "./tool.js";
 
+/** Profile 的曝光模式：全量直出，或只直出置顶工具。 */
+export type ExposureMode = "direct" | "curated";
+
 export interface Profile {
   id: string;
   name: string;
   isActive: boolean;
+  /** 老库升级后恒为 direct；新 Profile 默认 direct。 */
+  exposureMode: ExposureMode;
   serverCount?: number;
   createdAt: string;
   updatedAt: string;
@@ -13,6 +18,7 @@ export interface Profile {
 export interface ProfileServerState {
   enabled: boolean;
   disabledTools: string[];
+  pinnedTools: string[];
 }
 
 export interface ProfileDetail extends Profile {
@@ -32,4 +38,5 @@ export interface ProfileServerUpsert {
   serverId: string;
   enabled?: boolean;
   disabledTools?: string[];
+  pinnedTools?: string[];
 }

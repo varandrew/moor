@@ -32,6 +32,7 @@ export function invalidateProfileUndo(client: QueryClient, profileId: string) {
 
 type Change =
   | { kind: "tools"; selection: ToolSelection[]; enabled: boolean; message?: string }
+  | { kind: "pinned"; selection: ToolSelection[]; pinned: boolean; message?: string }
   | { kind: "server"; serverId: string; enabled: boolean }
   | { kind: "undo"; undo: Undo };
 
@@ -51,6 +52,27 @@ async function applyChange(client: QueryClient, profileId: string | undefined, c
         updates = change.undo.snapshot;
       } else if (change.kind === "server") {
         updates = [{ serverId: change.serverId, enabled: change.enabled }];
+      } else if (change.kind === "pinned") {
+        if (change.selection.length === 0) return { updates: [], before };
+        const profile = await api<ProfileDetail>(routes.profiles.detail(profileId));
+        const selected = new Map<string, Set<string>>();
+        for (const tool of change.selection) {
+          const names = selected.get(tool.serverId) ?? new Set<string>();
+          names.add(tool.toolName);
+          selected.set(tool.serverId, names);
+        }
+        updates = [];
+        for (const [serverId, names] of selected) {
+          const server = profile.servers.find((item) => item.id === serverId);
+          if (!server) throw new Error("Server not found in profile");
+          before.push({ serverId, pinnedTools: [...server.profileServer.pinnedTools] });
+          const pinned = new Set(server.profileServer.pinnedTools);
+          for (const name of names) {
+            if (change.pinned) pinned.add(name);
+            else pinned.delete(name);
+          }
+          updates.push({ serverId, pinnedTools: [...pinned] });
+        }
       } else {
         if (change.selection.length === 0) return { updates: [], before };
         // 串行执行时读取完整清单，保留暂未发现的工具并避免排队期间快照过期。
@@ -80,7 +102,7 @@ async function applyChange(client: QueryClient, profileId: string | undefined, c
     },
     onSuccess: async ({ updates, before }, change) => {
       if (!profileId || updates.length === 0) return;
-      if (change.kind === "tools" && change.message) {
+      if ((change.kind === "tools" || change.kind === "pinned") && change.message) {
         const undo: Undo = { snapshot: before };
         const entries = undoByClient.get(client) ?? new Map<string, Undo>();
         undoByClient.set(client, entries);
@@ -121,6 +143,15 @@ export function useProfileGovernance(profileId: string | undefined) {
     setTools: async (selection: ToolSelection[], enabled: boolean, message?: string) => {
       try {
         await applyChange(client, profileId, { kind: "tools", selection, enabled, message });
+        return true;
+      } catch {
+        // 失败由全局 MutationCache 提示；页面保留选择以便重试。
+        return false;
+      }
+    },
+    setPinned: async (selection: ToolSelection[], pinned: boolean, message?: string) => {
+      try {
+        await applyChange(client, profileId, { kind: "pinned", selection, pinned, message });
         return true;
       } catch {
         // 失败由全局 MutationCache 提示；页面保留选择以便重试。

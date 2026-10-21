@@ -71,8 +71,10 @@ async fn get_one(
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct UpdateBody {
     name: Option<String>,
+    exposure_mode: Option<String>,
 }
 
 async fn update(
@@ -80,8 +82,13 @@ async fn update(
     Path(id): Path<String>,
     axum::Json(body): axum::Json<UpdateBody>,
 ) -> Result<Json<Value>, AppError> {
-    let profile =
-        ProfileService::update(&state.db, &id, body.name.as_deref()).map_err(AppError::from)?;
+    let profile = ProfileService::update(
+        &state.db,
+        &id,
+        body.name.as_deref(),
+        body.exposure_mode.as_deref(),
+    )
+    .map_err(AppError::from)?;
     Ok(Json(
         serde_json::to_value(profile).map_err(|e| AppError::internal(e.to_string()))?,
     ))
@@ -182,6 +189,7 @@ struct BulkServerStateUpdate {
     server_id: String,
     enabled: Option<bool>,
     disabled_tools: Option<Vec<String>>,
+    pinned_tools: Option<Vec<String>>,
 }
 
 async fn bulk_upsert_servers(
@@ -197,6 +205,7 @@ async fn bulk_upsert_servers(
                 server_id: update.server_id,
                 enabled: update.enabled,
                 disabled_tools: update.disabled_tools,
+                pinned_tools: update.pinned_tools,
             },
         )
         .collect();

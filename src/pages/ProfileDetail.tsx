@@ -14,15 +14,18 @@ import {
   ChevronRight,
   SlidersHorizontal,
   X,
+  Pin,
+  AlertTriangle,
 } from "lucide-react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
-import { useProfile, useProfileTools } from "@/hooks/useProfiles";
+import { useProfile, useProfiles, useProfileTools } from "@/hooks/useProfiles";
 import { useProfileGovernance, type ToolSelection } from "@/hooks/useProfileGovernance";
 import { DetailPageHeader } from "@/components/shared/DetailPageHeader";
 import { PageLoading } from "@/components/shared/PageLoading";
 import { EmptyState } from "@/components/shared/EmptyState";
 import { cn } from "@/lib/utils";
-import type { ProfileToolGroup, ToolDetail } from "@moor/types";
+import { needsPinWarning, summarizeExposure } from "@/lib/tool-exposure";
+import type { ExposureMode, ProfileToolGroup, ToolDetail } from "@moor/types";
 
 export function ProfileDetail() {
   const { t } = useTranslation();
@@ -30,6 +33,18 @@ export function ProfileDetail() {
   const navigate = useNavigate();
   const { setServerEnabled, busy: isUpdatingServer } = useProfileGovernance(id);
   const { profile, isLoading: loading } = useProfile(id);
+  const { updateProfile } = useProfiles();
+  const [modeBusy, setModeBusy] = useState(false);
+
+  const changeExposureMode = async (mode: ExposureMode) => {
+    if (!id || mode === profile?.exposureMode) return;
+    setModeBusy(true);
+    try {
+      await updateProfile({ id, updates: { exposureMode: mode } });
+    } finally {
+      setModeBusy(false);
+    }
+  };
 
   if (loading) {
     return <PageLoading message={t("Loading profile...")} />;
@@ -121,15 +136,30 @@ export function ProfileDetail() {
       </Card>
 
       {/* Tool Governance */}
-      <ToolGovernanceCard profileId={id} />
+      <ToolGovernanceCard
+        profileId={id}
+        exposureMode={profile.exposureMode}
+        modeBusy={modeBusy}
+        onChangeMode={(mode) => void changeExposureMode(mode)}
+      />
     </div>
   );
 }
 
-function ToolGovernanceCard({ profileId }: { profileId: string }) {
+function ToolGovernanceCard({
+  profileId,
+  exposureMode,
+  modeBusy,
+  onChangeMode,
+}: {
+  profileId: string;
+  exposureMode: ExposureMode;
+  modeBusy: boolean;
+  onChangeMode: (mode: ExposureMode) => void;
+}) {
   const { t } = useTranslation();
   const { groups, isLoading } = useProfileTools(profileId);
-  const { setTools, busy: governanceBusy } = useProfileGovernance(profileId);
+  const { setTools, setPinned, busy: governanceBusy } = useProfileGovernance(profileId);
   const [searchParams, setSearchParams] = useSearchParams();
   const [search, setSearch] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -226,6 +256,9 @@ function ToolGovernanceCard({ profileId }: { profileId: string }) {
   const toggleTool = (group: ProfileToolGroup, toolName: string, enabled: boolean) =>
     setTools([{ serverId: group.serverId, toolName }], enabled);
 
+  const togglePinned = (group: ProfileToolGroup, toolName: string, pinned: boolean) =>
+    setPinned([{ serverId: group.serverId, toolName }], pinned);
+
   const setServerTools = (group: ProfileToolGroup, enable: boolean) => {
     const tools = groups.find((item) => item.serverId === group.serverId)?.tools ?? [];
     return setTools(
@@ -251,6 +284,17 @@ function ToolGovernanceCard({ profileId }: { profileId: string }) {
   };
 
   const totalTools = groups.reduce((sum, group) => sum + group.tools.length, 0);
+  const summary = summarizeExposure(groups, exposureMode);
+
+  const applyPin = async (pinned: boolean) => {
+    const count = selection.length;
+    const message = pinned
+      ? t("Pinned {count} tools", { count })
+      : t("Unpinned {count} tools", { count });
+    if (await setPinned(selection, pinned, message)) {
+      setSelection([]);
+    }
+  };
 
   return (
     <Card>
@@ -260,6 +304,34 @@ function ToolGovernanceCard({ profileId }: { profileId: string }) {
           {t("Tool Governance")}
           <Badge variant="subtle">{t("{count} tools", { count: totalTools })}</Badge>
         </CardTitle>
+        <div className="flex items-center gap-2 flex-wrap pt-2">
+          <span className="font-body text-xs text-[var(--fg-45)]">{t("Exposure mode")}</span>
+          <Button
+            size="sm"
+            variant={exposureMode === "direct" ? "default" : "outline"}
+            disabled={modeBusy}
+            onClick={() => onChangeMode("direct")}
+          >
+            {t("Direct listing")}
+          </Button>
+          <Button
+            size="sm"
+            variant={exposureMode === "curated" ? "default" : "outline"}
+            disabled={modeBusy}
+            onClick={() => onChangeMode("curated")}
+          >
+            {t("Curated listing")}
+          </Button>
+          <Badge variant="subtle">
+            {t("{listed} of {total} listed", { listed: summary.listed, total: summary.total })}
+          </Badge>
+        </div>
+        {needsPinWarning(exposureMode, summary) && (
+          <p className="mt-2 flex items-center gap-2 rounded-lg bg-cursor-orange/8 px-3 py-2 font-body text-xs text-cursor-orange">
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+            {t("No tools pinned — agents will see nothing from this profile.")}
+          </p>
+        )}
         <div className="flex items-center gap-3 flex-wrap pt-1">
           <div className="relative flex-1 min-w-[220px] max-w-sm">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-[var(--fg-30)]" />
@@ -290,6 +362,22 @@ function ToolGovernanceCard({ profileId }: { profileId: string }) {
                 onClick={() => void applySelection(false)}
               >
                 {t("Disable")}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={governanceBusy}
+                onClick={() => void applyPin(true)}
+              >
+                {t("Pin selected")}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={governanceBusy}
+                onClick={() => void applyPin(false)}
+              >
+                {t("Unpin selected")}
               </Button>
               <Button
                 size="sm"
@@ -347,6 +435,7 @@ function ToolGovernanceCard({ profileId }: { profileId: string }) {
               onToggleTool={(toolName, enabled) => void toggleTool(group, toolName, enabled)}
               onSetAllTools={(enable) => void setServerTools(group, enable)}
               onToggleSelected={(toolName) => toggleSelected(group.serverId, toolName)}
+              onTogglePinned={(toolName, pinned) => void togglePinned(group, toolName, pinned)}
             />
           ))
         )}
@@ -373,6 +462,7 @@ function ToolGroupSection({
   onToggleTool,
   onSetAllTools,
   onToggleSelected,
+  onTogglePinned,
 }: {
   group: ProfileToolGroup;
   expanded: boolean;
@@ -384,6 +474,7 @@ function ToolGroupSection({
   onToggleTool: (toolName: string, enabled: boolean) => void;
   onSetAllTools: (enable: boolean) => void;
   onToggleSelected: (toolName: string) => void;
+  onTogglePinned: (toolName: string, pinned: boolean) => void;
 }) {
   const { t } = useTranslation();
   const enabledTools = group.tools.filter((tool) => !tool.disabled).length;
@@ -456,6 +547,7 @@ function ToolGroupSection({
                 selected={isSelected(group.serverId, tool.toolName)}
                 onToggleSelected={() => onToggleSelected(tool.toolName)}
                 onToggleTool={(enabled) => onToggleTool(tool.toolName, enabled)}
+                onTogglePinned={() => onTogglePinned(tool.toolName, !tool.pinned)}
               />
             ))
           )}
@@ -473,6 +565,7 @@ function ToolRow({
   selected,
   onToggleSelected,
   onToggleTool,
+  onTogglePinned,
 }: {
   serverId: string;
   tool: ToolDetail;
@@ -481,6 +574,7 @@ function ToolRow({
   selected: boolean;
   onToggleSelected: () => void;
   onToggleTool: (enabled: boolean) => void;
+  onTogglePinned: () => void;
 }) {
   const { t } = useTranslation();
   return (
@@ -511,6 +605,21 @@ function ToolRow({
           <p className="font-body text-[11px] text-[var(--fg-40)] truncate">{tool.description}</p>
         )}
       </div>
+      <button
+        type="button"
+        onClick={onTogglePinned}
+        disabled={disabled}
+        aria-label={tool.pinned ? t("Unpin") : t("Pin")}
+        title={tool.pinned ? t("Unpin") : t("Pin")}
+        className={cn(
+          "shrink-0 rounded p-1 transition-colors",
+          tool.pinned
+            ? "text-cursor-orange hover:text-cursor-orange/80"
+            : "text-[var(--fg-25)] hover:text-cursor-dark",
+        )}
+      >
+        <Pin className={cn("h-3.5 w-3.5", tool.pinned && "fill-current")} />
+      </button>
       {!tool.disabled && (
         <div className="flex items-center gap-1.5 shrink-0">
           <span className="h-1.5 w-1.5 rounded-full bg-success-muted" />

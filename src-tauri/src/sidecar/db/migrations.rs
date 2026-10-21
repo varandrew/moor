@@ -33,6 +33,7 @@ pub fn run_migrations(db: &Database) -> Result<(), String> {
             server_id TEXT NOT NULL REFERENCES mcp_servers(id) ON DELETE CASCADE,
             enabled INTEGER NOT NULL DEFAULT 1,
             disabled_tools TEXT NOT NULL DEFAULT '[]',
+            pinned_tools TEXT NOT NULL DEFAULT '[]',
             PRIMARY KEY (profile_id, server_id)
         );
 
@@ -85,6 +86,18 @@ pub fn run_migrations(db: &Database) -> Result<(), String> {
         "mcp_servers",
         "sort_order",
         "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        db,
+        "profiles",
+        "exposure_mode",
+        "TEXT NOT NULL DEFAULT 'direct'",
+    )?;
+    ensure_column(
+        db,
+        "profile_servers",
+        "pinned_tools",
+        "TEXT NOT NULL DEFAULT '[]'",
     )?;
     backfill_server_sort_order(db)?;
     normalize_audit_timestamps(db)?;
@@ -182,8 +195,69 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("moor-migrations-{ts}.db"));
+        let path =
+            std::env::temp_dir().join(format!("moor-migrations-{ts}-{}.db", uuid::Uuid::new_v4()));
         Database::open(&path).expect("open db")
+    }
+
+    #[test]
+    fn exposure_columns_are_added_to_a_legacy_database() {
+        let db = temp_db();
+        db.exec(
+            "CREATE TABLE profiles (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE profile_servers (
+                profile_id TEXT NOT NULL,
+                server_id TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                disabled_tools TEXT NOT NULL DEFAULT '[]',
+                PRIMARY KEY (profile_id, server_id)
+            );
+            INSERT INTO profiles (id, name, is_active, created_at, updated_at)
+            VALUES ('legacy', 'Default', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        run_migrations(&db).unwrap();
+        run_migrations(&db).unwrap();
+
+        let mode = db
+            .query_one(
+                "SELECT exposure_mode FROM profiles WHERE id = 'legacy'",
+                &[],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(
+            mode.as_deref(),
+            Some("direct"),
+            "a legacy profile must keep the full direct listing"
+        );
+
+        db.run(
+            "INSERT INTO mcp_servers (id, name, connection_type, status, created_at, updated_at)
+             VALUES ('server-1', 'Alpha', 'stdio', 'stopped', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            &[],
+        )
+        .unwrap();
+        db.run(
+            "INSERT INTO profile_servers (profile_id, server_id) VALUES ('legacy', 'server-1')",
+            &[],
+        )
+        .unwrap();
+        let pinned = db
+            .query_one(
+                "SELECT pinned_tools FROM profile_servers WHERE server_id = 'server-1'",
+                &[],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(pinned.as_deref(), Some("[]"));
     }
 
     #[test]

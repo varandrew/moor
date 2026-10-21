@@ -4,7 +4,7 @@ use crate::sidecar::db::tool_discovery_repo::{
 };
 use crate::sidecar::db::Database;
 use crate::sidecar::services::tool_visibility::{
-    normalize_server_name, resolve_tool_visibility, ToolVisibility,
+    normalize_server_name, resolve_tool_visibility, ExposureMode, ToolVisibility,
 };
 use serde::Serialize;
 use std::collections::HashSet;
@@ -27,6 +27,7 @@ pub struct ToolDetail {
     pub description: Option<String>,
     pub input_schema: Option<serde_json::Value>,
     pub disabled: bool,
+    pub pinned: bool,
 }
 
 pub struct ToolCatalogService;
@@ -52,7 +53,35 @@ impl ToolCatalogService {
             Err(_) => return vec![],
         };
 
-        build_tool_catalog_entries(&profile_tools, visible_server_ids)
+        build_tool_catalog_entries(
+            &profile_tools,
+            visible_server_ids,
+            exposure_mode(db, &active_id),
+        )
+    }
+
+    /// `tools/call` 的归属解析用：策展模式下未置顶的工具仍可被调用。
+    pub fn get_callable_tool_catalog(
+        db: &Database,
+        profile_id: Option<&str>,
+        visible_server_ids: Option<&std::collections::HashSet<String>>,
+    ) -> Vec<ToolCatalogEntry> {
+        let profile_repo = ProfileRepository::new(db);
+        let active_id = match profile_id {
+            Some(id) => id.to_string(),
+            None => match profile_repo.find_active_id() {
+                Ok(Some(id)) => id,
+                _ => return vec![],
+            },
+        };
+
+        let tool_repo = ToolDiscoveryRepository::new(db);
+        let profile_tools = match tool_repo.find_by_profile_id(&active_id) {
+            Ok(t) => t,
+            Err(_) => return vec![],
+        };
+
+        build_callable_catalog_entries(&profile_tools, visible_server_ids)
     }
 
     pub fn get_tool_details(
@@ -83,8 +112,11 @@ impl ToolCatalogService {
             .map(|server| server.name)
             .unwrap_or_else(|| "server".to_string());
 
-        let visibility =
-            visibility_by_server(resolve_tool_visibility(&profile_tools, visible_server_ids));
+        let visibility = visibility_by_server(resolve_tool_visibility(
+            &profile_tools,
+            visible_server_ids,
+            exposure_mode(db, &active_id),
+        ));
         let discovered = match tool_repo.find_by_server_id(server_id) {
             Ok(tools) => tools,
             Err(_) => return vec![],
@@ -113,7 +145,11 @@ impl ToolCatalogService {
             Ok(tools) => tools,
             Err(_) => return vec![],
         };
-        let visibility = visibility_by_server(resolve_tool_visibility(&profile_tools, None));
+        let visibility = visibility_by_server(resolve_tool_visibility(
+            &profile_tools,
+            None,
+            exposure_mode(db, profile_id),
+        ));
         let mut discovered_by_server = std::collections::HashMap::<String, Vec<_>>::new();
         for tool in tool_repo.find_all().unwrap_or_default() {
             discovered_by_server
@@ -155,16 +191,47 @@ pub struct ProfileToolGroup {
     pub tools: Vec<ToolDetail>,
 }
 
+fn exposure_mode(db: &Database, profile_id: &str) -> ExposureMode {
+    ProfileRepository::new(db)
+        .find_by_id(profile_id)
+        .ok()
+        .flatten()
+        .map(|profile| ExposureMode::from_db(&profile.exposure_mode))
+        .unwrap_or(ExposureMode::Direct)
+}
+
+/// Agent 看到的目录：`tools/list` 的输入。
 fn build_tool_catalog_entries(
     profile_tools: &[ProfileTool],
     callable_server_ids: Option<&HashSet<String>>,
+    mode: ExposureMode,
 ) -> Vec<ToolCatalogEntry> {
-    resolve_tool_visibility(profile_tools, callable_server_ids)
+    catalog_entries(profile_tools, callable_server_ids, mode, |item| item.listed)
+}
+
+/// 可调用的完整集合：`tools/call` 的归属解析用，不受置顶影响。
+fn build_callable_catalog_entries(
+    profile_tools: &[ProfileTool],
+    callable_server_ids: Option<&HashSet<String>>,
+) -> Vec<ToolCatalogEntry> {
+    catalog_entries(
+        profile_tools,
+        callable_server_ids,
+        ExposureMode::Direct,
+        |item| item.access.is_callable(),
+    )
+}
+
+fn catalog_entries(
+    profile_tools: &[ProfileTool],
+    callable_server_ids: Option<&HashSet<String>>,
+    mode: ExposureMode,
+    keep: impl Fn(&ToolVisibility) -> bool,
+) -> Vec<ToolCatalogEntry> {
+    resolve_tool_visibility(profile_tools, callable_server_ids, mode)
         .into_iter()
+        .filter(keep)
         .filter_map(|visible| {
-            if !visible.access.is_exposed() {
-                return None;
-            }
             Some(ToolCatalogEntry {
                 server_id: visible.server_id,
                 server_name: visible.server_name,
@@ -204,6 +271,7 @@ fn tool_detail(
                 format!("{}__{}", normalize_server_name(server_name), tool.tool_name)
             }),
         disabled: resolved.is_some_and(|item| item.access.is_deny_listed()),
+        pinned: resolved.is_some_and(|item| item.pinned),
         tool_name: tool.tool_name,
         description: tool.description,
         input_schema: tool.input_schema,

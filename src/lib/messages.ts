@@ -386,6 +386,18 @@ export const messages = {
   "{count} calls · {duration} avg": "{count} 次调用 · 平均 {duration}",
   "Currently running on port {current}; configured for port {configured}. The configured port may already be used by another Moor instance.":
     "当前运行端口为 {current}；配置端口为 {configured}。配置端口可能已被其他 Moor 实例占用。",
+  "Direct listing": "全量直出",
+  "Curated listing": "策展模式",
+  "Exposure mode": "曝光模式",
+  "{listed} of {total} listed": "{listed} / {total} 直出",
+  Pin: "置顶",
+  Unpin: "取消置顶",
+  "Pin selected": "置顶选中",
+  "Unpin selected": "取消置顶选中",
+  "Pinned {count} tools": "已置顶 {count} 个工具",
+  "Unpinned {count} tools": "已取消置顶 {count} 个工具",
+  "No tools pinned — agents will see nothing from this profile.":
+    "还没有置顶任何工具——Agent 将看不到这个 Profile 的任何工具。",
 } as const;
 
 export type MessageKey = keyof typeof messages;

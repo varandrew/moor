@@ -20,6 +20,8 @@ pub struct ProfileTool {
     /// 该 Server 在当前 Profile 内是否启用。查询会返回两种状态，可见性判定由调用方负责。
     pub enabled: bool,
     pub disabled_tools: Vec<String>,
+    /// 该 Tool 是否在当前 Profile 的置顶集合里。
+    pub pinned: bool,
     pub tool_name: String,
     pub description: Option<String>,
     pub input_schema: Option<serde_json::Value>,
@@ -94,7 +96,7 @@ impl<'a> ToolDiscoveryRepository<'a> {
 
     pub fn find_by_profile_id(&self, profile_id: &str) -> Result<Vec<ProfileTool>, String> {
         self.db.query_all(
-            "SELECT ps.server_id, ps.enabled, ms.name AS server_name, ps.disabled_tools, td.tool_name, td.description, td.input_schema
+            "SELECT ps.server_id, ps.enabled, ms.name AS server_name, ps.disabled_tools, ps.pinned_tools, td.tool_name, td.description, td.input_schema
              FROM profile_servers ps
              JOIN mcp_servers ms ON ps.server_id = ms.id
              JOIN tool_discoveries td ON td.server_id = ms.id
@@ -103,13 +105,18 @@ impl<'a> ToolDiscoveryRepository<'a> {
             &[&profile_id],
             |row| {
                 let disabled_tools_str: String = row.get("disabled_tools")?;
+                let pinned_tools_str: String = row.get("pinned_tools")?;
                 let input_schema_str: Option<String> = row.get("input_schema")?;
+                let tool_name: String = row.get("tool_name")?;
+                let pinned_tools: Vec<String> =
+                    serde_json::from_str(&pinned_tools_str).unwrap_or_default();
                 Ok(ProfileTool {
                     server_id: row.get("server_id")?,
                     server_name: row.get("server_name")?,
                     enabled: row.get::<_, i64>("enabled")? != 0,
                     disabled_tools: serde_json::from_str(&disabled_tools_str).unwrap_or_default(),
-                    tool_name: row.get("tool_name")?,
+                    pinned: pinned_tools.contains(&tool_name),
+                    tool_name,
                     description: row.get("description")?,
                     input_schema: input_schema_str.and_then(|s| serde_json::from_str(&s).ok()),
                 })

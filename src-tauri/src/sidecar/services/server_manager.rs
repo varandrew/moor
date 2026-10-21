@@ -416,7 +416,7 @@ impl ServerManager {
             .flatten();
         let callable_ids = self.get_callable_server_ids().await;
         let owner = profile_id.as_deref().and_then(|id| {
-            ToolCatalogService::get_tool_catalog(&self.db, Some(id), Some(&callable_ids))
+            ToolCatalogService::get_callable_tool_catalog(&self.db, Some(id), Some(&callable_ids))
                 .into_iter()
                 .find(|tool| tool.exposed_name == exposed_name)
         });

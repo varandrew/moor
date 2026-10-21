@@ -15,6 +15,7 @@ export type {
   UnsupportedServer,
 } from "./scanned.js";
 export type {
+  ExposureMode,
   Profile,
   ProfileDetail,
   ProfileServerState,

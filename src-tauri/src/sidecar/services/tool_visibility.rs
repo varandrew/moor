@@ -1,17 +1,37 @@
 //! 工具可见性判定。
 //!
-//! Profile 的启用状态、Server 的运行状态与工具禁用清单在此合并成唯一判定点。
-//! `tools/list`、`tools/call`、治理面板与 Server 详情的工具列表都从这里取结论，
-//! 避免同一套规则在多处各写一遍。
+//! Profile 的曝光模式与启用状态、Server 的运行状态、工具禁用清单与置顶选择，
+//! 在此合并成唯一判定点。`tools/list`、`tools/call`、治理面板与 Server 详情的
+//! 工具列表都从这里取结论，避免同一套规则在多处各写一遍。
 
 use crate::sidecar::db::tool_discovery_repo::ProfileTool;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+
+/// Profile 的曝光模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExposureMode {
+    /// 全量直出：Profile 内所有可用 Tool 都出现在 `tools/list`。
+    Direct,
+    /// 策展：只有置顶 Tool 出现在 `tools/list`，其余仍可直接调用。
+    Curated,
+}
+
+impl ExposureMode {
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "curated" => Self::Curated,
+            _ => Self::Direct,
+        }
+    }
+}
 
 /// 一个 Tool 在当前 Profile 下对 Agent 的可达状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolAccess {
-    /// 直出：出现在 `tools/list`，且 `tools/call` 能解析到归属。
-    Exposed,
+    /// 可调用：`tools/call` 能解析到归属。是否出现在 `tools/list` 由 [`ToolVisibility::listed`] 决定。
+    Callable,
     /// 在 Profile 的禁用清单中。
     ToolDisabled,
     /// 所属 Server 在 Profile 内未启用。
@@ -21,8 +41,8 @@ pub enum ToolAccess {
 }
 
 impl ToolAccess {
-    pub fn is_exposed(self) -> bool {
-        matches!(self, Self::Exposed)
+    pub fn is_callable(self) -> bool {
+        matches!(self, Self::Callable)
     }
 
     /// 是否被 Profile 的禁用清单移除。与是否可达无关：Server 停用时禁用状态仍然保留。
@@ -32,9 +52,6 @@ impl ToolAccess {
 }
 
 /// 单个 Tool 的判定结果。
-///
-/// `exposed_name` 只在 [`ToolAccess::Exposed`] 时为 `Some`：暴露名的消歧只在可见集合内计算，
-/// 不可见的工具没有对外的名字。
 #[derive(Debug, Clone)]
 pub struct ToolVisibility {
     pub server_id: String,
@@ -43,6 +60,11 @@ pub struct ToolVisibility {
     pub description: Option<String>,
     pub input_schema: Option<serde_json::Value>,
     pub access: ToolAccess,
+    /// 是否被当前 Profile 置顶。置顶与曝光模式无关，是用户的显式选择。
+    pub pinned: bool,
+    /// 是否出现在 `tools/list`。策展模式下未置顶的工具不可见但可调用。
+    pub listed: bool,
+    /// 对外暴露名。只有可调用的 Tool 才有名字——消歧只在可调用集合内计算。
     pub exposed_name: Option<String>,
 }
 
@@ -52,16 +74,17 @@ pub struct ToolVisibility {
 pub fn resolve_tool_visibility(
     profile_tools: &[ProfileTool],
     callable_server_ids: Option<&HashSet<String>>,
+    exposure_mode: ExposureMode,
 ) -> Vec<ToolVisibility> {
     let classified: Vec<(ToolAccess, &ProfileTool)> = profile_tools
         .iter()
         .map(|tool| (classify(tool, callable_server_ids), tool))
         .collect();
 
-    // 消歧只在可见集合内计算：被隐藏的工具不占用名字，也不影响别人的名字。
+    // 消歧只在可调用集合内计算：名字不随置顶切换而变，被隐藏的工具也不占用名字。
     let mut server_ids_by_base_name = std::collections::HashMap::<String, Vec<String>>::new();
     for (access, tool) in &classified {
-        if access.is_exposed() {
+        if access.is_callable() {
             server_ids_by_base_name
                 .entry(base_name(tool))
                 .or_default()
@@ -77,10 +100,13 @@ pub fn resolve_tool_visibility(
             tool_name: tool.tool_name.clone(),
             description: tool.description.clone(),
             input_schema: tool.input_schema.clone(),
-            access,
+            pinned: tool.pinned,
+            listed: access.is_callable()
+                && (matches!(exposure_mode, ExposureMode::Direct) || tool.pinned),
             exposed_name: access
-                .is_exposed()
+                .is_callable()
                 .then(|| exposed_name_for(tool, &server_ids_by_base_name)),
+            access,
         })
         .collect()
 }
@@ -99,7 +125,7 @@ fn classify(tool: &ProfileTool, callable_server_ids: Option<&HashSet<String>>) -
     }
     match callable_server_ids {
         Some(ids) if !ids.contains(&tool.server_id) => ToolAccess::ServerUnavailable,
-        _ => ToolAccess::Exposed,
+        _ => ToolAccess::Callable,
     }
 }
 
@@ -118,7 +144,7 @@ fn exposed_name_for(
     let base = base_name(tool);
     let server_ids = server_ids_by_base_name
         .get(&base)
-        .expect("exposed tools always register their base name");
+        .expect("callable tools always register their base name");
     if server_ids.len() > 1 {
         format!(
             "{}_{}__{}",
@@ -168,6 +194,7 @@ mod tests {
         server_name: &str,
         enabled: bool,
         disabled: &[&str],
+        pinned: bool,
         tool_name: &str,
     ) -> ProfileTool {
         ProfileTool {
@@ -175,6 +202,7 @@ mod tests {
             server_name: server_name.to_string(),
             enabled,
             disabled_tools: disabled.iter().map(|name| name.to_string()).collect(),
+            pinned,
             tool_name: tool_name.to_string(),
             description: None,
             input_schema: None,
@@ -193,11 +221,19 @@ mod tests {
             .access
     }
 
+    fn listed_of(result: &[ToolVisibility], server_id: &str, tool_name: &str) -> bool {
+        result
+            .iter()
+            .find(|item| item.server_id == server_id && item.tool_name == tool_name)
+            .expect("tool should be present in the resolution")
+            .listed
+    }
+
     #[test]
     fn classifies_each_reason_a_tool_is_not_exposed() {
         // (Server 启用, 工具在禁用清单, Server 可调用, 期望状态)
         let cases = [
-            (true, false, true, ToolAccess::Exposed),
+            (true, false, true, ToolAccess::Callable),
             (true, true, true, ToolAccess::ToolDisabled),
             (false, false, true, ToolAccess::ServerDisabled),
             (true, false, false, ToolAccess::ServerUnavailable),
@@ -206,14 +242,21 @@ mod tests {
 
         for (server_enabled, denied, callable_server, expected) in cases {
             let disabled: &[&str] = if denied { &["search"] } else { &[] };
-            let rows = vec![tool("s1", "Alpha", server_enabled, disabled, "search")];
+            let rows = vec![tool(
+                "s1",
+                "Alpha",
+                server_enabled,
+                disabled,
+                false,
+                "search",
+            )];
             let ids = if callable_server {
                 Some(callable(&["s1"]))
             } else {
                 Some(callable(&[]))
             };
 
-            let result = resolve_tool_visibility(&rows, ids.as_ref());
+            let result = resolve_tool_visibility(&rows, ids.as_ref(), ExposureMode::Direct);
 
             assert_eq!(
                 access_of(&result, "s1", "search"),
@@ -224,16 +267,16 @@ mod tests {
     }
 
     #[test]
-    fn only_exposed_tools_get_an_exposed_name() {
+    fn only_callable_tools_get_an_exposed_name() {
         let rows = vec![
-            tool("s1", "Alpha", true, &[], "search"),
-            tool("s1", "Alpha", true, &["hidden"], "hidden"),
-            tool("s2", "Beta", false, &[], "read"),
-            tool("s3", "Gamma", true, &[], "write"),
+            tool("s1", "Alpha", true, &[], false, "search"),
+            tool("s1", "Alpha", true, &["hidden"], false, "hidden"),
+            tool("s2", "Beta", false, &[], false, "read"),
+            tool("s3", "Gamma", true, &[], false, "write"),
         ];
         let ids = callable(&["s1", "s2"]);
 
-        let result = resolve_tool_visibility(&rows, Some(&ids));
+        let result = resolve_tool_visibility(&rows, Some(&ids), ExposureMode::Direct);
         let name_of = |server_id: &str, tool_name: &str| {
             result
                 .iter()
@@ -249,19 +292,19 @@ mod tests {
 
     #[test]
     fn ignores_runtime_state_when_no_callable_set_is_given() {
-        let rows = vec![tool("s3", "Gamma", true, &[], "write")];
+        let rows = vec![tool("s3", "Gamma", true, &[], false, "write")];
 
-        let result = resolve_tool_visibility(&rows, None);
+        let result = resolve_tool_visibility(&rows, None, ExposureMode::Direct);
 
-        assert_eq!(result[0].access, ToolAccess::Exposed);
+        assert_eq!(result[0].access, ToolAccess::Callable);
         assert_eq!(result[0].exposed_name.as_deref(), Some("gamma__write"));
     }
 
     #[test]
     fn keeps_the_deny_list_visible_for_a_disabled_server() {
-        let rows = vec![tool("s2", "Beta", false, &["read"], "read")];
+        let rows = vec![tool("s2", "Beta", false, &["read"], false, "read")];
 
-        let result = resolve_tool_visibility(&rows, Some(&callable(&["s2"])));
+        let result = resolve_tool_visibility(&rows, Some(&callable(&["s2"])), ExposureMode::Direct);
 
         assert_eq!(
             result[0].access,
@@ -272,13 +315,13 @@ mod tests {
     }
 
     #[test]
-    fn disambiguates_names_only_among_exposed_tools() {
+    fn disambiguates_names_only_among_callable_tools() {
         let rows = vec![
-            tool("aaaaaaaa1111", "GitHub MCP", true, &[], "search"),
-            tool("aaaaaaaa2222", "github-mcp", true, &[], "search"),
+            tool("aaaaaaaa1111", "GitHub MCP", true, &[], false, "search"),
+            tool("aaaaaaaa2222", "github-mcp", true, &[], false, "search"),
         ];
 
-        let without_deny = resolve_tool_visibility(&rows, None);
+        let without_deny = resolve_tool_visibility(&rows, None, ExposureMode::Direct);
         let exposed: Vec<_> = without_deny
             .iter()
             .filter_map(|item| item.exposed_name.clone())
@@ -293,7 +336,7 @@ mod tests {
 
         let mut denied_rows = rows.clone();
         denied_rows[1].disabled_tools = vec!["search".to_string()];
-        let with_deny = resolve_tool_visibility(&denied_rows, None);
+        let with_deny = resolve_tool_visibility(&denied_rows, None, ExposureMode::Direct);
         let exposed_after_deny: Vec<_> = with_deny
             .iter()
             .filter_map(|item| item.exposed_name.clone())
@@ -306,12 +349,72 @@ mod tests {
     }
 
     #[test]
+    fn lists_every_callable_tool_in_direct_mode() {
+        let rows = vec![
+            tool("s1", "Alpha", true, &[], false, "search"),
+            tool("s1", "Alpha", true, &[], true, "pinned"),
+        ];
+
+        let result = resolve_tool_visibility(&rows, None, ExposureMode::Direct);
+
+        assert!(listed_of(&result, "s1", "search"));
+        assert!(listed_of(&result, "s1", "pinned"));
+    }
+
+    #[test]
+    fn lists_only_pinned_tools_in_curated_mode() {
+        let rows = vec![
+            tool("s1", "Alpha", true, &[], false, "search"),
+            tool("s1", "Alpha", true, &[], true, "pinned"),
+        ];
+
+        let result = resolve_tool_visibility(&rows, None, ExposureMode::Curated);
+
+        assert!(!listed_of(&result, "s1", "search"));
+        assert!(listed_of(&result, "s1", "pinned"));
+        assert_eq!(
+            access_of(&result, "s1", "search"),
+            ToolAccess::Callable,
+            "an unpinned tool stays callable so cached names keep working"
+        );
+        let hidden = result
+            .iter()
+            .find(|item| item.tool_name == "search")
+            .expect("tool should be resolved");
+        assert_eq!(
+            hidden.exposed_name.as_deref(),
+            Some("alpha__search"),
+            "an unpinned tool still has a name to be called by"
+        );
+    }
+
+    #[test]
+    fn a_denied_tool_is_never_listed_even_when_pinned() {
+        let rows = vec![tool("s1", "Alpha", true, &["search"], true, "search")];
+
+        let result = resolve_tool_visibility(&rows, None, ExposureMode::Curated);
+
+        assert!(!listed_of(&result, "s1", "search"));
+        assert_eq!(access_of(&result, "s1", "search"), ToolAccess::ToolDisabled);
+    }
+
+    #[test]
+    fn names_do_not_depend_on_the_exposure_mode() {
+        let rows = vec![tool("s1", "Alpha", true, &[], false, "search")];
+
+        let direct = resolve_tool_visibility(&rows, None, ExposureMode::Direct);
+        let curated = resolve_tool_visibility(&rows, None, ExposureMode::Curated);
+
+        assert_eq!(direct[0].exposed_name, curated[0].exposed_name);
+    }
+
+    #[test]
     fn exposes_a_tool_when_its_server_is_callable_and_not_denied() {
-        let rows = vec![tool("s1", "Alpha", true, &["other"], "search")];
+        let rows = vec![tool("s1", "Alpha", true, &["other"], false, "search")];
 
-        let result = resolve_tool_visibility(&rows, Some(&callable(&["s1"])));
+        let result = resolve_tool_visibility(&rows, Some(&callable(&["s1"])), ExposureMode::Direct);
 
-        assert!(result[0].access.is_exposed());
+        assert!(result[0].access.is_callable());
         assert!(!result[0].access.is_deny_listed());
     }
 }

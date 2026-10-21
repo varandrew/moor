@@ -72,9 +72,17 @@ impl ProfileService {
         db: &Database,
         id: &str,
         name: Option<&str>,
+        exposure_mode: Option<&str>,
     ) -> Result<Profile, ProfileServiceError> {
+        if let Some(mode) = exposure_mode {
+            if !matches!(mode, "direct" | "curated") {
+                return Err(ProfileServiceError::Validation(
+                    "exposureMode must be direct or curated".into(),
+                ));
+            }
+        }
         ProfileRepository::new(db)
-            .update(id, name)
+            .update(id, name, exposure_mode)
             .map_err(ProfileServiceError::Internal)?
             .ok_or_else(|| ProfileServiceError::NotFound("Profile not found".into()))
     }

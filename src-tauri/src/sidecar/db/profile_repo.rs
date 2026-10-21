@@ -7,6 +7,8 @@ pub struct Profile {
     pub id: String,
     pub name: String,
     pub is_active: bool,
+    /// `direct`（全量直出）或 `curated`（置顶直出）。老库升级后恒为 `direct`。
+    pub exposure_mode: String,
     pub server_count: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
@@ -17,6 +19,7 @@ pub struct Profile {
 pub struct ProfileServerState {
     pub enabled: bool,
     pub disabled_tools: Vec<String>,
+    pub pinned_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,28 +37,29 @@ pub struct ProfileServerUpsertInput {
     pub server_id: String,
     pub enabled: Option<bool>,
     pub disabled_tools: Option<Vec<String>>,
+    pub pinned_tools: Option<Vec<String>>,
 }
 
 /// upsert 合并语义的唯一实现：enabled 与 disabled_tools 是相互独立的可选补丁，
 /// 缺省方保留现有值；新行缺省 enabled=true / 空禁用表。
 /// 单条与批量接口共用——两处语义分叉会导致治理面板与单点编辑互相覆盖。
 fn resolve_profile_server_state(
-    existing: Option<(i64, String)>,
+    existing: Option<(i64, String, String)>,
     enabled: Option<bool>,
     disabled_tools: Option<&Vec<String>>,
-) -> (i64, String) {
+    pinned_tools: Option<&Vec<String>>,
+) -> (i64, String, String) {
     let tools_json =
         |tools: &Vec<String>| serde_json::to_string(tools).unwrap_or_else(|_| "[]".into());
-    match (existing, enabled, disabled_tools) {
-        (Some(_), Some(en), Some(tools)) => (en as i64, tools_json(tools)),
-        (Some((_, t)), Some(en), None) => (en as i64, t),
-        (Some((e, _)), None, Some(tools)) => (e, tools_json(tools)),
-        (Some((e, t)), None, None) => (e, t),
-        (None, _, _) => (
-            enabled.unwrap_or(true) as i64,
-            disabled_tools.map_or_else(|| "[]".to_string(), tools_json),
-        ),
-    }
+    let (current_enabled, current_disabled, current_pinned) = match existing {
+        Some((enabled, disabled, pinned)) => (enabled, disabled, pinned),
+        None => (1, "[]".to_string(), "[]".to_string()),
+    };
+    (
+        enabled.map_or(current_enabled, |value| value as i64),
+        disabled_tools.map_or(current_disabled, |tools| tools_json(tools)),
+        pinned_tools.map_or(current_pinned, |tools| tools_json(tools)),
+    )
 }
 
 fn map_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<Profile> {
@@ -65,6 +69,7 @@ fn map_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<Profile> {
         id: row.get("id")?,
         name: row.get("name")?,
         is_active: is_active != 0,
+        exposure_mode: row.get("exposure_mode")?,
         server_count,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
@@ -122,7 +127,12 @@ impl<'a> ProfileRepository<'a> {
             .and_then(|p| p.ok_or_else(|| "Created profile could not be reloaded".into()))
     }
 
-    pub fn update(&self, id: &str, name: Option<&str>) -> Result<Option<Profile>, String> {
+    pub fn update(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        exposure_mode: Option<&str>,
+    ) -> Result<Option<Profile>, String> {
         let exists = self
             .db
             .query_one("SELECT id FROM profiles WHERE id = ?1", &[&id], |row| {
@@ -131,11 +141,11 @@ impl<'a> ProfileRepository<'a> {
         if exists.is_none() {
             return Ok(None);
         }
-        if let Some(name) = name {
+        if name.is_some() || exposure_mode.is_some() {
             let now = chrono::Utc::now().to_rfc3339();
             self.db.run(
-                "UPDATE profiles SET name = ?1, updated_at = ?2 WHERE id = ?3",
-                &[&name, &now, &id],
+                "UPDATE profiles SET name = COALESCE(?1, name), exposure_mode = COALESCE(?2, exposure_mode), updated_at = ?3 WHERE id = ?4",
+                &[&name, &exposure_mode, &now, &id],
             )?;
         }
         self.find_by_id(id)
@@ -185,7 +195,8 @@ impl<'a> ProfileRepository<'a> {
         profile_id: &str,
     ) -> Result<Vec<ProfileDetailServer>, String> {
         self.db.query_all(
-            "SELECT ms.*, ps.enabled AS profile_enabled, ps.disabled_tools AS profile_disabled_tools
+            "SELECT ms.*, ps.enabled AS profile_enabled, ps.disabled_tools AS profile_disabled_tools,
+                    ps.pinned_tools AS profile_pinned_tools
              FROM mcp_servers ms
              LEFT JOIN profile_servers ps ON ps.server_id = ms.id AND ps.profile_id = ?1
              ORDER BY ms.name ASC",
@@ -194,11 +205,15 @@ impl<'a> ProfileRepository<'a> {
                 let server = super::server_repo::map_server(row)?;
                 let profile_enabled: Option<i64> = row.get("profile_enabled")?;
                 let profile_disabled_tools: Option<String> = row.get("profile_disabled_tools")?;
+                let profile_pinned_tools: Option<String> = row.get("profile_pinned_tools")?;
                 Ok(ProfileDetailServer {
                     server,
                     profile_server: ProfileServerState {
                         enabled: profile_enabled.is_some_and(|v| v != 0),
                         disabled_tools: profile_disabled_tools
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or_default(),
+                        pinned_tools: profile_pinned_tools
                             .and_then(|s| serde_json::from_str(&s).ok())
                             .unwrap_or_default(),
                     },
@@ -215,14 +230,20 @@ impl<'a> ProfileRepository<'a> {
         disabled_tools: Option<&Vec<String>>,
     ) -> Result<ProfileServerState, String> {
         let existing = self.db.query_one(
-            "SELECT enabled, disabled_tools FROM profile_servers WHERE profile_id = ?1 AND server_id = ?2",
+            "SELECT enabled, disabled_tools, pinned_tools FROM profile_servers WHERE profile_id = ?1 AND server_id = ?2",
             &[&profile_id, &server_id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )?;
 
         let had_existing = existing.is_some();
-        let (final_enabled, final_tools) =
-            resolve_profile_server_state(existing, enabled, disabled_tools);
+        let (final_enabled, final_tools, final_pinned) =
+            resolve_profile_server_state(existing, enabled, disabled_tools, None);
 
         if had_existing {
             self.db.run(
@@ -239,6 +260,7 @@ impl<'a> ProfileRepository<'a> {
         Ok(ProfileServerState {
             enabled: final_enabled != 0,
             disabled_tools: serde_json::from_str(&final_tools).unwrap_or_default(),
+            pinned_tools: serde_json::from_str(&final_pinned).unwrap_or_default(),
         })
     }
 
@@ -252,23 +274,30 @@ impl<'a> ProfileRepository<'a> {
         self.db.transaction(|conn| {
             for item in items {
                 let existing = match conn.query_row(
-                    "SELECT enabled, disabled_tools FROM profile_servers WHERE profile_id = ?1 AND server_id = ?2",
+                    "SELECT enabled, disabled_tools, pinned_tools FROM profile_servers WHERE profile_id = ?1 AND server_id = ?2",
                     rusqlite::params![profile_id, item.server_id],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
                 ) {
                     Ok(row) => Some(row),
                     Err(rusqlite::Error::QueryReturnedNoRows) => None,
                     Err(e) => return Err(e.to_string()),
                 };
-                let (final_enabled, final_tools) = resolve_profile_server_state(
+                let (final_enabled, final_tools, final_pinned) = resolve_profile_server_state(
                     existing,
                     item.enabled,
                     item.disabled_tools.as_ref(),
+                    item.pinned_tools.as_ref(),
                 );
                 conn.execute(
-                    "INSERT INTO profile_servers (profile_id, server_id, enabled, disabled_tools) VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(profile_id, server_id) DO UPDATE SET enabled = excluded.enabled, disabled_tools = excluded.disabled_tools",
-                    rusqlite::params![profile_id, item.server_id, final_enabled, final_tools],
+                    "INSERT INTO profile_servers (profile_id, server_id, enabled, disabled_tools, pinned_tools) VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(profile_id, server_id) DO UPDATE SET enabled = excluded.enabled, disabled_tools = excluded.disabled_tools, pinned_tools = excluded.pinned_tools",
+                    rusqlite::params![profile_id, item.server_id, final_enabled, final_tools, final_pinned],
                 )
                 .map_err(|e| e.to_string())?;
             }
@@ -295,13 +324,14 @@ impl<'a> ProfileRepository<'a> {
         let now = chrono::Utc::now().to_rfc3339();
         self.db.transaction(|conn| {
             conn.execute(
-                "INSERT INTO profiles (id, name, is_active, created_at, updated_at) VALUES (?1, ?2, 0, ?3, ?3)",
-                rusqlite::params![&id, &new_name, &now],
+                "INSERT INTO profiles (id, name, is_active, exposure_mode, created_at, updated_at)
+                 SELECT ?1, ?2, 0, exposure_mode, ?3, ?3 FROM profiles WHERE id = ?4",
+                rusqlite::params![&id, &new_name, &now, &source_id],
             )
             .map_err(|e| e.to_string())?;
             conn.execute(
-                "INSERT INTO profile_servers (profile_id, server_id, enabled, disabled_tools)
-                 SELECT ?1, server_id, enabled, disabled_tools FROM profile_servers WHERE profile_id = ?2",
+                "INSERT INTO profile_servers (profile_id, server_id, enabled, disabled_tools, pinned_tools)
+                 SELECT ?1, server_id, enabled, disabled_tools, pinned_tools FROM profile_servers WHERE profile_id = ?2",
                 rusqlite::params![&id, &source_id],
             )
             .map_err(|e| e.to_string())?;
