@@ -74,6 +74,10 @@ export function parseMoorSSEEvent(
       return isServerToolsEvent(data) ? { type: event, data } : invalidEvent(event, warn);
     case "profile:activated":
       return isProfileActivatedEvent(data) ? { type: event, data } : invalidEvent(event, warn);
+    case "tools:changed":
+      return isRecord(data) && typeof data.reason === "string"
+        ? { type: event, data: { reason: data.reason } }
+        : invalidEvent(event, warn);
     case "settings:changed":
       return isSettingsChangedEvent(data) ? { type: event, data } : invalidEvent(event, warn);
     default:

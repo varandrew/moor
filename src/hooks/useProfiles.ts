@@ -17,6 +17,12 @@ import type {
 export function useProfiles() {
   const queryClient = useQueryClient();
 
+  useSSEEvent("tools:changed", () => {
+    // 治理写入与策略切换都会改变「哪些工具可见」，详情与工具矩阵都要重取。
+    void queryClient.invalidateQueries({ queryKey: ["profiles"] });
+    void queryClient.invalidateQueries({ queryKey: ["servers"] });
+  });
+
   useSSEEvent("profile:activated", () => {
     void queryClient.invalidateQueries({ queryKey: profileKeys.list() });
     void queryClient.invalidateQueries({ queryKey: serverKeys.list() });

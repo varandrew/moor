@@ -15,7 +15,7 @@ export const API_ERROR_SUMMARIES: Record<string, string> = {
   NOT_FOUND: "The requested item was not found.",
   VALIDATION_ERROR: "Check the configuration values.",
   ACTIVE_PROFILE: "The active profile cannot be removed.",
-  SERVER_NOT_RUNNING: "Start the server before checking its health.",
+  SERVER_NOT_RUNNING: "Start the server first.",
   SERVER_BUSY: "The server is busy. Try again after the current request.",
   SERVER_CHANGED: "The server changed during the check. Try again.",
   UPDATE_CHECK_FAILED: "Unable to check for updates.",

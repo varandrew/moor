@@ -293,7 +293,7 @@ function ToolGovernanceCard({
   };
 
   const totalTools = groups.reduce((sum, group) => sum + group.tools.length, 0);
-  const summary = summarizeExposure(groups, exposureMode);
+  const summary = summarizeExposure(groups, exposureMode, riskPolicy);
 
   const applyPin = async (pinned: boolean) => {
     const count = selection.length;

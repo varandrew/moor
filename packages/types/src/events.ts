@@ -30,6 +30,13 @@ export interface ProfileActivatedEvent {
   };
 }
 
+export interface ToolsChangedEvent {
+  type: "tools:changed";
+  data: {
+    reason: string;
+  };
+}
+
 export interface SettingsChangedEvent {
   type: "settings:changed";
   data: Settings;
@@ -40,6 +47,7 @@ export type MoorEvent =
   | ServerStatusEvent
   | ServerToolsEvent
   | ProfileActivatedEvent
+  | ToolsChangedEvent
   | SettingsChangedEvent;
 
 export type MoorEventType = MoorEvent["type"];

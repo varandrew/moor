@@ -45,7 +45,7 @@ async fn refresh_tools(
         .server_manager
         .refresh_server_tools(&id)
         .await
-        .map_err(|message| AppError::conflict("server_not_running", message))?;
+        .map_err(|message| AppError::conflict("SERVER_NOT_RUNNING", message))?;
     Ok(Json(serde_json::json!({ "tools": count })))
 }
 

@@ -34,6 +34,7 @@ export type {
   ServerStatusEvent,
   ServerToolsEvent,
   SettingsChangedEvent,
+  ToolsChangedEvent,
 } from "./events.js";
 export type {
   AdvancedSettings,

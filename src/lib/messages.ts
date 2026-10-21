@@ -254,7 +254,7 @@ export const messages = {
   "The requested item was not found.": "请求的项目不存在。",
   "Check the configuration values.": "请检查配置值。",
   "The active profile cannot be removed.": "无法移除当前使用的配置方案。",
-  "Start the server before checking its health.": "请先启动服务器再检查健康状态。",
+  "Start the server first.": "请先启动服务器。",
   "The server is busy. Try again after the current request.": "服务器正在处理请求，请稍后重试。",
   "The server changed during the check. Try again.": "检查期间服务器发生变更，请重试。",
   "Unable to check for updates.": "无法检查更新。",

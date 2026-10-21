@@ -112,7 +112,10 @@ async fn handle_mcp_get(state: Arc<AppState>, headers: &HeaderMap) -> Response {
         let event = item.ok()?;
         if !matches!(
             event,
-            Evt::ServerTools { .. } | Evt::ProfileActivated { .. } | Evt::ToolsChanged { .. }
+            Evt::ServerTools { .. }
+                | Evt::ServerStatus { .. }
+                | Evt::ProfileActivated { .. }
+                | Evt::ToolsChanged { .. }
         ) {
             return None;
         }
@@ -685,6 +688,49 @@ mod tests {
         assert!(
             text.contains("notifications/tools/list_changed"),
             "unexpected frame: {text}"
+        );
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn stopping_a_server_also_announces_the_tool_list_change() {
+        let data_dir = temp_data_dir("tools-list-changed-stop");
+        let state = test_state(data_dir.clone());
+        let session_id = state.mcp_sessions.create().await.expect("session created");
+        let app = Router::new()
+            .route("/mcp", axum::routing::any(handle_mcp_request))
+            .with_state(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/mcp")
+                    .header(header::ACCEPT, "text/event-stream")
+                    .header(MCP_SESSION_ID_HEADER, &session_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut stream = response.into_body().into_data_stream();
+        state.event_bus.emit(Evt::ServerStatus {
+            server_id: "server-1".into(),
+            status: "stopped".into(),
+            error_message: None,
+        });
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("a stopped server must announce the change")
+            .expect("stream should yield a frame")
+            .expect("frame should be readable");
+        assert!(
+            String::from_utf8_lossy(&frame).contains("notifications/tools/list_changed"),
+            "a stop hides tools, so the list changed"
         );
 
         let _ = std::fs::remove_dir_all(data_dir);

@@ -280,6 +280,7 @@ fn search_catalog(catalog: &[ToolCatalogEntry], params: &Value) -> Value {
                     .clone()
                     .unwrap_or_else(|| json!({"type": "object"})),
                 "serverName": entry.server_name,
+                "riskLevel": entry.risk_level,
             })
         })
         .collect();
@@ -743,6 +744,10 @@ process.stdin.on("data", (chunk) => {
         assert_eq!(tools[0]["name"], "fake__report");
         assert_eq!(tools[0]["serverName"], "fake");
         assert_eq!(tools[0]["inputSchema"]["type"], "object");
+        assert_eq!(
+            tools[0]["riskLevel"], "unknown",
+            "search results must carry the risk level"
+        );
     }
 
     #[tokio::test]
