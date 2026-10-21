@@ -153,6 +153,7 @@ mod tests {
             None,
             10,
             None,
+            "direct",
         )
         .expect("failed to insert first log");
         repo.insert(
@@ -166,6 +167,7 @@ mod tests {
             None,
             10,
             None,
+            "direct",
         )
         .expect("failed to insert second log");
 
@@ -201,7 +203,7 @@ mod tests {
             ("to", "2026-01-01T00:00:02Z"),
         ] {
             repo.insert(
-                id, timestamp, None, None, "search", None, None, None, 10, None,
+                id, timestamp, None, None, "search", None, None, None, 10, None, "direct",
             )
             .unwrap();
         }
@@ -267,6 +269,7 @@ mod tests {
             Some("boom"),
             10,
             None,
+            "direct",
         )
         .expect("failed to insert first log");
         repo.insert(
@@ -280,6 +283,7 @@ mod tests {
             None,
             20,
             None,
+            "direct",
         )
         .expect("failed to insert second log");
 

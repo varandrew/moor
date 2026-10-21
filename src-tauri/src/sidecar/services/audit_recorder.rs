@@ -8,6 +8,22 @@ use crate::sidecar::services::audit_redaction::redact_for_audit;
 use crate::sidecar::services::settings::audit_logging_enabled;
 
 /// 调用方固定 Profile 与 Server 归属，脱敏、启用检查和写库由记录器处理。
+/// 一次调用是 Agent 直接发起的，还是经元工具转发的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallVia {
+    Direct,
+    Meta,
+}
+
+impl ToolCallVia {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Meta => "meta",
+        }
+    }
+}
+
 pub struct ToolCallRecord<'a> {
     pub profile_id: Option<&'a str>,
     pub server_id: Option<&'a str>,
@@ -17,6 +33,8 @@ pub struct ToolCallRecord<'a> {
     pub error: Option<&'a str>,
     pub duration_ms: i64,
     pub agent_info: Option<&'a str>,
+    /// `direct` 或 `meta`。
+    pub via: ToolCallVia,
 }
 
 /// 审计记录器。完成时读取启用标志，归属仅使用调用方传入的上下文。
@@ -44,6 +62,7 @@ impl AuditRecorder {
             entry.error,
             entry.duration_ms,
             entry.agent_info,
+            entry.via.as_str(),
         );
     }
 }
@@ -103,7 +122,7 @@ mod tests {
             ("recent", &chrono::Utc::now().to_rfc3339()),
         ] {
             repo.insert(
-                id, timestamp, None, None, "search", None, None, None, 1, None,
+                id, timestamp, None, None, "search", None, None, None, 1, None, "direct",
             )
             .unwrap();
         }

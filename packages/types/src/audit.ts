@@ -48,6 +48,8 @@ export interface LogInsights {
   errorCalls: number;
   errorRate: number;
   avgDurationMs: number | null;
+  /** 被风险策略拒绝的调用数。 */
+  blockedCalls: number;
   tools: ToolInsight[];
   servers: ServerInsight[];
 }

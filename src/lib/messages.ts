@@ -405,6 +405,7 @@ export const messages = {
   Write: "写入",
   "Unknown risk": "未知",
   "Risk level updated": "风险等级已更新",
+  "{count} calls blocked by policy": "{count} 次调用被风险策略拒绝",
 } as const;
 
 export type MessageKey = keyof typeof messages;

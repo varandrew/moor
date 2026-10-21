@@ -16,7 +16,7 @@ use crate::sidecar::db::profile_repo::ProfileRepository;
 use crate::sidecar::db::server_repo::{Server, ServerRepository};
 use crate::sidecar::db::tool_discovery_repo::{ToolDiscoveryRepository, ToolInsert};
 use crate::sidecar::db::Database;
-use crate::sidecar::services::audit_recorder::{AuditRecorder, ToolCallRecord};
+use crate::sidecar::services::audit_recorder::{AuditRecorder, ToolCallRecord, ToolCallVia};
 use crate::sidecar::services::event_bus::{EventBus, Evt};
 use crate::sidecar::services::server_log::{DiagnosticAttempt, ServerDiagnostics};
 use crate::sidecar::services::settings;
@@ -433,6 +433,7 @@ impl ServerManager {
         exposed_name: &str,
         args: Value,
         agent_info: Option<&str>,
+        via: ToolCallVia,
     ) -> Result<Value, ToolCallError> {
         // Profile 只解析一次；没有 Active Profile 时不回退到后续激活的 Profile。
         let profile_id = ProfileRepository::new(&self.db)
@@ -507,6 +508,7 @@ impl ServerManager {
                     0
                 },
                 agent_info,
+                via,
             },
         );
         result
@@ -541,6 +543,14 @@ impl ServerManager {
     ) -> Vec<crate::sidecar::services::tool_catalog::ToolCatalogEntry> {
         let callable_ids = self.get_callable_server_ids().await;
         ToolCatalogService::get_callable_tool_catalog(&self.db, None, Some(&callable_ids))
+    }
+
+    /// 当前 Active Profile 的 id。
+    pub fn active_profile_id(&self) -> Option<String> {
+        ProfileRepository::new(&self.db)
+            .find_active_id()
+            .ok()
+            .flatten()
     }
 
     /// 当前 Active Profile 的曝光模式；没有 Active Profile 时按直出处理。
@@ -1098,7 +1108,12 @@ process.stdin.on("data", (chunk) => {{
 
         let err = tokio::time::timeout(
             std::time::Duration::from_millis(6_500),
-            manager.call_tool("phase__echo", serde_json::json!({}), None),
+            manager.call_tool(
+                "phase__echo",
+                serde_json::json!({}),
+                None,
+                ToolCallVia::Direct,
+            ),
         )
         .await
         .expect("tool call should return before the outer timeout")

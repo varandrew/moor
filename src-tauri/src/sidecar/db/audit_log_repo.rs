@@ -38,6 +38,8 @@ pub struct AuditLogEntry {
     pub error: Option<String>,
     pub duration_ms: Option<i64>,
     pub agent_info: Option<String>,
+    /// `direct`（Agent 直接调用）或 `meta`（经元工具检索/转发）。
+    pub via: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +104,8 @@ pub struct LogInsights {
     pub error_calls: i64,
     pub error_rate: f64,
     pub avg_duration_ms: Option<f64>,
+    /// 被风险策略拒绝的调用数。
+    pub blocked_calls: i64,
     pub tools: Vec<ToolInsight>,
     pub servers: Vec<ServerInsight>,
 }
@@ -120,6 +124,7 @@ fn map_audit_log(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditLogEntry> {
         error: row.get("error")?,
         duration_ms: row.get("duration_ms")?,
         agent_info: row.get("agent_info")?,
+        via: row.get("via")?,
     })
 }
 
@@ -196,16 +201,17 @@ impl<'a> AuditLogRepository<'a> {
         error: Option<&str>,
         duration_ms: i64,
         agent_info: Option<&str>,
+        via: &str,
     ) -> Result<(), String> {
         let timestamp = normalize_timestamp(timestamp)?;
         let args_json = arguments.map(|v| serde_json::to_string(v).unwrap_or_default());
         let result_json = result.map(|v| serde_json::to_string(v).unwrap_or_default());
         // 同次写入解析失效关联，避免调用结束前删除归属导致整条审计丢失。
         self.db.run(
-            "INSERT INTO audit_logs (id, timestamp, profile_id, server_id, tool_name, arguments, result, error, duration_ms, agent_info)
+            "INSERT INTO audit_logs (id, timestamp, profile_id, server_id, tool_name, arguments, result, error, duration_ms, agent_info, via)
              VALUES (?1, ?2, (SELECT id FROM profiles WHERE id = ?3),
-                     (SELECT id FROM mcp_servers WHERE id = ?4), ?5, ?6, ?7, ?8, ?9, ?10)",
-            &[&id, &timestamp, &profile_id, &server_id, &tool_name, &args_json, &result_json, &error, &duration_ms, &agent_info],
+                     (SELECT id FROM mcp_servers WHERE id = ?4), ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            &[&id, &timestamp, &profile_id, &server_id, &tool_name, &args_json, &result_json, &error, &duration_ms, &agent_info, &via],
         )
     }
 
@@ -230,11 +236,14 @@ impl<'a> AuditLogRepository<'a> {
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
 
-        let (total_calls, error_calls, avg_duration_ms) = self
+        let (total_calls, error_calls, avg_duration_ms, blocked_calls) = self
             .db
             .query_one(
                 &format!(
-                    "SELECT COUNT(*), COALESCE(SUM(CASE WHEN a.error IS NOT NULL THEN 1 ELSE 0 END), 0), AVG(a.duration_ms)
+                    "SELECT COUNT(*),
+                            COALESCE(SUM(CASE WHEN a.error IS NOT NULL THEN 1 ELSE 0 END), 0),
+                            AVG(a.duration_ms),
+                            COALESCE(SUM(CASE WHEN a.error LIKE 'Tool blocked by risk policy%' THEN 1 ELSE 0 END), 0)
                      FROM audit_logs a WHERE 1=1{conditions}"
                 ),
                 &param_refs,
@@ -243,10 +252,11 @@ impl<'a> AuditLogRepository<'a> {
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, Option<f64>>(2)?,
+                        row.get::<_, i64>(3)?,
                     ))
                 },
             )?
-            .unwrap_or((0, 0, None));
+            .unwrap_or((0, 0, None, 0));
         let error_rate = if total_calls > 0 {
             error_calls as f64 / total_calls as f64
         } else {
@@ -304,7 +314,8 @@ impl<'a> AuditLogRepository<'a> {
             },
         )?;
         for tool in &mut tools {
-            if let Some(vals) = durations.get_mut(&(tool.server_id.clone(), tool.tool_name.clone())) {
+            if let Some(vals) = durations.get_mut(&(tool.server_id.clone(), tool.tool_name.clone()))
+            {
                 vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 tool.p50_ms = percentile_nearest_rank(vals, 50.0);
                 tool.p95_ms = percentile_nearest_rank(vals, 95.0);
@@ -346,6 +357,7 @@ impl<'a> AuditLogRepository<'a> {
             error_calls,
             error_rate,
             avg_duration_ms,
+            blocked_calls,
             tools,
             servers,
         })
@@ -425,7 +437,8 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("moor-audit-repo-{ts}-{}.db", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("moor-audit-repo-{ts}-{}.db", uuid::Uuid::new_v4()));
         let db = Database::open(&path).expect("open db");
         db.run_migrations().expect("migrate");
         (db, path)
@@ -450,6 +463,7 @@ mod tests {
             error,
             duration_ms,
             None,
+            "direct",
         )
         .expect("insert log");
     }
@@ -574,6 +588,7 @@ mod tests {
             None,
             5,
             None,
+            "direct",
         )
         .expect("insert");
         repo.insert(
@@ -587,6 +602,7 @@ mod tests {
             None,
             9,
             None,
+            "direct",
         )
         .expect("insert");
 
@@ -617,6 +633,7 @@ mod tests {
                 None,
                 *duration,
                 None,
+                "direct",
             )
             .expect("insert");
         }
@@ -663,7 +680,7 @@ mod tests {
             ("end", "2026-01-01T00:00:02Z"),
         ] {
             repo.insert(
-                id, timestamp, None, None, "search", None, None, None, 10, None,
+                id, timestamp, None, None, "search", None, None, None, 10, None, "direct",
             )
             .expect("insert");
         }
@@ -683,7 +700,9 @@ mod tests {
         assert_eq!(repo.get_insights(from, from).unwrap().total_calls, 0);
         assert!(repo.get_insights(to, from).is_err());
         assert!(repo
-            .insert("invalid", "garbage", None, None, "search", None, None, None, 10, None)
+            .insert(
+                "invalid", "garbage", None, None, "search", None, None, None, 10, None, "direct",
+            )
             .is_err());
         assert_eq!(repo.purge_before("2026-01-01T08:00:01+08:00").unwrap(), 1);
         let _ = std::fs::remove_file(path);
@@ -704,6 +723,7 @@ mod tests {
             None,
             1,
             None,
+            "direct",
         )
         .expect("insert");
         repo.insert(
@@ -717,6 +737,7 @@ mod tests {
             None,
             2,
             None,
+            "direct",
         )
         .expect("insert");
 

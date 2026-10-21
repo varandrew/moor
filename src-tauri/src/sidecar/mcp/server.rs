@@ -1,5 +1,6 @@
 use super::jsonrpc;
 use crate::sidecar::http::AppState;
+use crate::sidecar::services::audit_recorder::{AuditRecorder, ToolCallRecord, ToolCallVia};
 use crate::sidecar::services::server_manager::ToolCallError;
 use crate::sidecar::services::tool_catalog::ToolCatalogEntry;
 use crate::sidecar::services::tool_visibility::ExposureMode;
@@ -126,8 +127,25 @@ async fn handle_tools_call(
         .unwrap_or_else(|| json!({}));
 
     if tool_name == SEARCH_TOOL_NAME {
+        let started = std::time::Instant::now();
         let catalog = state.server_manager.get_callable_tools().await;
         let result = search_catalog(&catalog, &arguments);
+        let hits = result["tools"].as_array().map_or(0, Vec::len);
+        let profile_id = state.server_manager.active_profile_id();
+        AuditRecorder::record(
+            &state.db,
+            ToolCallRecord {
+                profile_id: profile_id.as_deref(),
+                server_id: None,
+                tool_name: SEARCH_TOOL_NAME,
+                arguments: &arguments,
+                result: Some(&json!({ "hits": hits })),
+                error: None,
+                duration_ms: started.elapsed().as_millis() as i64,
+                agent_info,
+                via: ToolCallVia::Meta,
+            },
+        );
         return jsonrpc::make_response(
             id,
             json!({
@@ -148,10 +166,26 @@ async fn handle_tools_call(
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        return call_and_map(id, state, inner_name, inner_arguments, agent_info).await;
+        return call_and_map(
+            id,
+            state,
+            inner_name,
+            inner_arguments,
+            agent_info,
+            ToolCallVia::Meta,
+        )
+        .await;
     }
 
-    call_and_map(id, state, tool_name, arguments, agent_info).await
+    call_and_map(
+        id,
+        state,
+        tool_name,
+        arguments,
+        agent_info,
+        ToolCallVia::Direct,
+    )
+    .await
 }
 
 async fn call_and_map(
@@ -160,10 +194,11 @@ async fn call_and_map(
     tool_name: &str,
     arguments: Value,
     agent_info: Option<&str>,
+    via: ToolCallVia,
 ) -> Value {
     match state
         .server_manager
-        .call_tool(tool_name, arguments, agent_info)
+        .call_tool(tool_name, arguments, agent_info, via)
         .await
     {
         Ok(result) => jsonrpc::make_response(id, result),
@@ -852,5 +887,95 @@ process.stdin.on("data", (chunk) => {
         .await;
 
         assert_eq!(response["error"]["code"], jsonrpc::SERVER_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn audit_distinguishes_direct_meta_and_search_calls() {
+        let gateway = curated_gateway("audit-via").await;
+
+        handle_request(
+            jsonrpc::Id::Number(1),
+            "tools/call",
+            Some(serde_json::json!({ "name": "fake__report", "arguments": {} })),
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+        handle_request(
+            jsonrpc::Id::Number(2),
+            "tools/call",
+            Some(serde_json::json!({
+                "name": CALL_TOOL_NAME,
+                "arguments": { "name": "fake__echo", "arguments": {} }
+            })),
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+        search(
+            gateway.state.clone(),
+            serde_json::json!({ "query": "report" }),
+        )
+        .await;
+
+        let repo = AuditLogRepository::new(&gateway.db);
+        let rows = repo
+            .query_logs(None, None, None, None, Some(20), None)
+            .expect("audit rows");
+        let via_of = |tool: &str| {
+            rows.iter()
+                .find(|row| row.tool_name == tool)
+                .map(|row| row.via.clone())
+        };
+        assert_eq!(via_of("fake__report").as_deref(), Some("direct"));
+        assert_eq!(via_of("fake__echo").as_deref(), Some("meta"));
+        assert_eq!(via_of(SEARCH_TOOL_NAME).as_deref(), Some("meta"));
+
+        let search_row = rows
+            .iter()
+            .find(|row| row.tool_name == SEARCH_TOOL_NAME)
+            .expect("search row");
+        assert_eq!(
+            search_row
+                .result
+                .as_ref()
+                .and_then(|value| value["hits"].as_i64()),
+            Some(1),
+            "a search records how many tools matched, not the payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_policy_denial_is_audited() {
+        let gateway =
+            start_test_gateway_with_tools("audit-blocked", r#"[{ "name": "delete_repo" }]"#).await;
+        let profile_repo = ProfileRepository::new(&gateway.db);
+        let profile_id = profile_repo
+            .find_active_id()
+            .expect("read active profile")
+            .expect("active profile");
+        profile_repo
+            .update(&profile_id, None, None, Some("block_destructive"))
+            .expect("set policy");
+
+        handle_request(
+            jsonrpc::Id::Number(1),
+            "tools/call",
+            Some(serde_json::json!({ "name": "fake__delete_repo", "arguments": {} })),
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+
+        let repo = AuditLogRepository::new(&gateway.db);
+        let rows = repo
+            .query_logs(None, Some("fake__delete_repo"), None, None, Some(10), None)
+            .expect("audit rows");
+        assert_eq!(rows.len(), 1, "a refused call still leaves a record");
+        assert!(rows[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("blocked by risk policy")));
+        assert_eq!(repo.get_insights(None, None).unwrap().blocked_calls, 1);
     }
 }

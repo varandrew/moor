@@ -149,6 +149,11 @@ function InsightsPanel({
             {t("{count} tools need attention", { count: alertCount })}
           </Badge>
         )}
+        {(insights?.blockedCalls ?? 0) > 0 && (
+          <Badge variant="outline" className="text-[11px]">
+            {t("{count} calls blocked by policy", { count: insights.blockedCalls })}
+          </Badge>
+        )}
       </div>
 
       {/* Summary cards */}

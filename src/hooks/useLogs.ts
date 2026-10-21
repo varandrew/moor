@@ -65,6 +65,7 @@ const DEFAULT_INSIGHTS: LogInsights = {
   errorCalls: 0,
   errorRate: 0,
   avgDurationMs: null,
+  blockedCalls: 0,
   tools: [],
   servers: [],
 };

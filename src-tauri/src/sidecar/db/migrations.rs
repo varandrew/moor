@@ -59,7 +59,8 @@ pub fn run_migrations(db: &Database) -> Result<(), String> {
             result TEXT,
             error TEXT,
             duration_ms INTEGER,
-            agent_info TEXT
+            agent_info TEXT,
+            via TEXT NOT NULL DEFAULT 'direct'
         );
 
         CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp);
@@ -119,6 +120,7 @@ pub fn run_migrations(db: &Database) -> Result<(), String> {
         "risk_source",
         "TEXT NOT NULL DEFAULT 'heuristic'",
     )?;
+    ensure_column(db, "audit_logs", "via", "TEXT NOT NULL DEFAULT 'direct'")?;
     backfill_server_sort_order(db)?;
     normalize_audit_timestamps(db)?;
 
