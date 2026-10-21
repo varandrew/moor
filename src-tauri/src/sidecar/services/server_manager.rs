@@ -16,6 +16,7 @@ use crate::sidecar::db::profile_repo::ProfileRepository;
 use crate::sidecar::db::server_repo::{Server, ServerRepository};
 use crate::sidecar::db::tool_discovery_repo::{ToolDiscoveryRepository, ToolInsert};
 use crate::sidecar::db::Database;
+use crate::sidecar::mcp::transport::request_error::{RequestError, RequestErrorKind};
 use crate::sidecar::services::audit_recorder::{AuditRecorder, ToolCallRecord, ToolCallVia};
 use crate::sidecar::services::event_bus::{EventBus, Evt};
 use crate::sidecar::services::server_log::{DiagnosticAttempt, ServerDiagnostics};
@@ -55,6 +56,12 @@ pub enum ToolCallError {
     ServerUnavailable(String),
     /// 下游请求超时。
     Timeout(String),
+    /// 下游返回了带 code 的 JSON-RPC 错误，原样透传。
+    Downstream {
+        code: i64,
+        message: String,
+        data: Option<Value>,
+    },
     /// 其他执行失败。
     Execution(String),
 }
@@ -66,6 +73,9 @@ impl std::fmt::Display for ToolCallError {
             | Self::ServerUnavailable(message)
             | Self::Timeout(message)
             | Self::Execution(message) => formatter.write_str(message),
+            Self::Downstream { code, message, .. } => {
+                write!(formatter, "{message} (downstream code {code})")
+            }
             Self::PolicyDenied { risk_level, .. } => {
                 write!(formatter, "Tool blocked by risk policy ({risk_level})")
             }
@@ -73,13 +83,19 @@ impl std::fmt::Display for ToolCallError {
     }
 }
 
-/// 下游的执行错误是字符串，只能按关键字识别超时；其余一律归为执行失败。
-fn classify_call_failure(message: String) -> ToolCallError {
-    let lowered = message.to_lowercase();
-    if lowered.contains("timeout") || lowered.contains("timed out") {
-        ToolCallError::Timeout(message)
-    } else {
-        ToolCallError::Execution(message)
+/// 按错误的来源层分类，而不是靠错误文案。
+fn classify_request_error(error: RequestError) -> ToolCallError {
+    match error.kind {
+        RequestErrorKind::Rpc => match error.code {
+            Some(code) => ToolCallError::Downstream {
+                code,
+                message: error.message,
+                data: error.data,
+            },
+            None => ToolCallError::Execution(error.message),
+        },
+        RequestErrorKind::Timeout => ToolCallError::Timeout(error.message),
+        RequestErrorKind::Transport => ToolCallError::Execution(error.message),
     }
 }
 
@@ -461,25 +477,26 @@ impl ServerManager {
                     let server_name = tool.server_name.clone();
                     let tool_name = tool.tool_name.clone();
                     async {
+                        let unavailable = || {
+                            ToolCallError::ServerUnavailable(format!(
+                                "Server \"{server_name}\" is not running"
+                            ))
+                        };
                         let session_arc = {
                             let slots = self.slots.lock().await;
-                            let slot = slots.get(&server_id).ok_or_else(|| {
-                                format!("Server \"{server_name}\" is not running")
-                            })?;
-                            slot.session
-                                .clone()
-                                .ok_or_else(|| {
-                                    format!("Server \"{server_name}\" is not running")
-                                })
-                        }?;
+                            let slot = slots.get(&server_id).ok_or_else(unavailable)?;
+                            slot.session.clone().ok_or_else(unavailable)?
+                        };
 
                         let request_timeout_ms = self.get_timeout_settings().request_ms;
                         let mut client = session_arc.lock().await;
                         client.set_request_timeout_ms(request_timeout_ms);
-                        client.call_tool(&tool_name, args.clone()).await
+                        client
+                            .call_tool(&tool_name, args.clone())
+                            .await
+                            .map_err(classify_request_error)
                     }
                     .await
-                    .map_err(classify_call_failure)
                 }
                 ToolAccess::BlockedByRisk => Err(ToolCallError::PolicyDenied {
                     risk_level: tool.risk.as_str().to_string(),
@@ -1567,7 +1584,7 @@ process.stdin.on("data", (chunk) => {{
             &'a self,
             _tool_name: &'a str,
             _args: Value,
-        ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<Value, RequestError>> + Send + 'a>> {
             Box::pin(async move { Ok(serde_json::json!({})) })
         }
         fn disconnect(&mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {

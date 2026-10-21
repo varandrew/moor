@@ -30,7 +30,7 @@ pub trait McpSession: Send {
         &'a self,
         tool_name: &'a str,
         args: Value,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Value, RequestError>> + Send + 'a>>;
     fn disconnect(&mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
     fn set_request_timeout_ms(&mut self, request_timeout_ms: u32);
     fn alive_receiver(&self) -> Option<tokio::sync::watch::Receiver<bool>>;

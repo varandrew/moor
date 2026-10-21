@@ -217,6 +217,14 @@ async fn call_and_map(
         Err(ToolCallError::Timeout(err)) => {
             jsonrpc::make_error(id, jsonrpc::UPSTREAM_TIMEOUT, &err)
         }
+        Err(ToolCallError::Downstream {
+            code,
+            message,
+            data,
+        }) => match data {
+            Some(data) => jsonrpc::make_error_with_data(id, code, &message, data),
+            None => jsonrpc::make_error(id, code, &message),
+        },
         Err(ToolCallError::Execution(err)) => {
             jsonrpc::make_error(id, jsonrpc::INTERNAL_ERROR, &err)
         }
@@ -335,6 +343,10 @@ process.stdin.on("data", (chunk) => {
       const tools = __TOOLS__;
       result = { tools: tools.map((tool) => ({ name: tool.name, description: "Fake tool", inputSchema: { type: "object" } })) };
     } else if (request.method === "tools/call") {
+      if (request.params.name === "fail_with_data") {
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32010, message: "boom", data: { hint: "check input" } } }) + "\n");
+        continue;
+      }
       result = { content: [{ type: "text", text: JSON.stringify(request.params.arguments ?? {}) }] };
     }
     process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) + "\n");
@@ -1006,5 +1018,25 @@ process.stdin.on("data", (chunk) => {
         assert_eq!(names.len(), 2, "the empty profile still explains itself");
         assert!(names.contains(&SEARCH_TOOL_NAME));
         assert!(names.contains(&CALL_TOOL_NAME));
+    }
+
+    #[tokio::test]
+    async fn a_downstream_error_keeps_its_code_and_data() {
+        let gateway =
+            start_test_gateway_with_tools("downstream-error", r#"[{ "name": "fail_with_data" }]"#)
+                .await;
+
+        let response = handle_request(
+            jsonrpc::Id::Number(1),
+            "tools/call",
+            Some(serde_json::json!({ "name": "fake__fail_with_data", "arguments": {} })),
+            gateway.state.clone(),
+            Some("test-agent"),
+        )
+        .await;
+
+        assert_eq!(response["error"]["code"], -32010);
+        assert_eq!(response["error"]["message"], "boom");
+        assert_eq!(response["error"]["data"]["hint"], "check input");
     }
 }

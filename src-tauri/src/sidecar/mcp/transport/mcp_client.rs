@@ -95,17 +95,18 @@ impl McpClient {
             McpTransport::Stdio(t) => t
                 .send_request("tools/list", Some(serde_json::json!({})))
                 .await
-                .map_err(|err| self.enrich_stdio_error(&err))?,
+                .map_err(|error| self.stdio_error_message(error.message))?,
             McpTransport::Http(t) => {
                 let id = chrono::Utc::now().timestamp_millis();
                 t.send_request(id, "tools/list", Some(serde_json::json!({})))
-                    .await?
+                    .await
+                    .map_err(|error| error.message)?
             }
         };
         Ok(parse_tools_list(&result))
     }
 
-    pub async fn call_tool(&self, tool_name: &str, args: Value) -> Result<Value, String> {
+    pub async fn call_tool(&self, tool_name: &str, args: Value) -> Result<Value, RequestError> {
         let params = serde_json::json!({
             "name": tool_name,
             "arguments": args,
@@ -114,7 +115,7 @@ impl McpClient {
             McpTransport::Stdio(t) => t
                 .send_request("tools/call", Some(params))
                 .await
-                .map_err(|err| self.enrich_stdio_error(&err)),
+                .map_err(|error| self.enrich_stdio_error(error)),
             McpTransport::Http(t) => {
                 let id = chrono::Utc::now().timestamp_millis();
                 t.send_request(id, "tools/call", Some(params)).await
@@ -159,14 +160,17 @@ impl McpClient {
                 let _ = t
                     .send_request("initialize", Some(init_params))
                     .await
-                    .map_err(|err| t.with_startup_stderr_summary(err))?;
+                    .map_err(|error| t.with_startup_stderr_summary(error.message))?;
                 t.send_notification("notifications/initialized", Some(serde_json::json!({})))
                     .await
                     .map_err(|err| t.with_startup_stderr_summary(err))?;
             }
             McpTransport::Http(t) => {
                 let id = chrono::Utc::now().timestamp_millis();
-                let _ = t.send_request(id, "initialize", Some(init_params)).await?;
+                let _ = t
+                    .send_request(id, "initialize", Some(init_params))
+                    .await
+                    .map_err(|error| error.message)?;
                 t.send_notification("notifications/initialized", Some(serde_json::json!({})))
                     .await?;
             }
@@ -174,10 +178,18 @@ impl McpClient {
         Ok(())
     }
 
-    fn enrich_stdio_error(&self, err: &str) -> String {
+    /// 给 stdio 失败补上启动期 stderr 摘要，保留错误类别与下游 code/data。
+    fn enrich_stdio_error(&self, error: RequestError) -> RequestError {
+        RequestError {
+            message: self.stdio_error_message(error.message),
+            ..error
+        }
+    }
+
+    fn stdio_error_message(&self, message: String) -> String {
         match &self.transport {
-            McpTransport::Stdio(t) => t.with_startup_stderr_summary(err.to_string()),
-            McpTransport::Http(_) => err.to_string(),
+            McpTransport::Stdio(t) => t.with_startup_stderr_summary(message),
+            McpTransport::Http(_) => message,
         }
     }
 }
@@ -229,7 +241,7 @@ impl crate::sidecar::services::server_manager::McpSession for McpClient {
         &'a self,
         tool_name: &'a str,
         args: Value,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>>
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, RequestError>> + Send + 'a>>
     {
         Box::pin(async move { McpClient::call_tool(self, tool_name, args).await })
     }

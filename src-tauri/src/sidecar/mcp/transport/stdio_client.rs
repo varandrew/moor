@@ -151,10 +151,13 @@ impl StdioClientTransport {
         }
     }
 
-    pub async fn send_request(&self, method: &str, params: Option<Value>) -> Result<Value, String> {
+    pub async fn send_request(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, RequestError> {
         self.send_request_with_timeout(method, params, self.request_timeout)
             .await
-            .map_err(|error| error.message)
     }
 
     pub async fn send_request_with_timeout(
@@ -211,7 +214,7 @@ impl StdioClientTransport {
         })
         .await
         .map_err(|_| {
-            RequestError::from(format!(
+            RequestError::timeout(format!(
                 "request timed out after {}",
                 format_timeout_duration(timeout)
             ))

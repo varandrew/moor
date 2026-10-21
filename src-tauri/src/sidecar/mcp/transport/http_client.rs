@@ -67,10 +67,9 @@ impl HttpClientTransport {
         id: i64,
         method: &str,
         params: Option<Value>,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, RequestError> {
         self.send_request_with_timeout(id, method, params, self.request_timeout)
             .await
-            .map_err(|error| error.message)
     }
 
     pub async fn send_request_with_timeout(
@@ -83,7 +82,7 @@ impl HttpClientTransport {
         tokio::time::timeout(timeout, self.send_request_inner(id, method, params))
             .await
             .map_err(|_| {
-                RequestError::from(format!(
+                RequestError::timeout(format!(
                     "HTTP request timed out after {}",
                     format_timeout_duration(timeout)
                 ))
@@ -320,7 +319,8 @@ impl HttpClientTransport {
         loop {
             let event =
                 read_next_sse_event(&mut state.response, &mut state.buffer, self.request_timeout)
-                    .await?;
+                    .await
+                    .map_err(|error| error.message)?;
             if event.event.as_deref() == Some("endpoint") {
                 state.endpoint = resolve_sse_endpoint(&self.url, &event.data)?;
                 return Ok(state);
@@ -454,7 +454,7 @@ async fn read_next_sse_event(
     response: &mut reqwest::Response,
     buffer: &mut String,
     idle_timeout: Duration,
-) -> Result<SseEvent, String> {
+) -> Result<SseEvent, RequestError> {
     loop {
         if let Some(event) = take_sse_event(buffer) {
             return Ok(event);
@@ -462,14 +462,14 @@ async fn read_next_sse_event(
         let chunk = tokio::time::timeout(idle_timeout, response.chunk())
             .await
             .map_err(|_| {
-                format!(
+                RequestError::timeout(format!(
                     "SSE response timed out after {}",
                     format_timeout_duration(idle_timeout)
-                )
+                ))
             })?
-            .map_err(|e| format!("Failed to read SSE response: {e}"))?;
+            .map_err(|e| RequestError::from(format!("Failed to read SSE response: {e}")))?;
         let Some(chunk) = chunk else {
-            return Err("SSE stream closed before a response event".to_string());
+            return Err("SSE stream closed before a response event".into());
         };
         buffer.push_str(&String::from_utf8_lossy(&chunk));
     }
@@ -962,7 +962,7 @@ mod tests {
             .expect_err("JSON-RPC error body should be returned as a transport error");
 
         assert_eq!(
-            err,
+            err.message,
             "Remote MCP server error: Bad Request: No valid session ID provided"
         );
         server.abort();
@@ -991,7 +991,13 @@ mod tests {
             .await
             .expect_err("slow JSON response should time out");
 
-        assert!(err.contains("timed out"));
+        assert_eq!(
+            err.kind,
+            crate::sidecar::mcp::transport::request_error::RequestErrorKind::Timeout,
+            "{:?}",
+            err.message
+        );
+        assert!(err.message.contains("timed out"));
         server.abort();
     }
 
@@ -1026,7 +1032,7 @@ mod tests {
             .await
             .expect_err("SSE fallback request should use the overall request timeout");
 
-        assert!(err.contains("timed out after 50ms"));
+        assert!(err.message.contains("timed out after 50ms"));
         server.abort();
     }
 }

@@ -198,6 +198,8 @@ mod tests {
         assert_eq!(state.status, HealthStatus::Unhealthy);
         state.record(
             Err(RequestError {
+                kind: crate::sidecar::mcp::transport::request_error::RequestErrorKind::Transport,
+                data: None,
                 code: Some(-32601),
                 message: "Method not found".into(),
             }),
