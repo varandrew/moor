@@ -7,7 +7,7 @@ import type { ProfileToolGroup } from "@moor/types";
 /**
  * 切到策展模式前的置顶选择器。
  *
- * 只做展示与选择，写入由调用方负责：确认后先置顶再切模式，两步都由页面调度。
+ * 只做展示与选择，完整转换由 Profile Tool Governance 接纳。
  */
 export function PinPicker({
   groups,
@@ -53,7 +53,11 @@ export function PinPicker({
                     key={tool.toolName}
                     className="flex items-center gap-2 rounded-lg px-2 py-1 hover:bg-surface-300/40 cursor-pointer"
                   >
-                    <Checkbox checked={selected.has(key)} onCheckedChange={() => onToggle(item)} />
+                    <Checkbox
+                      disabled={busy}
+                      checked={selected.has(key)}
+                      onCheckedChange={() => onToggle(item)}
+                    />
                     <span className="font-mono text-xs text-cursor-dark truncate">
                       {tool.toolName}
                     </span>

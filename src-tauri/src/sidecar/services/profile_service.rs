@@ -4,7 +4,7 @@
 
 use crate::sidecar::db::profile_repo::{
     Profile, ProfileDetailServer, ProfileRepository, ProfileServerState, ProfileServerUpsertInput,
-    RemoveResult,
+    ProfileUpdateResult, RemoveResult,
 };
 use crate::sidecar::db::server_repo::ServerRepository;
 use crate::sidecar::db::Database;
@@ -70,6 +70,7 @@ impl ProfileService {
 
     pub fn update(
         db: &Database,
+        event_bus: &EventBus,
         id: &str,
         update: crate::sidecar::db::profile_repo::ProfileUpdate<'_>,
     ) -> Result<Profile, ProfileServiceError> {
@@ -87,10 +88,32 @@ impl ProfileService {
                 ));
             }
         }
-        ProfileRepository::new(db)
+        if update.initial_pins.is_some() && update.exposure_mode != Some("curated") {
+            return Err(ProfileServiceError::Validation(
+                "initialPins requires curated exposureMode".into(),
+            ));
+        }
+        let touches_exposure = update.exposure_mode.is_some() || update.risk_policy.is_some();
+        let profile = match ProfileRepository::new(db)
             .update(id, update)
             .map_err(ProfileServiceError::Internal)?
-            .ok_or_else(|| ProfileServiceError::NotFound("Profile not found".into()))
+        {
+            ProfileUpdateResult::Updated(profile) => profile,
+            ProfileUpdateResult::NotFound => {
+                return Err(ProfileServiceError::NotFound("Profile not found".into()))
+            }
+            ProfileUpdateResult::ServerNotInProfile(id) => {
+                return Err(ProfileServiceError::Validation(format!(
+                    "Server {id} not found in profile"
+                )))
+            }
+        };
+        if touches_exposure {
+            event_bus.emit(Evt::ToolsChanged {
+                reason: "profile".into(),
+            });
+        }
+        Ok(profile)
     }
 
     pub fn remove(db: &Database, id: &str) -> Result<(), ProfileServiceError> {
@@ -297,7 +320,10 @@ mod tests {
             )
             .expect("deny tool in focused profile");
 
-        let exposed: Vec<String> = ToolCatalogService::get_tool_catalog(&db, None, None)
+        let exposed: Vec<String> = ToolCatalogService::load_active_profile(&db)
+            .unwrap()
+            .resolve(None)
+            .listed_tools()
             .into_iter()
             .map(|entry| entry.exposed_name)
             .collect();
@@ -307,7 +333,10 @@ mod tests {
         let mut events = event_bus.subscribe();
         ProfileService::activate(&db, &event_bus, &focused.id).expect("activate focused");
 
-        let exposed: Vec<String> = ToolCatalogService::get_tool_catalog(&db, None, None)
+        let exposed: Vec<String> = ToolCatalogService::load_active_profile(&db)
+            .unwrap()
+            .resolve(None)
+            .listed_tools()
             .into_iter()
             .map(|entry| entry.exposed_name)
             .collect();

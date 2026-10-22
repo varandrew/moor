@@ -18,7 +18,7 @@ import {
   AlertTriangle,
 } from "lucide-react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
-import { useProfile, useProfiles, useProfileTools } from "@/hooks/useProfiles";
+import { useProfile, useProfileTools } from "@/hooks/useProfiles";
 import { useProfileGovernance, type ToolSelection } from "@/hooks/useProfileGovernance";
 import { DetailPageHeader } from "@/components/shared/DetailPageHeader";
 import { PageLoading } from "@/components/shared/PageLoading";
@@ -41,22 +41,6 @@ export function ProfileDetail() {
   const navigate = useNavigate();
   const { setServerEnabled, busy: isUpdatingServer } = useProfileGovernance(id);
   const { profile, isLoading: loading } = useProfile(id);
-  const { updateProfile } = useProfiles();
-  const [modeBusy, setModeBusy] = useState(false);
-
-  const changeProfile = async (updates: {
-    exposureMode?: ExposureMode;
-    riskPolicy?: RiskPolicy;
-  }) => {
-    if (!id) return;
-    setModeBusy(true);
-    try {
-      await updateProfile({ id, updates });
-    } finally {
-      setModeBusy(false);
-    }
-  };
-
   if (loading) {
     return <PageLoading message={t("Loading profile...")} />;
   }
@@ -151,9 +135,6 @@ export function ProfileDetail() {
         profileId={id}
         exposureMode={profile.exposureMode}
         riskPolicy={profile.riskPolicy}
-        modeBusy={modeBusy}
-        onChangeMode={(mode) => void changeProfile({ exposureMode: mode })}
-        onChangeRiskPolicy={(policy) => void changeProfile({ riskPolicy: policy })}
       />
     </div>
   );
@@ -163,20 +144,20 @@ function ToolGovernanceCard({
   profileId,
   exposureMode,
   riskPolicy,
-  modeBusy,
-  onChangeMode,
-  onChangeRiskPolicy,
 }: {
   profileId: string;
   exposureMode: ExposureMode;
   riskPolicy: RiskPolicy;
-  modeBusy: boolean;
-  onChangeMode: (mode: ExposureMode) => void;
-  onChangeRiskPolicy: (policy: RiskPolicy) => void;
 }) {
   const { t } = useTranslation();
   const { groups, isLoading } = useProfileTools(profileId);
-  const { setTools, setPinned, busy: governanceBusy } = useProfileGovernance(profileId);
+  const {
+    setTools,
+    setPinned,
+    setExposureMode,
+    setRiskPolicy,
+    busy: governanceBusy,
+  } = useProfileGovernance(profileId);
   const [searchParams, setSearchParams] = useSearchParams();
   const [search, setSearch] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -316,11 +297,9 @@ function ToolGovernanceCard({
 
   const confirmCuratedMode = async () => {
     if (!pinPicker) return;
-    if (pinPicker.length > 0) {
-      await setPinned(pinPicker, true);
+    if (await setExposureMode("curated", pinPicker)) {
+      setPinPicker(null);
     }
-    onChangeMode("curated");
-    setPinPicker(null);
   };
 
   const dismissHint = () => {
@@ -353,15 +332,15 @@ function ToolGovernanceCard({
           <Button
             size="sm"
             variant={exposureMode === "direct" ? "default" : "outline"}
-            disabled={modeBusy}
-            onClick={() => onChangeMode("direct")}
+            disabled={governanceBusy}
+            onClick={() => void setExposureMode("direct")}
           >
             {t("Direct listing")}
           </Button>
           <Button
             size="sm"
             variant={exposureMode === "curated" ? "default" : "outline"}
-            disabled={modeBusy}
+            disabled={governanceBusy}
             onClick={requestCuratedMode}
           >
             {t("Curated listing")}
@@ -373,16 +352,16 @@ function ToolGovernanceCard({
           <Button
             size="sm"
             variant={riskPolicy === "advisory" ? "default" : "outline"}
-            disabled={modeBusy}
-            onClick={() => onChangeRiskPolicy("advisory")}
+            disabled={governanceBusy}
+            onClick={() => void setRiskPolicy("advisory")}
           >
             {t("Advisory")}
           </Button>
           <Button
             size="sm"
             variant={riskPolicy === "block_destructive" ? "default" : "outline"}
-            disabled={modeBusy}
-            onClick={() => onChangeRiskPolicy("block_destructive")}
+            disabled={governanceBusy}
+            onClick={() => void setRiskPolicy("block_destructive")}
           >
             {t("Block destructive")}
           </Button>
@@ -399,7 +378,7 @@ function ToolGovernanceCard({
           <PinPicker
             groups={groups}
             selection={pinPicker}
-            busy={governanceBusy || modeBusy}
+            busy={governanceBusy}
             onToggle={(item) =>
               setPinPicker((prev) =>
                 prev?.some(

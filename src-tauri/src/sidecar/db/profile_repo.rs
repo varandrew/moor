@@ -1,4 +1,5 @@
 use super::Database;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +39,20 @@ pub struct ProfileUpdate<'a> {
     pub name: Option<&'a str>,
     pub exposure_mode: Option<&'a str>,
     pub risk_policy: Option<&'a str>,
+    pub initial_pins: Option<&'a [InitialPin]>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitialPin {
+    pub server_id: String,
+    pub tool_name: String,
+}
+
+pub enum ProfileUpdateResult {
+    Updated(Profile),
+    NotFound,
+    ServerNotInProfile(String),
 }
 
 /// 批量 upsert 的单项输入：enabled 与 disabled_tools 均为可选补丁，语义与单条接口一致。
@@ -85,6 +100,30 @@ fn map_profile(row: &rusqlite::Row<'_>) -> rusqlite::Result<Profile> {
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
+}
+
+fn write_profile_server(
+    conn: &Connection,
+    profile_id: &str,
+    item: &ProfileServerUpsertInput,
+) -> Result<(), String> {
+    let existing = conn.query_row(
+        "SELECT enabled, disabled_tools, pinned_tools FROM profile_servers WHERE profile_id = ?1 AND server_id = ?2",
+        rusqlite::params![profile_id, item.server_id],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+    ).optional().map_err(|e| e.to_string())?;
+    let (enabled, disabled, pinned) = resolve_profile_server_state(
+        existing,
+        item.enabled,
+        item.disabled_tools.as_ref(),
+        item.pinned_tools.as_ref(),
+    );
+    conn.execute(
+        "INSERT INTO profile_servers (profile_id, server_id, enabled, disabled_tools, pinned_tools) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(profile_id, server_id) DO UPDATE SET enabled = excluded.enabled, disabled_tools = excluded.disabled_tools, pinned_tools = excluded.pinned_tools",
+        rusqlite::params![profile_id, item.server_id, enabled, disabled, pinned],
+    ).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 pub struct ProfileRepository<'a> {
@@ -138,29 +177,50 @@ impl<'a> ProfileRepository<'a> {
             .and_then(|p| p.ok_or_else(|| "Created profile could not be reloaded".into()))
     }
 
-    pub fn update(&self, id: &str, update: ProfileUpdate<'_>) -> Result<Option<Profile>, String> {
-        let exists = self
-            .db
-            .query_one("SELECT id FROM profiles WHERE id = ?1", &[&id], |row| {
-                row.get::<_, String>(0)
-            })?;
-        if exists.is_none() {
-            return Ok(None);
-        }
-        if update.name.is_some() || update.exposure_mode.is_some() || update.risk_policy.is_some() {
-            let now = chrono::Utc::now().to_rfc3339();
-            self.db.run(
-                "UPDATE profiles SET name = COALESCE(?1, name), exposure_mode = COALESCE(?2, exposure_mode), risk_policy = COALESCE(?3, risk_policy), updated_at = ?4 WHERE id = ?5",
-                &[
-                    &update.name,
-                    &update.exposure_mode,
-                    &update.risk_policy,
-                    &now,
-                    &id,
-                ],
-            )?;
-        }
-        self.find_by_id(id)
+    pub fn update(
+        &self,
+        id: &str,
+        update: ProfileUpdate<'_>,
+    ) -> Result<ProfileUpdateResult, String> {
+        self.db.transaction(|conn| {
+            let exists = conn.query_row("SELECT id FROM profiles WHERE id = ?1", [id], |row| row.get::<_, String>(0))
+                .optional().map_err(|e| e.to_string())?;
+            if exists.is_none() {
+                return Ok(ProfileUpdateResult::NotFound);
+            }
+            let mut pins_by_server = std::collections::BTreeMap::<String, Vec<String>>::new();
+            for pin in update.initial_pins.unwrap_or_default() {
+                if !pins_by_server.contains_key(&pin.server_id) {
+                    let stored = conn.query_row(
+                        "SELECT pinned_tools FROM profile_servers WHERE profile_id = ?1 AND server_id = ?2",
+                        rusqlite::params![id, pin.server_id], |row| row.get::<_, String>(0),
+                    ).optional().map_err(|e| e.to_string())?;
+                    let Some(stored) = stored else {
+                        return Ok(ProfileUpdateResult::ServerNotInProfile(pin.server_id.clone()));
+                    };
+                    pins_by_server.insert(pin.server_id.clone(), serde_json::from_str(&stored).map_err(|e| e.to_string())?);
+                }
+                let pins = pins_by_server.get_mut(&pin.server_id).expect("server pins loaded");
+                if !pins.contains(&pin.tool_name) {
+                    pins.push(pin.tool_name.clone());
+                }
+            }
+            for (server_id, pinned_tools) in pins_by_server {
+                write_profile_server(conn, id, &ProfileServerUpsertInput {
+                    server_id, enabled: None, disabled_tools: None, pinned_tools: Some(pinned_tools),
+                })?;
+            }
+            if update.name.is_some() || update.exposure_mode.is_some() || update.risk_policy.is_some() {
+                conn.execute(
+                    "UPDATE profiles SET name = COALESCE(?1, name), exposure_mode = COALESCE(?2, exposure_mode), risk_policy = COALESCE(?3, risk_policy), updated_at = ?4 WHERE id = ?5",
+                    rusqlite::params![update.name, update.exposure_mode, update.risk_policy, chrono::Utc::now().to_rfc3339(), id],
+                ).map_err(|e| e.to_string())?;
+            }
+            conn.query_row(
+                "SELECT p.*, COUNT(ps.server_id) as server_count FROM profiles p LEFT JOIN profile_servers ps ON p.id = ps.profile_id WHERE p.id = ?1 GROUP BY p.id",
+                [id], map_profile,
+            ).map(ProfileUpdateResult::Updated).map_err(|e| e.to_string())
+        })
     }
 
     pub fn activate(&self, id: &str) -> Result<Option<Profile>, String> {
@@ -285,33 +345,7 @@ impl<'a> ProfileRepository<'a> {
     ) -> Result<(), String> {
         self.db.transaction(|conn| {
             for item in items {
-                let existing = match conn.query_row(
-                    "SELECT enabled, disabled_tools, pinned_tools FROM profile_servers WHERE profile_id = ?1 AND server_id = ?2",
-                    rusqlite::params![profile_id, item.server_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    },
-                ) {
-                    Ok(row) => Some(row),
-                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                    Err(e) => return Err(e.to_string()),
-                };
-                let (final_enabled, final_tools, final_pinned) = resolve_profile_server_state(
-                    existing,
-                    item.enabled,
-                    item.disabled_tools.as_ref(),
-                    item.pinned_tools.as_ref(),
-                );
-                conn.execute(
-                    "INSERT INTO profile_servers (profile_id, server_id, enabled, disabled_tools, pinned_tools) VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(profile_id, server_id) DO UPDATE SET enabled = excluded.enabled, disabled_tools = excluded.disabled_tools, pinned_tools = excluded.pinned_tools",
-                    rusqlite::params![profile_id, item.server_id, final_enabled, final_tools, final_pinned],
-                )
-                .map_err(|e| e.to_string())?;
+                write_profile_server(conn, profile_id, item)?;
             }
             Ok(())
         })

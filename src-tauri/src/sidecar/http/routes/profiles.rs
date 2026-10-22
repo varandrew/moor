@@ -76,6 +76,7 @@ struct UpdateBody {
     name: Option<String>,
     exposure_mode: Option<String>,
     risk_policy: Option<String>,
+    initial_pins: Option<Vec<crate::sidecar::db::profile_repo::InitialPin>>,
 }
 
 async fn update(
@@ -83,24 +84,18 @@ async fn update(
     Path(id): Path<String>,
     axum::Json(body): axum::Json<UpdateBody>,
 ) -> Result<Json<Value>, AppError> {
-    let touches_exposure = body.exposure_mode.is_some() || body.risk_policy.is_some();
     let profile = ProfileService::update(
         &state.db,
+        &state.event_bus,
         &id,
         crate::sidecar::db::profile_repo::ProfileUpdate {
             name: body.name.as_deref(),
             exposure_mode: body.exposure_mode.as_deref(),
             risk_policy: body.risk_policy.as_deref(),
+            initial_pins: body.initial_pins.as_deref(),
         },
     )
     .map_err(AppError::from)?;
-    if touches_exposure {
-        state
-            .event_bus
-            .emit(crate::sidecar::services::event_bus::Evt::ToolsChanged {
-                reason: "profile".into(),
-            });
-    }
     Ok(Json(
         serde_json::to_value(profile).map_err(|e| AppError::internal(e.to_string()))?,
     ))
@@ -250,6 +245,147 @@ mod tests {
 
     fn test_state(data_dir: std::path::PathBuf) -> Arc<AppState> {
         AppState::for_test(&data_dir)
+    }
+
+    fn curated_fixture() -> (std::path::PathBuf, Arc<AppState>, String) {
+        use crate::sidecar::db::server_repo::{ServerInsertInput, ServerRepository};
+        let dir = temp_data_dir(&format!("curated-transition-{}", uuid::Uuid::new_v4()));
+        let state = test_state(dir.clone());
+        let repo = ProfileRepository::new(&state.db);
+        let profile = repo.create("Curated transition").unwrap();
+        ServerRepository::new(&state.db)
+            .insert_one_with_id(
+                "srv-a",
+                0,
+                &ServerInsertInput {
+                    name: "Alpha".into(),
+                    connection_type: "stdio".into(),
+                    command: Some("node".into()),
+                    args: None,
+                    url: None,
+                    env: None,
+                    headers: None,
+                    working_dir: None,
+                    auto_start: false,
+                },
+            )
+            .unwrap();
+        repo.upsert_profile_servers_batch(
+            &profile.id,
+            &[crate::sidecar::db::profile_repo::ProfileServerUpsertInput {
+                server_id: "srv-a".into(),
+                enabled: Some(false),
+                disabled_tools: Some(vec!["undiscovered".into()]),
+                pinned_tools: Some(vec!["old".into()]),
+            }],
+        )
+        .unwrap();
+        (dir, state, profile.id)
+    }
+
+    async fn put_profile(state: Arc<AppState>, id: &str, body: Value) -> axum::response::Response {
+        router()
+            .with_state(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/profiles/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn curated_transition_commits_pins_and_mode_and_emits_once() {
+        let (dir, state, id) = curated_fixture();
+        let mut events = state.event_bus.subscribe();
+        let response = put_profile(
+            state.clone(),
+            &id,
+            json!({
+                "exposureMode": "curated", "initialPins": [
+                    {"serverId": "srv-a", "toolName": "new"},
+                    {"serverId": "srv-a", "toolName": "new"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let (profile, servers) = ProfileService::get_detail(&state.db, &id).unwrap();
+        assert_eq!(profile.exposure_mode, "curated");
+        assert_eq!(servers[0].profile_server.pinned_tools, vec!["old", "new"]);
+        assert_eq!(
+            servers[0].profile_server.disabled_tools,
+            vec!["undiscovered"]
+        );
+        assert!(!servers[0].profile_server.enabled);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(crate::sidecar::services::event_bus::Evt::ToolsChanged { .. })
+        ));
+        assert!(events.try_recv().is_err());
+        assert_eq!(
+            put_profile(
+                state.clone(),
+                &id,
+                json!({"exposureMode": "curated", "initialPins": []})
+            )
+            .await
+            .status(),
+            axum::http::StatusCode::OK
+        );
+        let (_, servers) = ProfileService::get_detail(&state.db, &id).unwrap();
+        assert_eq!(servers[0].profile_server.pinned_tools, vec!["old", "new"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn curated_transition_rolls_back_pins_when_mode_write_fails() {
+        let (dir, state, id) = curated_fixture();
+        state.db.exec("CREATE TRIGGER fail_mode BEFORE UPDATE ON profiles BEGIN SELECT RAISE(ABORT, 'mode write failed'); END;").unwrap();
+        let mut events = state.event_bus.subscribe();
+        let response = put_profile(
+            state.clone(),
+            &id,
+            json!({
+                "exposureMode": "curated", "initialPins": [{"serverId": "srv-a", "toolName": "new"}]
+            }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let (profile, servers) = ProfileService::get_detail(&state.db, &id).unwrap();
+        assert_eq!(profile.exposure_mode, "direct");
+        assert_eq!(servers[0].profile_server.pinned_tools, vec!["old"]);
+        assert!(events.try_recv().is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn curated_transition_rejects_invalid_selections_without_writes() {
+        let (dir, state, id) = curated_fixture();
+        let mut events = state.event_bus.subscribe();
+        for payload in [
+            json!({"exposureMode": "direct", "initialPins": []}),
+            json!({"exposureMode": "curated", "initialPins": [
+                {"serverId": "srv-a", "toolName": "new"}, {"serverId": "missing", "toolName": "new"}
+            ]}),
+        ] {
+            assert_eq!(
+                put_profile(state.clone(), &id, payload).await.status(),
+                axum::http::StatusCode::BAD_REQUEST
+            );
+            let (profile, servers) = ProfileService::get_detail(&state.db, &id).unwrap();
+            assert_eq!(profile.exposure_mode, "direct");
+            assert_eq!(servers[0].profile_server.pinned_tools, vec!["old"]);
+            assert!(events.try_recv().is_err());
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

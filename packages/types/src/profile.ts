@@ -4,6 +4,13 @@ import type { RiskPolicy, ToolDetail } from "./tool.js";
 /** Profile 的曝光模式：全量直出，或只直出置顶工具。 */
 export type ExposureMode = "direct" | "curated";
 
+export interface ProfileUpdateInput {
+  name?: string;
+  exposureMode?: ExposureMode;
+  riskPolicy?: RiskPolicy;
+  initialPins?: Array<{ serverId: string; toolName: string }>;
+}
+
 export interface Profile {
   id: string;
   name: string;

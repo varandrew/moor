@@ -11,7 +11,6 @@ pub use crate::sidecar::services::tool_search::SEARCH_TOOL_NAME;
 /// 策展模式下注入的转发元工具。
 pub const CALL_TOOL_NAME: &str = "moor_call_tool";
 
-
 /// Handle an incoming MCP JSON-RPC request and produce a response.
 /// This implements the MCP Gateway: aggregates tools from all running servers
 /// and routes tool calls to the correct server.
@@ -47,7 +46,11 @@ fn handle_initialize(id: jsonrpc::Id) -> serde_json::Value {
 }
 
 async fn handle_tools_list(id: jsonrpc::Id, state: Arc<AppState>) -> serde_json::Value {
-    let catalog = state.server_manager.get_tool_catalog(None).await;
+    let exposure = match state.server_manager.tool_exposure().await {
+        Ok(exposure) => exposure,
+        Err(error) => return jsonrpc::make_error(id, jsonrpc::INTERNAL_ERROR, &error.to_string()),
+    };
+    let catalog = exposure.listed_tools();
     let mut tools: Vec<serde_json::Value> = catalog
         .iter()
         .map(|tool| {
@@ -62,10 +65,7 @@ async fn handle_tools_list(id: jsonrpc::Id, state: Arc<AppState>) -> serde_json:
             })
         })
         .collect();
-    if matches!(
-        state.server_manager.active_exposure_mode(),
-        ExposureMode::Curated
-    ) {
+    if matches!(exposure.mode, ExposureMode::Curated) {
         tools.extend(meta_tool_definitions());
     }
     jsonrpc::make_response(id, json!({ "tools": tools }))
@@ -124,13 +124,19 @@ async fn handle_tools_call(
         .unwrap_or_else(|| json!({}));
 
     if tool_name == SEARCH_TOOL_NAME {
-        let outcome = crate::sidecar::services::tool_search::search(
+        let outcome = match crate::sidecar::services::tool_search::search(
             &state.server_manager,
             &state.db,
             &arguments,
             agent_info,
         )
-        .await;
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return jsonrpc::make_error(id, jsonrpc::INTERNAL_ERROR, &error.to_string())
+            }
+        };
         return jsonrpc::make_response(
             id,
             json!({

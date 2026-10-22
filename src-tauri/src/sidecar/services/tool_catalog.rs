@@ -1,6 +1,6 @@
 use crate::sidecar::db::profile_repo::ProfileRepository;
 use crate::sidecar::db::tool_discovery_repo::{
-    ProfileTool, ToolDiscovery, ToolDiscoveryRepository,
+    map_profile_tool, ProfileTool, ToolDiscovery, ToolDiscoveryRepository,
 };
 use crate::sidecar::db::Database;
 use crate::sidecar::services::tool_risk::{RiskLevel, RiskPolicy};
@@ -35,81 +35,81 @@ pub struct ToolDetail {
 
 pub struct ToolCatalogService;
 
-/// 一次解析出的 Profile 工具集与它的两项曝光设置。
-/// 三个读取入口共用它，避免同一段「取 Active Profile + 取工具」重复三遍。
-struct LoadedProfileTools {
+/// 同一次数据库读取固定 Profile 归属、策略与全部命名输入。
+pub(crate) struct LoadedProfileTools {
+    profile_id: Option<String>,
     tools: Vec<ProfileTool>,
     mode: ExposureMode,
     policy: RiskPolicy,
 }
 
-fn load_profile_tools(db: &Database, profile_id: Option<&str>) -> Option<LoadedProfileTools> {
-    let profile_repo = ProfileRepository::new(db);
-    let id = match profile_id {
-        Some(id) => id.to_string(),
-        None => profile_repo.find_active_id().ok().flatten()?,
+pub(crate) struct ToolExposure {
+    pub profile_id: Option<String>,
+    pub mode: ExposureMode,
+    pub tools: Vec<ToolVisibility>,
+}
+
+impl ToolExposure {
+    pub fn listed_tools(&self) -> Vec<ToolCatalogEntry> {
+        project_catalog(&self.tools, Selection::Listed)
+    }
+
+    pub fn callable_tools(&self) -> Vec<ToolCatalogEntry> {
+        project_catalog(&self.tools, Selection::Callable)
+    }
+}
+
+impl LoadedProfileTools {
+    pub fn resolve(self, callable_ids: Option<&HashSet<String>>) -> ToolExposure {
+        ToolExposure {
+            profile_id: self.profile_id,
+            mode: self.mode,
+            tools: resolve_tool_visibility(&self.tools, callable_ids, self.mode, self.policy),
+        }
+    }
+}
+
+fn load_profile_tools(db: &Database) -> Result<LoadedProfileTools, String> {
+    let rows = db.query_all(
+        "SELECT p.id AS profile_id, p.exposure_mode, p.risk_policy,
+                ps.server_id, ps.enabled, ms.name AS server_name, ps.disabled_tools, ps.pinned_tools,
+                td.tool_name, td.description, td.input_schema, td.risk_level
+         FROM profiles p
+         LEFT JOIN profile_servers ps ON ps.profile_id = p.id
+         LEFT JOIN mcp_servers ms ON ms.id = ps.server_id
+         LEFT JOIN tool_discoveries td ON td.server_id = ms.id
+         WHERE p.is_active = 1
+         ORDER BY ms.name ASC, td.tool_name ASC",
+        &[],
+        |row| {
+            let tool = if row.get::<_, Option<String>>("tool_name")?.is_some() {
+                Some(map_profile_tool(row)?)
+            } else { None };
+            Ok((row.get::<_, String>("profile_id")?, row.get::<_, String>("exposure_mode")?, row.get::<_, String>("risk_policy")?, tool))
+        },
+    )?;
+    let mut loaded = LoadedProfileTools {
+        profile_id: None,
+        mode: ExposureMode::Direct,
+        policy: RiskPolicy::Advisory,
+        tools: vec![],
     };
-    let tools = ToolDiscoveryRepository::new(db)
-        .find_by_profile_id(&id)
-        .ok()?;
-    let profile = profile_repo.find_by_id(&id).ok().flatten();
-    let mode = profile
-        .as_ref()
-        .map(|profile| ExposureMode::from_db(&profile.exposure_mode))
-        .unwrap_or(ExposureMode::Direct);
-    let policy = profile
-        .as_ref()
-        .map(|profile| RiskPolicy::from_db(&profile.risk_policy))
-        .unwrap_or(RiskPolicy::Advisory);
-    Some(LoadedProfileTools { tools, mode, policy })
+    for (id, mode, policy, tool) in rows {
+        if loaded.profile_id.is_none() {
+            loaded.profile_id = Some(id);
+            loaded.mode = ExposureMode::from_db(&mode);
+            loaded.policy = RiskPolicy::from_db(&policy);
+        }
+        if let Some(tool) = tool {
+            loaded.tools.push(tool);
+        }
+    }
+    Ok(loaded)
 }
 
 impl ToolCatalogService {
-    pub fn get_tool_catalog(
-        db: &Database,
-        profile_id: Option<&str>,
-        visible_server_ids: Option<&std::collections::HashSet<String>>,
-    ) -> Vec<ToolCatalogEntry> {
-        let Some(loaded) = load_profile_tools(db, profile_id) else {
-            return vec![];
-        };
-        catalog_entries(
-            &loaded.tools,
-            visible_server_ids,
-            loaded.mode,
-            loaded.policy,
-            Selection::Listed,
-        )
-    }
-
-    /// `tools/call` 的归属解析用：策展模式下未置顶的工具仍可被调用。
-    pub fn get_callable_tool_catalog(
-        db: &Database,
-        profile_id: Option<&str>,
-        visible_server_ids: Option<&std::collections::HashSet<String>>,
-    ) -> Vec<ToolCatalogEntry> {
-        let Some(loaded) = load_profile_tools(db, profile_id) else {
-            return vec![];
-        };
-        catalog_entries(
-            &loaded.tools,
-            visible_server_ids,
-            loaded.mode,
-            loaded.policy,
-            Selection::Callable,
-        )
-    }
-
-    /// `tools/call` 的错误分类需要完整判定（含被策略拦下的工具），而不只是可调用集合。
-    pub fn resolve_profile_tools(
-        db: &Database,
-        profile_id: Option<&str>,
-        visible_server_ids: Option<&std::collections::HashSet<String>>,
-    ) -> Vec<ToolVisibility> {
-        let Some(loaded) = load_profile_tools(db, profile_id) else {
-            return vec![];
-        };
-        resolve_tool_visibility(&loaded.tools, visible_server_ids, loaded.mode, loaded.policy)
+    pub(crate) fn load_active_profile(db: &Database) -> Result<LoadedProfileTools, String> {
+        load_profile_tools(db)
     }
 
     pub fn get_tool_details(
@@ -241,27 +241,21 @@ enum Selection {
     Callable,
 }
 
-fn catalog_entries(
-    profile_tools: &[ProfileTool],
-    callable_server_ids: Option<&HashSet<String>>,
-    mode: ExposureMode,
-    policy: RiskPolicy,
-    selection: Selection,
-) -> Vec<ToolCatalogEntry> {
-    resolve_tool_visibility(profile_tools, callable_server_ids, mode, policy)
-        .into_iter()
+fn project_catalog(tools: &[ToolVisibility], selection: Selection) -> Vec<ToolCatalogEntry> {
+    tools
+        .iter()
         .filter(|item| match selection {
             Selection::Listed => item.listed,
             Selection::Callable => item.access.is_callable(),
         })
         .filter_map(|visible| {
             Some(ToolCatalogEntry {
-                server_name: visible.server_name,
+                server_name: visible.server_name.clone(),
                 risk_level: visible.risk.as_str().to_string(),
-                tool_name: visible.tool_name,
-                exposed_name: visible.exposed_name?,
-                description: visible.description,
-                input_schema: visible.input_schema,
+                tool_name: visible.tool_name.clone(),
+                exposed_name: visible.exposed_name.clone()?,
+                description: visible.description.clone(),
+                input_schema: visible.input_schema.clone(),
             })
         })
         .collect()
@@ -390,7 +384,10 @@ mod tests {
             )
             .expect("failed to disable tool");
 
-        let exposed_names: Vec<_> = ToolCatalogService::get_tool_catalog(&db, None, None)
+        let exposed_names: Vec<_> = ToolCatalogService::load_active_profile(&db)
+            .unwrap()
+            .resolve(None)
+            .listed_tools()
             .into_iter()
             .map(|tool| tool.exposed_name)
             .collect();

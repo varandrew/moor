@@ -45,7 +45,27 @@ async fn refresh_tools(
         .server_manager
         .refresh_server_tools(&id)
         .await
-        .map_err(|message| AppError::conflict("SERVER_NOT_RUNNING", message))?;
+        .map_err(|error| {
+            use crate::sidecar::services::server_manager::ToolRefreshError;
+            match error {
+                ToolRefreshError::NotFound => AppError::not_found("Server not found"),
+                ToolRefreshError::NotRunning => {
+                    AppError::conflict("SERVER_NOT_RUNNING", "Server is not running")
+                }
+                ToolRefreshError::Changed => AppError::conflict(
+                    "SERVER_CHANGED",
+                    "Server changed while refreshing tools. Refresh again.",
+                ),
+                ToolRefreshError::Upstream(message) => AppError::upstream(
+                    "TOOL_DISCOVERY_FAILED",
+                    message,
+                    "Failed to refresh tools from the server.",
+                ),
+                ToolRefreshError::Storage(message) => {
+                    AppError::internal_public(message, "Failed to save discovered tools.")
+                }
+            }
+        })?;
     Ok(Json(serde_json::json!({ "tools": count })))
 }
 

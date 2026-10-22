@@ -15,7 +15,7 @@ The single Profile in effect for all Agents at a time; its server/tool toggles d
 _Avoid_: current profile, selected profile.
 
 **Hot-Swap**:
-变更 Active Profile 而不主动断开 Agent；后续 `tools/list` 和新接受的 `tools/call` 使用新 Profile。已解析的调用保留原 Tool Call Context。只影响暴露的 Tool，不改变 Server 的运行状态。激活时发送 `profile:activated`，前端据此使缓存失效。
+变更 Active Profile 而不主动断开 Agent；后续 `tools/list` 和新接受的 `tools/call` 使用新 Profile。已解析的调用保留原 Tool Call Context。一次 Tool Exposure 读取固定 Profile、曝光模式、Tool Policy 和 Tool 行；Hot-Swap 不将已开始的读取拼成新旧 Profile 混合结果。只影响暴露的 Tool，不改变 Server 的运行状态。激活时发送 `profile:activated`，前端据此使缓存失效。
 _Avoid_: reload, switch.
 
 **Tool Call Context**:
@@ -44,6 +44,28 @@ _Avoid_: capability, function.
 The join of a Profile and Server carrying `enabled` and the `disabled_tools` deny list.
 _Avoid_: membership, assignment.
 
+### Curation & policy
+
+**Tool Exposure**:
+网关向 Agent 发布 Tool 的方式。两种模式：Direct（Profile 内全部启用的 Tool 直出）与 Curated（置顶 Tool 直出，其余按需发现）。一个 Profile 同时只有一种模式。读取存储失败时明确返回错误，只有确实没有 Active Profile 时才返回空清单；空的 Curated Profile 仍保留其元工具。
+_Avoid_: 工具过滤、白名单模式、懒加载。
+
+**Curated Exposure**:
+Tool Exposure 的策展模式：Profile 置顶的 Tool 直接出现在 `tools/list`，其余 Tool 经网关的检索与转发元工具发现和调用；两条路径共用同一套 Tool Call Context 与 Audit Log。进入 Curated Exposure 时，追加所选 Pinned Tool 与切换模式一同提交；任一步失败均保留原状态。空选择不清空已有置顶。
+_Avoid_: tool search mode、动态工具。
+
+**Pinned Tool**:
+在 Profile 内标记为常驻直出的 Tool。未置顶的 Tool 仅在 Curated Exposure 下按需可见。
+_Avoid_: 常用工具、收藏。
+
+**Tool Policy**:
+Profile 级的 Tool 准入规则，在 `tools/list`（过滤）与 `tools/call`（结构化拒绝）两层同时生效，并记录拒绝原因。deny 优先于 allow。
+_Avoid_: 权限、安全策略（过于宽泛）。
+
+**Moorfile**:
+可导出的单机 Profile 包，描述 Profile、Server 与 Tool Policy，密钥以占位符表示而不含真实值。
+_Avoid_: 备份、导出文件。
+
 ### Import & observability
 
 **Config Import**:
@@ -67,7 +89,7 @@ _Avoid_: history, trace.
 Names for deepened modules from the 2026-05-29 architecture review, updated for the single-Rust decision (ADR-0001).
 
 **Server Runtime**:
-管理 Server 完整生命周期的 deep module，统一 registry、状态机、会话、Tool 清单、Tool 调用与审计归属。规范实现为 Rust `server_manager.rs` 及域内文件 `server_manager/{status,session,errors,health}.rs`。`call_tool(exposed_name, arguments, agent_info)` interface 一次解析 Tool Call Context，完成执行、计时与审计，区分 Tool 不可用和执行失败；MCP 协议层只负责参数校验与响应编码。
+管理 Server 完整生命周期的 deep module，统一 registry、状态机、会话、Tool 清单、Tool 调用与审计归属。规范实现为 Rust `server_manager.rs` 及域内文件 `server_manager/{status,session,errors,health}.rs`。`call_tool(exposed_name, arguments, agent_info)` interface 一次解析 Tool Call Context，完成执行、计时与审计，区分 Tool 不可用和执行失败；MCP 协议层只负责参数校验与响应编码。ToolDiscovery 仅在仍属于当前启动代次且保存成功时被接纳并发布变更；启动时保存失败须断开新会话并报告启动失败。手动刷新保存失败保留原清单与运行状态，停止或重启导致的过期结果须明确报告失效。
 _Avoid_: ServerManager, ServerService (the split).
 
 **Settings**:
@@ -83,7 +105,7 @@ The pure reducer (frontend) that resolves a Server's displayed status from base 
 _Avoid_: server patch utils, status merge, inline cache writes in hooks.
 
 **Profile Tool Governance**:
-管理 Profile 内 Tool 的启禁状态，统一单项、整组和批量操作。同一 Profile 的治理写入按序执行；Undo 恢复操作前的禁用清单，仅在该 Profile 后续写入尚未成功时有效。未发现的 Tool 仍保留其既有禁用状态。
+管理 Profile 内 Tool 的启禁状态，统一单项、整组和批量操作。同一 Profile 的启禁、置顶、曝光模式与风险策略写入按序执行；切换失败保留界面选择，成功后使旧 Undo 失效。模式切换不提供 Undo。启禁与置顶的 Undo 恢复操作前的相应清单，仅在该 Profile 后续写入尚未成功时有效。未发现的 Tool 仍保留其既有禁用状态。
 _Avoid_: 工具快照工具集、页面内禁用清单计算。
 
 **Server Diagnostics**:

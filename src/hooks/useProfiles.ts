@@ -6,13 +6,7 @@ import { routes } from "@/lib/api-routes";
 import { serverKeys, profileKeys, logKeys } from "@/lib/query-keys";
 import { useSSEEvent } from "@/contexts/SSEContext";
 import { getErrorMessage } from "@/lib/utils";
-import type {
-  ExposureMode,
-  Profile,
-  ProfileDetail,
-  ProfileToolGroup,
-  RiskPolicy,
-} from "@moor/types";
+import type { Profile, ProfileDetail, ProfileToolGroup } from "@moor/types";
 
 export function useProfiles() {
   const queryClient = useQueryClient();
@@ -69,24 +63,6 @@ export function useProfiles() {
     },
   });
 
-  const updateProfile = useMutation({
-    mutationFn: async ({
-      id,
-      updates,
-    }: {
-      id: string;
-      updates: { name?: string; exposureMode?: ExposureMode; riskPolicy?: RiskPolicy };
-    }) => {
-      await apiPut(routes.profiles.update(id), updates);
-      invalidateProfileUndo(queryClient, id);
-      return id;
-    },
-    onSuccess: (id) => {
-      void queryClient.invalidateQueries({ queryKey: profileKeys.list() });
-      void queryClient.invalidateQueries({ queryKey: profileKeys.detail(id) });
-    },
-  });
-
   const cloneProfile = useMutation({
     mutationFn: async ({ sourceId, name }: { sourceId: string; name: string }) =>
       apiPost<Profile>(routes.profiles.clone(sourceId), { name }),
@@ -103,7 +79,6 @@ export function useProfiles() {
     createProfile: createProfile.mutateAsync,
     activateProfile: activateProfile.mutateAsync,
     deleteProfile: deleteProfile.mutateAsync,
-    updateProfile: updateProfile.mutateAsync,
     cloneProfile: cloneProfile.mutateAsync,
   };
 }

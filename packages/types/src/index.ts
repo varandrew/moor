@@ -21,6 +21,7 @@ export type {
   ProfileServerState,
   ProfileServerUpsert,
   ProfileToolGroup,
+  ProfileUpdateInput,
 } from "./profile.js";
 export type { MCPTool, ToolCatalogEntry } from "./mcp.js";
 export type { RiskLevel, RiskPolicy, ToolDetail } from "./tool.js";

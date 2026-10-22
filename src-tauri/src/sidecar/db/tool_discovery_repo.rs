@@ -49,6 +49,26 @@ fn map_tool_discovery(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolDiscovery
     })
 }
 
+pub(crate) fn map_profile_tool(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProfileTool> {
+    let disabled_tools_str: String = row.get("disabled_tools")?;
+    let pinned_tools_str: String = row.get("pinned_tools")?;
+    let input_schema_str: Option<String> = row.get("input_schema")?;
+    let tool_name: String = row.get("tool_name")?;
+    let risk_level: String = row.get("risk_level")?;
+    let pinned_tools: Vec<String> = serde_json::from_str(&pinned_tools_str).unwrap_or_default();
+    Ok(ProfileTool {
+        server_id: row.get("server_id")?,
+        server_name: row.get("server_name")?,
+        enabled: row.get::<_, i64>("enabled")? != 0,
+        disabled_tools: serde_json::from_str(&disabled_tools_str).unwrap_or_default(),
+        pinned: pinned_tools.contains(&tool_name),
+        risk_level,
+        tool_name,
+        description: row.get("description")?,
+        input_schema: input_schema_str.and_then(|s| serde_json::from_str(&s).ok()),
+    })
+}
+
 pub struct ToolDiscoveryRepository<'a> {
     pub db: &'a Database,
 }
@@ -78,16 +98,15 @@ impl<'a> ToolDiscoveryRepository<'a> {
     ) -> Result<(), String> {
         // 重新发现会整表替换；用户手动纠正过的风险等级必须先取出来再写回，
         // 否则每次刷新工具都会把纠正结果冲掉。
-        let overrides: HashMap<String, String> = self
-            .db
-            .query_all(
-                "SELECT tool_name, risk_level FROM tool_discoveries WHERE server_id = ?1 AND risk_source = 'user'",
-                &[&server_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )?
-            .into_iter()
-            .collect();
         self.db.transaction(|conn| {
+            let overrides: HashMap<String, String> = {
+                let mut statement = conn.prepare(
+                    "SELECT tool_name, risk_level FROM tool_discoveries WHERE server_id = ?1 AND risk_source = 'user'",
+                ).map_err(|e| e.to_string())?;
+                let rows = statement.query_map([server_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+                    .map_err(|e| e.to_string())?;
+                rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?
+            };
             conn.execute(
                 "DELETE FROM tool_discoveries WHERE server_id = ?1",
                 [server_id],
@@ -156,26 +175,7 @@ impl<'a> ToolDiscoveryRepository<'a> {
              WHERE ps.profile_id = ?1
              ORDER BY ms.name ASC, td.tool_name ASC",
             &[&profile_id],
-            |row| {
-                let disabled_tools_str: String = row.get("disabled_tools")?;
-                let pinned_tools_str: String = row.get("pinned_tools")?;
-                let input_schema_str: Option<String> = row.get("input_schema")?;
-                let tool_name: String = row.get("tool_name")?;
-                let risk_level: String = row.get("risk_level")?;
-                let pinned_tools: Vec<String> =
-                    serde_json::from_str(&pinned_tools_str).unwrap_or_default();
-                Ok(ProfileTool {
-                    server_id: row.get("server_id")?,
-                    server_name: row.get("server_name")?,
-                    enabled: row.get::<_, i64>("enabled")? != 0,
-                    disabled_tools: serde_json::from_str(&disabled_tools_str).unwrap_or_default(),
-                    pinned: pinned_tools.contains(&tool_name),
-                    risk_level,
-                    tool_name,
-                    description: row.get("description")?,
-                    input_schema: input_schema_str.and_then(|s| serde_json::from_str(&s).ok()),
-                })
-            },
+            map_profile_tool,
         )
     }
 

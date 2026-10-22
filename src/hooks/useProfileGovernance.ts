@@ -9,7 +9,13 @@ import { toast } from "sonner";
 import { api, apiPut } from "@/lib/api/client";
 import { routes } from "@/lib/api-routes";
 import { profileKeys, serverKeys } from "@/lib/query-keys";
-import type { ProfileDetail, ProfileServerUpsert } from "@moor/types";
+import type {
+  ExposureMode,
+  ProfileDetail,
+  ProfileServerUpsert,
+  ProfileUpdateInput,
+  RiskPolicy,
+} from "@moor/types";
 
 export interface ToolSelection {
   serverId: string;
@@ -31,13 +37,18 @@ export function invalidateProfileUndo(client: QueryClient, profileId: string) {
 }
 
 type Change =
+  | { kind: "profile"; updates: Omit<ProfileUpdateInput, "name"> }
   | { kind: "tools"; selection: ToolSelection[]; enabled: boolean; message?: string }
   | { kind: "pinned"; selection: ToolSelection[]; pinned: boolean; message?: string }
   | { kind: "server"; serverId: string; enabled: boolean }
   | { kind: "undo"; undo: Undo };
 
 // 每次操作固定 Profile，toast 跨页面存活时也不会继承新路由的写入目标。
-async function applyChange(client: QueryClient, profileId: string | undefined, change: Change) {
+export async function applyChange(
+  client: QueryClient,
+  profileId: string | undefined,
+  change: Change,
+) {
   const mutation = new MutationObserver(client, {
     mutationKey: ["profile-governance", profileId],
     scope: { id: `profile-governance:${profileId}` },
@@ -45,6 +56,11 @@ async function applyChange(client: QueryClient, profileId: string | undefined, c
       if (!profileId) throw new Error("Profile not found");
       let updates: ProfileServerUpsert[];
       const before: ProfileServerUpsert[] = [];
+      if (change.kind === "profile") {
+        await apiPut(routes.profiles.update(profileId), change.updates);
+        invalidateProfileUndo(client, profileId);
+        return { updates: [], before };
+      }
       if (change.kind === "undo") {
         if (undoByClient.get(client)?.get(profileId) !== change.undo) {
           throw new Error("Undo is no longer available because this profile changed");
@@ -101,6 +117,13 @@ async function applyChange(client: QueryClient, profileId: string | undefined, c
       return { updates, before };
     },
     onSuccess: async ({ updates, before }, change) => {
+      if (change.kind === "profile") {
+        await Promise.all([
+          client.invalidateQueries({ queryKey: profileKeys.list() }),
+          client.invalidateQueries({ queryKey: serverKeys.list() }),
+        ]);
+        return;
+      }
       if (!profileId || updates.length === 0) return;
       if ((change.kind === "tools" || change.kind === "pinned") && change.message) {
         const undo: Undo = { snapshot: before };
@@ -140,6 +163,25 @@ export function useProfileGovernance(profileId: string | undefined) {
 
   return {
     busy,
+    setExposureMode: async (exposureMode: ExposureMode, initialPins?: ToolSelection[]) => {
+      try {
+        await applyChange(client, profileId, {
+          kind: "profile",
+          updates: { exposureMode, initialPins },
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    setRiskPolicy: async (riskPolicy: RiskPolicy) => {
+      try {
+        await applyChange(client, profileId, { kind: "profile", updates: { riskPolicy } });
+        return true;
+      } catch {
+        return false;
+      }
+    },
     setTools: async (selection: ToolSelection[], enabled: boolean, message?: string) => {
       try {
         await applyChange(client, profileId, { kind: "tools", selection, enabled, message });

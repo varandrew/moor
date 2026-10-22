@@ -37,9 +37,12 @@
 
 ---
 
+> [!NOTE]
+> This README describes the current source tree. Packaged releases may not yet include every feature documented here; check the [release notes](https://github.com/varandrew/moor/releases) for your version.
+
 > _AI Agents need tools, but managing dozens of MCP servers across different clients is a mess. I wanted a single gateway that aggregates everything, filters by context, and keeps running in the background — all controllable from a beautiful native UI._
 >
-> _Moor exposes one endpoint (`http://127.0.0.1:<port>/mcp`) that dynamically serves only the tools you want, based on your active Profile. Switch profiles without disconnecting your Agent, and every tool call is audited. That's why I built it._
+> _Moor exposes one endpoint (`http://127.0.0.1:<port>/mcp`) that dynamically serves only the tools you want, based on your active Profile. Switch profiles without disconnecting your Agent, with tool-call auditing enabled by default. That's why I built it._
 
 <p align="center">
   <img src="./assets/Dashboard%20Page.png" alt="Dashboard" width="800"><br>
@@ -65,19 +68,19 @@
 
 ### macOS App
 
-Download the `.dmg` from [Releases](https://github.com/varandrew/moor/releases), drag to Applications, done. The app bundles the HTTP server as an in-process Rust binary — no pre-installed Node.js runtime required.
+Download the `.dmg` from [Releases](https://github.com/varandrew/moor/releases), drag to Applications, done. The app embeds a Rust HTTP gateway in the desktop process — no pre-installed Node.js runtime required.
 
 ### Windows App
 
-Download the Windows installer from [Releases](https://github.com/varandrew/moor/releases) and run it. The app bundles the HTTP server as an in-process Rust binary — no pre-installed Node.js runtime required.
+Download the Windows installer from [Releases](https://github.com/varandrew/moor/releases) and run it. The app embeds a Rust HTTP gateway in the desktop process — no pre-installed Node.js runtime required.
 
 ### Linux App
 
-Download the `.deb`, `.rpm`, or `.AppImage` from [Releases](https://github.com/varandrew/moor/releases) (x86_64 and aarch64 builds are produced by CI). The app bundles the HTTP server as an in-process Rust binary — no pre-installed Node.js runtime required. macOS remains the primary target; Linux builds are produced by CI but less extensively tested.
+Download the `.deb`, `.rpm`, or `.AppImage` from [Releases](https://github.com/varandrew/moor/releases) (x86_64 and aarch64 builds are produced by CI). The app embeds a Rust HTTP gateway in the desktop process — no pre-installed Node.js runtime required. macOS remains the primary target; Linux builds are produced by CI but less extensively tested.
 
 ### Build from Source
 
-Requires macOS (Apple Silicon / Intel), Windows x64, or Linux (x86_64 / aarch64), Node.js >= 22 (CI uses 24), pnpm >= 10, and Rust >= 1.77.
+Requires macOS (Apple Silicon / Intel), Windows x64, or Linux (x86_64 / aarch64), Node.js >= 22 (CI uses 24), pnpm 11.3.0 (as pinned in `package.json`), and the stable Rust toolchain used by CI.
 
 ```bash
 git clone https://github.com/varandrew/moor.git
@@ -91,7 +94,7 @@ See [Development](#development) for build instructions.
 
 ### Launch the App
 
-Open **Moor.app**. The Dashboard shows your active Profile, server status, and recent audit logs at a glance.
+Open **Moor** from your applications menu (`Moor.app` on macOS). The Dashboard shows your active Profile, server status, and recent audit logs at a glance.
 
 ### Scan Existing Configs
 
@@ -103,6 +106,8 @@ Moor can automatically detect MCP servers you've already configured for Claude C
 
 You can also paste a JSON MCP configuration with **Import JSON**. Moor imports stdio and HTTP/SSE servers, and reports unsupported entries such as OpenAPI configs without saving them.
 
+Start the imported servers from **Servers** so Moor can discover their tools. Enabling a server in a Profile controls exposure; it does not start the server.
+
 ### Create a Profile
 
 Profiles let you group servers and control which tools are exposed to Agents:
@@ -111,7 +116,8 @@ Profiles let you group servers and control which tools are exposed to Agents:
 2. Name it (e.g., "Coding", "Research")
 3. Toggle servers on/off
 4. Expand a server to enable/disable individual tools
-5. Click **Activate** — the change is instant
+5. Optionally choose **Curated listing** and select tools to pin; **Direct listing** is the default
+6. Click **Activate** — the change is instant
 
 ### Connect Your Agent
 
@@ -129,6 +135,12 @@ To connect from WSL2 (NAT mode) or another LAN device, enable **Settings → Adv
 
 Moor handles the rest — aggregating `tools/list`, routing `tools/call`, and filtering based on your active Profile.
 
+### Adjust MCP Timeouts
+
+If a stdio server starts through `npx`, `pnpm dlx`, or a package manager that downloads dependencies, its first `initialize` / `tools/list` may exceed the default 30 seconds. In **Settings → Advanced**, increase **Server Start Timeout** for startup or **Request Timeout** for running `tools/call` requests. Both settings accept 5–300 seconds.
+
+Preinstall frequently used servers and use absolute command paths to reduce startup delays. To start them when Moor launches, enable **Auto-start** on each server and **Auto-start Servers on Launch** in Settings; only servers enabled in the active Profile are started.
+
 ## Features
 
 ### MCP Gateway Aggregation
@@ -137,7 +149,7 @@ A single HTTP endpoint (`/mcp`) proxies all backend MCP servers. Agents see a un
 
 ### Multi-Transport Support
 
-Connect to both **stdio** (subprocess) and **HTTP/SSE** MCP servers. Moor manages connection lifecycles, restarts, and health checks automatically.
+Connect to both **stdio** (subprocess) and **HTTP/SSE** MCP servers. Moor manages connections and server lifecycles, with optional periodic health checks.
 
 ### Profile Management
 
@@ -145,13 +157,29 @@ Create unlimited Profiles for different workflows. Each Profile stores:
 
 - Which servers are enabled
 - Which tools are disabled per server
+- Which tools are pinned, the exposure mode, and the risk policy
 - A global active state
 
 Switch Profiles with **hot-swap** — connected Agents stay connected, and the next `tools/list` reflects the new configuration immediately.
 
 ### Tool-Level Toggles
 
-Beyond server-level on/off, drill into any server to disable specific tools. Disabled tools disappear from the Agent's tool catalog in real time.
+Beyond server-level on/off, drill into any server to disable specific tools. Disabled tools are excluded from the Agent's tool catalog and cannot be called.
+
+### Curated Exposure and Pinned Tools
+
+**Direct listing** is the default for new and existing Profiles and lists every enabled, callable tool allowed by the Profile's policy. **Curated listing** lists only pinned tools plus two gateway meta tools:
+
+- `moor_search_tools`: search available tools by keyword and server name, with pagination and input schemas in the results
+- `moor_call_tool`: call a discovered tool by its exposed name and return the downstream result
+
+Use the Profile's pin controls to keep individual tools or a server's tools in the default catalog. Switching to Curated listing opens a picker for the initial pins. With no pinned tools, the catalog still contains the two meta tools. Unpinned tools remain searchable and callable, including by a previously cached exposed name; disabled or policy-blocked tools do not. You can switch back to Direct listing at any time.
+
+### Tool Risk Policy
+
+Moor classifies tools as `safe`, `write`, `destructive`, or `unknown` using their names and descriptions. You can correct a classification on the server detail page.
+
+Each Profile defaults to **Advisory**, which displays risk without blocking calls. **Block destructive** removes tools classified as `destructive` from listings and search results, and refuses calls with error code `-32002` and a structured reason. The policy applies in both exposure modes and takes precedence over pins. It does not block `write` or `unknown` tools; the classification is a heuristic, not a guarantee of read-only access.
 
 ### Config Import
 
@@ -175,22 +203,25 @@ Generate ready-to-copy configuration snippets for Claude Code, Claude Desktop, C
 
 ### Audit Logs
 
-Every `tools/call` is recorded with:
+With audit logging enabled (the default), tool calls are recorded with:
 
 - Timestamp, Profile, Server, Tool name
 - Arguments (with sensitive data redaction)
 - Result or error
 - Duration and Agent info
+- Call origin (`direct` or `meta`) and refusal reason when blocked
 
-Filter by time range, server, or tool. View aggregate statistics on the Dashboard.
+Filter by time range, server, or tool. View aggregate statistics on the Dashboard and policy-blocked call counts in Insights. Audit logging can be disabled in **Settings → Advanced**. Logs are retained for 30 days by default; set `logRetentionDays` to `0` to keep them indefinitely.
 
 ### System Tray
 
-Close the window — Moor keeps running in the macOS menu bar or Windows system tray. The gateway stays alive, so your Agents never lose connection.
+By default, closing the window hides Moor in the macOS menu bar or Windows system tray while the gateway keeps running. Disable **Minimize to Tray on Close** in Settings to quit on window close, or use **Quit Moor** in the tray menu. Quitting stops the gateway.
 
 ### Real-Time Status
 
 Server status changes and Profile switches are pushed to the UI via SSE. No refresh needed.
+
+MCP clients listening on `GET /mcp` receive `notifications/tools/list_changed` when the Profile, pins, risk policy, or tool catalog changes. Clients that handle this notification can fetch the updated catalog without reconnecting. Refresh tools on a running server from its detail page to repeat discovery without restarting the process.
 
 ## Architecture
 
@@ -237,8 +268,8 @@ WebView ◀──SSE──── /api/events
 
 - macOS (Apple Silicon / Intel), Windows x64, or Linux (x86_64 / aarch64)
 - [Node.js](https://nodejs.org) >= 22 (CI uses 24)
-- [pnpm](https://pnpm.io) >= 10
-- [Rust](https://rustup.rs) >= 1.77
+- [pnpm](https://pnpm.io) 11.3.0 (pinned in `package.json`)
+- [Rust](https://rustup.rs) stable (the toolchain used by CI)
 - [Xcode Command Line Tools](https://developer.apple.com/xcode/resources/) on macOS
 
 ### Install Dependencies
@@ -291,6 +322,8 @@ vp test
 
 ## API
 
+Management endpoints under `/api/*` require a loopback Host and the `X-Moor-Token` header. The `/mcp` endpoint follows the loopback/LAN rules described above and does not require that token.
+
 ### MCP Gateway
 
 | Method | Path   | Description                             |
@@ -299,33 +332,35 @@ vp test
 
 ### Server Management
 
-| Method   | Path                     | Description                                                |
-| -------- | ------------------------ | ---------------------------------------------------------- |
-| `GET`    | `/api/servers`           | List all servers                                           |
-| `POST`   | `/api/servers`           | Add server                                                 |
-| `GET`    | `/api/servers/:id`       | Server detail                                              |
-| `PUT`    | `/api/servers/:id`       | Update server config                                       |
-| `DELETE` | `/api/servers/:id`       | Remove server                                              |
-| `POST`   | `/api/servers/:id/start` | Start server                                               |
-| `POST`   | `/api/servers/:id/stop`  | Stop server                                                |
-| `GET`    | `/api/servers/:id/tools` | Get discovered tools (optionally filter by `?profile_id=`) |
-| `PUT`    | `/api/servers/order`     | Reorder servers                                            |
+| Method   | Path                                    | Description                                                |
+| -------- | --------------------------------------- | ---------------------------------------------------------- |
+| `GET`    | `/api/servers`                          | List all servers                                           |
+| `POST`   | `/api/servers`                          | Add server                                                 |
+| `GET`    | `/api/servers/:id`                      | Server detail                                              |
+| `PUT`    | `/api/servers/:id`                      | Update server config                                       |
+| `DELETE` | `/api/servers/:id`                      | Remove server                                              |
+| `POST`   | `/api/servers/:id/start`                | Start server                                               |
+| `POST`   | `/api/servers/:id/stop`                 | Stop server                                                |
+| `GET`    | `/api/servers/:id/tools`                | Get discovered tools (optionally filter by `?profile_id=`) |
+| `POST`   | `/api/servers/:id/tools/refresh`        | Rediscover tools on a running server without restarting it |
+| `PATCH`  | `/api/servers/:id/tools/:toolName/risk` | Override a tool's `riskLevel`                              |
+| `PUT`    | `/api/servers/order`                    | Reorder servers                                            |
 
 ### Profile Management
 
-| Method   | Path                                  | Description                           |
-| -------- | ------------------------------------- | ------------------------------------- |
-| `GET`    | `/api/profiles`                       | List all profiles                     |
-| `POST`   | `/api/profiles`                       | Create profile                        |
-| `GET`    | `/api/profiles/:id`                   | Get profile detail (with servers)     |
-| `PUT`    | `/api/profiles/:id`                   | Update profile                        |
-| `DELETE` | `/api/profiles/:id`                   | Delete profile                        |
-| `PUT`    | `/api/profiles/:id/activate`          | Set as active profile                 |
-| `POST`   | `/api/profiles/:id/clone`             | Clone a profile                       |
-| `GET`    | `/api/profiles/:id/servers/:serverId` | Get server toggle + disabled tools    |
-| `PUT`    | `/api/profiles/:id/servers/:serverId` | Update server toggle + disabled tools |
-| `PUT`    | `/api/profiles/:id/servers-state`     | Bulk upsert server toggles            |
-| `GET`    | `/api/profiles/:id/tools`             | Tools exposed by the profile          |
+| Method   | Path                                  | Description                                                                            |
+| -------- | ------------------------------------- | -------------------------------------------------------------------------------------- |
+| `GET`    | `/api/profiles`                       | List all profiles                                                                      |
+| `POST`   | `/api/profiles`                       | Create profile                                                                         |
+| `GET`    | `/api/profiles/:id`                   | Get profile detail (with servers)                                                      |
+| `PUT`    | `/api/profiles/:id`                   | Update name, `exposureMode`, `riskPolicy`, or `initialPins` when entering Curated mode |
+| `DELETE` | `/api/profiles/:id`                   | Delete profile                                                                         |
+| `PUT`    | `/api/profiles/:id/activate`          | Set as active profile                                                                  |
+| `POST`   | `/api/profiles/:id/clone`             | Clone a profile                                                                        |
+| `GET`    | `/api/profiles/:id/servers/:serverId` | Get server toggle, disabled tools, and pinned tools                                    |
+| `PUT`    | `/api/profiles/:id/servers/:serverId` | Update server toggle + disabled tools                                                  |
+| `PUT`    | `/api/profiles/:id/servers-state`     | Bulk update server toggles, `disabledTools`, and `pinnedTools`                         |
+| `GET`    | `/api/profiles/:id/tools`             | Profile tool groups with visibility, pin, and risk metadata                            |
 
 ### Audit Logs
 

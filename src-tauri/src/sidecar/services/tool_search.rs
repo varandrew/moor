@@ -5,7 +5,7 @@
 
 use crate::sidecar::db::Database;
 use crate::sidecar::services::audit_recorder::{AuditRecorder, ToolCallRecord, ToolCallVia};
-use crate::sidecar::services::server_manager::ServerManager;
+use crate::sidecar::services::server_manager::{ServerManager, ToolCallError};
 use crate::sidecar::services::tool_catalog::ToolCatalogEntry;
 use serde_json::{json, Value};
 
@@ -29,28 +29,38 @@ pub async fn search(
     db: &Database,
     params: &Value,
     agent_info: Option<&str>,
-) -> SearchOutcome {
+) -> Result<SearchOutcome, ToolCallError> {
     let started = std::time::Instant::now();
-    let profile_id = manager.active_profile_id();
-    let catalog = manager.get_callable_tools_for(profile_id.as_deref()).await;
-    let (payload, hits) = search_catalog(&catalog, params);
-    let recorded_result = json!({ "hits": hits });
+    let exposure = manager.tool_exposure().await;
+    let profile_id = exposure
+        .as_ref()
+        .ok()
+        .and_then(|exposure| exposure.profile_id.as_deref());
+    let result = exposure
+        .as_ref()
+        .ok()
+        .map(|exposure| search_catalog(&exposure.callable_tools(), params));
+    let recorded_result = result.as_ref().map(|(_, hits)| json!({ "hits": hits }));
+    let error = exposure.as_ref().err().map(ToString::to_string);
     AuditRecorder::record(
         db,
         ToolCallRecord {
-            profile_id: profile_id.as_deref(),
+            profile_id,
             server_id: None,
             tool_name: SEARCH_TOOL_NAME,
             arguments: params,
-            result: Some(&recorded_result),
-            error: None,
+            result: recorded_result.as_ref(),
+            error: error.as_deref(),
             duration_ms: started.elapsed().as_millis() as i64,
             agent_info,
             via: ToolCallVia::Meta,
             refusal: None,
         },
     );
-    SearchOutcome { payload }
+    exposure?;
+    Ok(SearchOutcome {
+        payload: result.expect("successful exposure has search results").0,
+    })
 }
 
 /// 关键词按空格分隔且全部命中（大小写不敏感），在工具名与描述上匹配。
@@ -169,10 +179,13 @@ mod tests {
 
     #[test]
     fn filters_by_server_name() {
-        let catalog = vec![entry("search", None), ToolCatalogEntry {
-            server_name: "Beta".to_string(),
-            ..entry("search-beta", None)
-        }];
+        let catalog = vec![
+            entry("search", None),
+            ToolCatalogEntry {
+                server_name: "Beta".to_string(),
+                ..entry("search-beta", None)
+            },
+        ];
 
         let (payload, hits) = search_catalog(&catalog, &json!({ "server": "beta" }));
         assert_eq!(hits, 1);

@@ -21,7 +21,7 @@ use crate::sidecar::services::audit_recorder::{AuditRecorder, ToolCallRecord, To
 use crate::sidecar::services::event_bus::{EventBus, Evt};
 use crate::sidecar::services::server_log::{DiagnosticAttempt, ServerDiagnostics};
 use crate::sidecar::services::settings;
-use crate::sidecar::services::tool_catalog::{ToolCatalogService, ToolDetail};
+use crate::sidecar::services::tool_catalog::{ToolCatalogService, ToolDetail, ToolExposure};
 use crate::sidecar::services::tool_visibility::ToolAccess;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -44,6 +44,29 @@ struct ServerSlot {
 #[derive(Debug, Clone)]
 pub struct ManagedServer {
     pub status: String,
+}
+
+#[derive(Debug)]
+pub enum ToolRefreshError {
+    NotFound,
+    NotRunning,
+    Changed,
+    Upstream(String),
+    Storage(String),
+}
+
+impl std::fmt::Display for ToolRefreshError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => formatter.write_str("Server not found"),
+            Self::NotRunning => formatter.write_str("Server is not running"),
+            Self::Changed => {
+                formatter.write_str("Server changed while refreshing tools. Refresh again.")
+            }
+            Self::Upstream(error) => write!(formatter, "Tool discovery failed: {error}"),
+            Self::Storage(error) => write!(formatter, "Failed to save discovered tools: {error}"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -298,35 +321,48 @@ impl ServerManager {
                 let mut client = Some(client);
                 let accepted = {
                     let mut slots = self.slots.lock().await;
-                    if let Some(slot) = slots.get_mut(id) {
-                        if matches!(slot.status, ServerStatus::Starting)
-                            && slot.start_token == start_token
-                        {
+                    let result = self.cache_tools(id, slots.get(id), start_token, &tools);
+                    match &result {
+                        Ok(()) => {
+                            let slot = slots.get_mut(id).expect("accepted server exists");
                             slot.status = ServerStatus::Running;
                             slot.start_deadline = None;
                             slot.start_timeout_ms = None;
-                            let client = client
-                                .take()
-                                .expect("client should be available before session is accepted");
-                            slot.session = Some(Arc::new(tokio::sync::Mutex::new(client)));
-                            true
-                        } else {
-                            false
+                            slot.session = Some(Arc::new(Mutex::new(
+                                client.take().expect("new session exists"),
+                            )));
+                            self.persist_server_status(id, "running", None);
                         }
-                    } else {
-                        false
+                        Err(ToolRefreshError::Storage(error)) => {
+                            let slot = slots.get_mut(id).expect("validated server exists");
+                            slot.status = ServerStatus::Error(error.clone());
+                            slot.start_deadline = None;
+                            slot.start_timeout_ms = None;
+                            self.persist_server_status(id, "error", Some(error));
+                        }
+                        Err(_) => {}
                     }
+                    result
                 };
-                if !accepted {
-                    if let Some(mut client) = client {
-                        let _ = client.disconnect().await;
-                    }
-                    return Ok(());
+                if let Some(mut client) = client {
+                    let _ = client.disconnect().await;
                 }
-                self.cache_tools(id, &tools);
-                self.persist_server_status(id, "running", None);
-                self.spawn_death_watcher(id.to_string(), start_token, alive_rx, diagnostics);
-                Ok(())
+                match accepted {
+                    Ok(()) => {
+                        self.spawn_death_watcher(
+                            id.to_string(),
+                            start_token,
+                            alive_rx,
+                            diagnostics,
+                        );
+                        Ok(())
+                    }
+                    Err(ToolRefreshError::Changed) => Ok(()),
+                    Err(error) => {
+                        diagnostics.append_event(&format!("Start failed: {error}"));
+                        Err(error.to_string())
+                    }
+                }
             }
             Err(e) => {
                 let public_msg = public_server_start_error_message(&e);
@@ -451,27 +487,27 @@ impl ServerManager {
         agent_info: Option<&str>,
         via: ToolCallVia,
     ) -> Result<Value, ToolCallError> {
-        // Profile 只解析一次；没有 Active Profile 时不回退到后续激活的 Profile。
-        let profile_id = ProfileRepository::new(&self.db)
-            .find_active_id()
-            .ok()
-            .flatten();
-        let callable_ids = self.get_callable_server_ids().await;
-        let resolved = profile_id.as_deref().map(|id| {
-            ToolCatalogService::resolve_profile_tools(&self.db, Some(id), Some(&callable_ids))
+        let (exposure, read_error) = match self.tool_exposure().await {
+            Ok(exposure) => (Some(exposure), None),
+            Err(error) => (None, Some(error)),
+        };
+        let profile_id = exposure
+            .as_ref()
+            .and_then(|exposure| exposure.profile_id.as_deref());
+        let owner = exposure.as_ref().and_then(|exposure| {
+            exposure
+                .tools
+                .iter()
+                .find(|tool| tool.exposed_name.as_deref() == Some(exposed_name))
         });
-        let owner = resolved
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .find(|tool| tool.exposed_name.as_deref() == Some(exposed_name));
 
         let start_time = Instant::now();
         let not_found =
             || ToolCallError::InvalidTool(format!("Tool \"{exposed_name}\" not found or disabled"));
-        let result = match owner {
-            None => Err(not_found()),
-            Some(tool) => match tool.access {
+        let result = match (read_error, owner) {
+            (Some(error), _) => Err(error),
+            (None, None) => Err(not_found()),
+            (None, Some(tool)) => match tool.access {
                 ToolAccess::Callable => {
                     let server_id = tool.server_id.clone();
                     let server_name = tool.server_name.clone();
@@ -517,7 +553,7 @@ impl ServerManager {
         AuditRecorder::record(
             &self.db,
             ToolCallRecord {
-                profile_id: profile_id.as_deref(),
+                profile_id,
                 server_id: owner.map(|tool| tool.server_id.as_str()),
                 tool_name: exposed_name,
                 arguments: &args,
@@ -537,66 +573,38 @@ impl ServerManager {
     }
 
     /// 对运行中的 Server 重新发现工具，不重启进程。
-    pub async fn refresh_server_tools(&self, server_id: &str) -> Result<usize, String> {
-        let session = {
+    pub async fn refresh_server_tools(&self, server_id: &str) -> Result<usize, ToolRefreshError> {
+        let (session, token) = {
             let slots = self.slots.lock().await;
-            let slot = slots
-                .get(server_id)
-                .ok_or_else(|| "Server not found".to_string())?;
+            let slot = slots.get(server_id).ok_or(ToolRefreshError::NotFound)?;
             if !matches!(slot.status, ServerStatus::Running) {
-                return Err("Server is not running".to_string());
+                return Err(ToolRefreshError::NotRunning);
             }
-            slot.session
-                .clone()
-                .ok_or_else(|| "Server is not running".to_string())?
+            (
+                slot.session.clone().ok_or(ToolRefreshError::NotRunning)?,
+                slot.start_token,
+            )
         };
-
-        let tools = {
-            let client = session.lock().await;
-            client.list_tools().await?
-        };
-        self.cache_tools(server_id, &tools);
+        // 会话锁保留到接纳结束，防止同一会话的后一次刷新先提交。
+        let client = session.lock().await;
+        let result = client.list_tools().await;
+        let slots = self.slots.lock().await;
+        let slot = slots.get(server_id).ok_or(ToolRefreshError::Changed)?;
+        if slot.start_token != token || !matches!(slot.status, ServerStatus::Running) {
+            return Err(ToolRefreshError::Changed);
+        }
+        let tools = result.map_err(ToolRefreshError::Upstream)?;
+        self.cache_tools(server_id, Some(slot), token, &tools)?;
         Ok(tools.len())
     }
 
-    /// 指定 Profile 的可调用集合：调用方先固定归属，避免一次调用读两次 Active Profile。
-    pub async fn get_callable_tools_for(
-        &self,
-        profile_id: Option<&str>,
-    ) -> Vec<crate::sidecar::services::tool_catalog::ToolCatalogEntry> {
+    pub(crate) async fn tool_exposure(&self) -> Result<ToolExposure, ToolCallError> {
+        let loaded = ToolCatalogService::load_active_profile(&self.db).map_err(|error| {
+            tracing::error!(error = %error, "Failed to read tool exposure");
+            ToolCallError::Execution("Unable to read tool exposure".into())
+        })?;
         let callable_ids = self.get_callable_server_ids().await;
-        ToolCatalogService::get_callable_tool_catalog(&self.db, profile_id, Some(&callable_ids))
-    }
-
-    /// 当前 Active Profile 的 id。
-    pub fn active_profile_id(&self) -> Option<String> {
-        ProfileRepository::new(&self.db)
-            .find_active_id()
-            .ok()
-            .flatten()
-    }
-
-    /// 当前 Active Profile 的曝光模式；没有 Active Profile 时按直出处理。
-    pub fn active_exposure_mode(&self) -> crate::sidecar::services::tool_visibility::ExposureMode {
-        let repo = ProfileRepository::new(&self.db);
-        repo.find_active_id()
-            .ok()
-            .flatten()
-            .and_then(|id| repo.find_by_id(&id).ok().flatten())
-            .map(|profile| {
-                crate::sidecar::services::tool_visibility::ExposureMode::from_db(
-                    &profile.exposure_mode,
-                )
-            })
-            .unwrap_or(crate::sidecar::services::tool_visibility::ExposureMode::Direct)
-    }
-
-    pub async fn get_tool_catalog(
-        &self,
-        profile_id: Option<&str>,
-    ) -> Vec<crate::sidecar::services::tool_catalog::ToolCatalogEntry> {
-        let callable_ids = self.get_callable_server_ids().await;
-        ToolCatalogService::get_tool_catalog(&self.db, profile_id, Some(&callable_ids))
+        Ok(loaded.resolve(Some(&callable_ids)))
     }
 
     pub async fn get_tool_details(
@@ -661,12 +669,27 @@ impl ServerManager {
         });
     }
 
-    fn cache_tools(&self, server_id: &str, tools: &[ToolInsert]) {
-        let repo = ToolDiscoveryRepository::new(&self.db);
-        let _ = repo.replace_tools_for_server(server_id, tools);
+    /// 调用方持有 slots 锁；校验、保存与发布之间不得插入停止或重启。
+    fn cache_tools(
+        &self,
+        server_id: &str,
+        slot: Option<&ServerSlot>,
+        start_token: u64,
+        tools: &[ToolInsert],
+    ) -> Result<(), ToolRefreshError> {
+        let slot = slot.ok_or(ToolRefreshError::Changed)?;
+        if slot.start_token != start_token
+            || !matches!(slot.status, ServerStatus::Starting | ServerStatus::Running)
+        {
+            return Err(ToolRefreshError::Changed);
+        }
+        ToolDiscoveryRepository::new(&self.db)
+            .replace_tools_for_server(server_id, tools)
+            .map_err(ToolRefreshError::Storage)?;
         self.event_bus.emit(Evt::ServerTools {
             server_id: server_id.to_string(),
         });
+        Ok(())
     }
 
     fn persist_server_status(&self, id: &str, status: &str, error_message: Option<&str>) {
@@ -1848,5 +1871,595 @@ process.stdin.on("data", (chunk) => {{
         assert_eq!(stopped.status, "stopped");
 
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+    struct DiscoveryConnector {
+        gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        disconnected: Arc<std::sync::atomic::AtomicBool>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        fail_refresh: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct DiscoverySession {
+        gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        disconnected: Arc<std::sync::atomic::AtomicBool>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        fail_refresh: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    fn discovered(name: &str) -> Vec<ToolInsert> {
+        vec![ToolInsert {
+            name: name.into(),
+            description: None,
+            input_schema: None,
+        }]
+    }
+
+    impl McpConnector for DiscoveryConnector {
+        fn connect<'a>(
+            &'a self,
+            _config: &'a StoredServerConfig,
+            _timeouts: ServerTimeouts,
+            _diagnostics: DiagnosticAttempt,
+        ) -> BoxedConnectFuture<'a> {
+            Box::pin(async move {
+                Ok((
+                    discovered("initial"),
+                    Box::new(DiscoverySession {
+                        gate: self.gate.clone(),
+                        disconnected: self.disconnected.clone(),
+                        calls: self.calls.clone(),
+                        fail_refresh: self.fail_refresh.clone(),
+                    }) as Box<dyn McpSession>,
+                ))
+            })
+        }
+    }
+
+    impl McpSession for DiscoverySession {
+        fn ping(
+            &self,
+            _timeout: Duration,
+        ) -> Pin<Box<dyn Future<Output = Result<(), RequestError>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn list_tools(
+            &self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<ToolInsert>, String>> + Send + '_>> {
+            Box::pin(async move {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call == 0 {
+                    if let Some((started, finish)) = &self.gate {
+                        started.notify_one();
+                        finish.notified().await;
+                    }
+                }
+                if self.fail_refresh.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("Downstream discovery failed".into());
+                }
+                Ok(discovered(&format!("refreshed-{call}")))
+            })
+        }
+        fn call_tool<'a>(
+            &'a self,
+            _name: &'a str,
+            _args: Value,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, RequestError>> + Send + 'a>> {
+            Box::pin(async { Ok(serde_json::json!({})) })
+        }
+        fn disconnect(&mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+            self.disconnected
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+        fn set_request_timeout_ms(&mut self, _ms: u32) {}
+        fn alive_receiver(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+            None
+        }
+    }
+
+    async fn discovery_fixture(
+        connector: DiscoveryConnector,
+    ) -> (
+        std::path::PathBuf,
+        Arc<Database>,
+        Arc<ServerManager>,
+        String,
+    ) {
+        let dir = temp_data_dir(&format!("discovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (db, manager) = build_manager_with_fake_connector(&dir, Arc::new(connector));
+        let id = uuid::Uuid::new_v4().to_string();
+        insert_stdio_server(&db, &id, "discovery", "unused".into(), false, 0);
+        manager.load_from_db().await;
+        (dir, db, manager, id)
+    }
+
+    fn discovery_connector() -> DiscoveryConnector {
+        DiscoveryConnector {
+            gate: None,
+            disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail_refresh: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    async fn refresh_response(
+        state: Arc<crate::sidecar::http::AppState>,
+        id: &str,
+    ) -> (axum::http::StatusCode, Value) {
+        use tower::ServiceExt;
+        let response = crate::sidecar::http::routes::servers::router()
+            .with_state(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/servers/{id}/tools/refresh"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn discovery_refresh_http_errors_preserve_the_running_catalog() {
+        let connector = discovery_connector();
+        let fail_refresh = connector.fail_refresh.clone();
+        let (dir, db, manager, id) = discovery_fixture(connector).await;
+        let state = Arc::new(crate::sidecar::http::AppState::new(
+            db.clone(),
+            "test-token".into(),
+            "test".into(),
+            19323,
+            manager.event_bus.clone(),
+            manager.clone(),
+        ));
+        for (target, status, code) in [
+            ("missing", axum::http::StatusCode::NOT_FOUND, "NOT_FOUND"),
+            (
+                id.as_str(),
+                axum::http::StatusCode::CONFLICT,
+                "SERVER_NOT_RUNNING",
+            ),
+        ] {
+            let (actual_status, body) = refresh_response(state.clone(), target).await;
+            assert_eq!(actual_status, status);
+            assert_eq!(body["error"]["code"], code);
+        }
+        manager.start_server(&id).await.unwrap();
+        let mut events = manager.event_bus.subscribe();
+        fail_refresh.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = refresh_response(state.clone(), &id).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["code"], "TOOL_DISCOVERY_FAILED");
+        assert_eq!(
+            body["error"]["message"],
+            "Failed to refresh tools from the server."
+        );
+        fail_refresh.store(false, std::sync::atomic::Ordering::SeqCst);
+        db.exec("CREATE TRIGGER fail_tools BEFORE INSERT ON tool_discoveries BEGIN SELECT RAISE(ABORT, 'tool storage failed'); END;").unwrap();
+        let (status, body) = refresh_response(state.clone(), &id).await;
+        assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["code"], "INTERNAL_ERROR");
+        assert_eq!(body["error"]["message"], "Failed to save discovered tools.");
+        assert_eq!(manager.get_server(&id).await.unwrap().status, "running");
+        assert_eq!(
+            ToolDiscoveryRepository::new(&db)
+                .find_by_server_id(&id)
+                .unwrap()[0]
+                .tool_name,
+            "initial"
+        );
+        assert!(events.try_recv().is_err());
+        db.exec("DROP TRIGGER fail_tools").unwrap();
+        let (status, body) = refresh_response(state, &id).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"tools": 1}));
+        assert!(matches!(events.try_recv(), Ok(Evt::ServerTools { .. })));
+        manager.stop_server(&id).await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn discovery_storage_failure_disconnects_start_and_never_announces_tools() {
+        let connector = discovery_connector();
+        let disconnected = connector.disconnected.clone();
+        let (dir, db, manager, id) = discovery_fixture(connector).await;
+        db.exec("CREATE TRIGGER fail_tools BEFORE INSERT ON tool_discoveries BEGIN SELECT RAISE(ABORT, 'tool storage failed'); END;").unwrap();
+        let mut events = manager.event_bus.subscribe();
+        assert!(manager.start_server(&id).await.is_err());
+        assert!(disconnected.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(manager.get_server(&id).await.unwrap().status, "error");
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event, Evt::ServerTools { .. }));
+            assert!(!matches!(event, Evt::ServerStatus { status, .. } if status == "running"));
+        }
+        assert!(ToolDiscoveryRepository::new(&db)
+            .find_by_server_id(&id)
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn discovery_refresh_failure_preserves_running_session_and_previous_tools() {
+        let (dir, db, manager, id) = discovery_fixture(discovery_connector()).await;
+        manager.start_server(&id).await.unwrap();
+        db.exec("CREATE TRIGGER fail_tools BEFORE INSERT ON tool_discoveries BEGIN SELECT RAISE(ABORT, 'tool storage failed'); END;").unwrap();
+        let mut events = manager.event_bus.subscribe();
+        assert!(matches!(
+            manager.refresh_server_tools(&id).await,
+            Err(ToolRefreshError::Storage(_))
+        ));
+        assert_eq!(manager.get_server(&id).await.unwrap().status, "running");
+        assert_eq!(
+            ToolDiscoveryRepository::new(&db)
+                .find_by_server_id(&id)
+                .unwrap()[0]
+                .tool_name,
+            "initial"
+        );
+        assert!(events.try_recv().is_err());
+        db.exec("DROP TRIGGER fail_tools").unwrap();
+        assert_eq!(manager.refresh_server_tools(&id).await.unwrap(), 1);
+        assert!(matches!(events.try_recv(), Ok(Evt::ServerTools { .. })));
+        assert_eq!(
+            ToolDiscoveryRepository::new(&db)
+                .find_by_server_id(&id)
+                .unwrap()[0]
+                .tool_name,
+            "refreshed-1"
+        );
+        manager.stop_server(&id).await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn discovery_refresh_discards_results_after_stop_or_restart() {
+        for restart in [false, true] {
+            let started = Arc::new(tokio::sync::Notify::new());
+            let finish = Arc::new(tokio::sync::Notify::new());
+            let mut connector = discovery_connector();
+            connector.gate = Some((started.clone(), finish.clone()));
+            let (dir, db, manager, id) = discovery_fixture(connector).await;
+            manager.start_server(&id).await.unwrap();
+            let state = Arc::new(crate::sidecar::http::AppState::new(
+                db.clone(),
+                "test-token".into(),
+                "test".into(),
+                19323,
+                manager.event_bus.clone(),
+                manager.clone(),
+            ));
+            let refresh = tokio::spawn({
+                let id = id.clone();
+                async move { refresh_response(state, &id).await }
+            });
+            started.notified().await;
+            let stop = manager.stop_server(&id);
+            tokio::pin!(stop);
+            assert!(futures::poll!(&mut stop).is_pending());
+            if restart {
+                manager.start_server(&id).await.unwrap();
+            }
+            let mut events = manager.event_bus.subscribe();
+            finish.notify_one();
+            let (status, body) = refresh.await.unwrap();
+            assert_eq!(status, axum::http::StatusCode::CONFLICT);
+            assert_eq!(body["error"]["code"], "SERVER_CHANGED");
+            stop.await.unwrap();
+            assert_eq!(
+                ToolDiscoveryRepository::new(&db)
+                    .find_by_server_id(&id)
+                    .unwrap()[0]
+                    .tool_name,
+                "initial"
+            );
+            while let Ok(event) = events.try_recv() {
+                assert!(!matches!(event, Evt::ServerTools { .. }));
+            }
+            if restart {
+                manager.stop_server(&id).await.unwrap();
+            }
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_refreshes_commit_in_session_request_order() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let mut connector = discovery_connector();
+        connector.gate = Some((started.clone(), finish.clone()));
+        let calls = connector.calls.clone();
+        let (dir, db, manager, id) = discovery_fixture(connector).await;
+        manager.start_server(&id).await.unwrap();
+        let first = tokio::spawn({
+            let manager = manager.clone();
+            let id = id.clone();
+            async move { manager.refresh_server_tools(&id).await }
+        });
+        started.notified().await;
+        let second = manager.refresh_server_tools(&id);
+        tokio::pin!(second);
+        assert!(futures::poll!(&mut second).is_pending());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        finish.notify_one();
+        first.await.unwrap().unwrap();
+        second.await.unwrap();
+        assert_eq!(
+            ToolDiscoveryRepository::new(&db)
+                .find_by_server_id(&id)
+                .unwrap()[0]
+                .tool_name,
+            "refreshed-1"
+        );
+        manager.stop_server(&id).await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    async fn exposure_fixture() -> (
+        std::path::PathBuf,
+        Arc<crate::sidecar::http::AppState>,
+        String,
+        String,
+    ) {
+        let (dir, db, manager, id) = discovery_fixture(discovery_connector()).await;
+        settings::init_settings(&db, &dir).unwrap();
+        let profiles = ProfileRepository::new(&db);
+        let profile_id = profiles.find_active_id().unwrap().unwrap();
+        profiles
+            .assign_to_active_profile(std::slice::from_ref(&id))
+            .unwrap();
+        manager.start_server(&id).await.unwrap();
+        let state = Arc::new(crate::sidecar::http::AppState::new(
+            db,
+            "test-token".into(),
+            "test".into(),
+            19323,
+            manager.event_bus.clone(),
+            manager,
+        ));
+        (dir, state, id, profile_id)
+    }
+
+    async fn exposure_request(
+        state: Arc<crate::sidecar::http::AppState>,
+        method: &str,
+        params: Option<Value>,
+    ) -> Value {
+        crate::sidecar::mcp::server::handle_request(
+            crate::sidecar::mcp::jsonrpc::Id::Number(1),
+            method,
+            params,
+            state,
+            Some("snapshot-test"),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn exposure_empty_curated_profile_keeps_meta_tools() {
+        use crate::sidecar::db::profile_repo::ProfileUpdate;
+        let (dir, state, id, _) = exposure_fixture().await;
+        let profiles = ProfileRepository::new(&state.db);
+        let empty = profiles.create("Empty").unwrap();
+        profiles
+            .update(
+                &empty.id,
+                ProfileUpdate {
+                    exposure_mode: Some("curated"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        profiles.activate(&empty.id).unwrap();
+        for with_empty_server in [false, true] {
+            if with_empty_server {
+                ToolDiscoveryRepository::new(&state.db)
+                    .delete_by_server_id(&id)
+                    .unwrap();
+                profiles
+                    .upsert_profile_server(&empty.id, &id, Some(true), None)
+                    .unwrap();
+            }
+            let result = exposure_request(state.clone(), "tools/list", None).await;
+            let names: Vec<_> = result["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(names, vec!["moor_search_tools", "moor_call_tool"]);
+        }
+        state.server_manager.stop_server(&id).await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn exposure_list_uses_one_profile_mode_and_tool_snapshot() {
+        use crate::sidecar::db::profile_repo::ProfileUpdate;
+        let (dir, state, id, old_id) = exposure_fixture().await;
+        let profiles = ProfileRepository::new(&state.db);
+        profiles
+            .update(
+                &old_id,
+                ProfileUpdate {
+                    exposure_mode: Some("curated"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let next = profiles.create("Next").unwrap();
+        profiles
+            .upsert_profile_server(&next.id, &id, Some(true), None)
+            .unwrap();
+        let slots = state.server_manager.slots.lock().await;
+        let pending = exposure_request(state.clone(), "tools/list", None);
+        tokio::pin!(pending);
+        assert!(futures::poll!(&mut pending).is_pending());
+        profiles
+            .update(
+                &old_id,
+                ProfileUpdate {
+                    exposure_mode: Some("direct"),
+                    risk_policy: Some("block_destructive"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        profiles.activate(&next.id).unwrap();
+        drop(slots);
+        let old = pending.await;
+        let names: Vec<_> = old["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["moor_search_tools", "moor_call_tool"]);
+        let next_result = exposure_request(state.clone(), "tools/list", None).await;
+        assert_eq!(next_result["result"]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            next_result["result"]["tools"][0]["name"],
+            "discovery__initial"
+        );
+        state.server_manager.stop_server(&id).await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn exposure_search_and_call_keep_the_captured_profile_for_audit() {
+        use crate::sidecar::db::audit_log_repo::AuditLogRepository;
+        for name in ["moor_search_tools", "discovery__initial", "moor_call_tool"] {
+            let (dir, state, id, old_id) = exposure_fixture().await;
+            let profiles = ProfileRepository::new(&state.db);
+            let next = profiles.create("Next").unwrap();
+            let params = if name == "moor_call_tool" {
+                serde_json::json!({"name": name, "arguments": {"name": "discovery__initial"}})
+            } else {
+                serde_json::json!({"name": name, "arguments": {}})
+            };
+            let slots = state.server_manager.slots.lock().await;
+            let pending = exposure_request(state.clone(), "tools/call", Some(params.clone()));
+            tokio::pin!(pending);
+            assert!(futures::poll!(&mut pending).is_pending());
+            profiles
+                .upsert_profile_server(&old_id, &id, Some(true), Some(&vec!["initial".into()]))
+                .unwrap();
+            profiles.activate(&next.id).unwrap();
+            drop(slots);
+            let result = pending.await;
+            assert!(
+                result.get("error").is_none(),
+                "captured call failed: {result}"
+            );
+            if name == "moor_search_tools" {
+                let payload: Value =
+                    serde_json::from_str(result["result"]["content"][0]["text"].as_str().unwrap())
+                        .unwrap();
+                assert_eq!(payload["tools"][0]["name"], "discovery__initial");
+            }
+            let logs = AuditLogRepository::new(&state.db)
+                .query_logs(None, None, None, None, None, None)
+                .unwrap();
+            assert_eq!(logs.len(), 1);
+            assert_eq!(logs[0].profile_id.as_deref(), Some(old_id.as_str()));
+            let next_result = exposure_request(state.clone(), "tools/call", Some(params)).await;
+            if name == "moor_search_tools" {
+                let payload: Value = serde_json::from_str(
+                    next_result["result"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert!(payload["tools"].as_array().unwrap().is_empty());
+            } else {
+                assert!(next_result.get("error").is_some());
+            }
+            state.server_manager.stop_server(&id).await.unwrap();
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn exposure_without_active_profile_does_not_adopt_a_later_activation() {
+        use crate::sidecar::db::audit_log_repo::AuditLogRepository;
+        let (dir, state, id, profile_id) = exposure_fixture().await;
+        state.db.exec("UPDATE profiles SET is_active = 0").unwrap();
+        let slots = state.server_manager.slots.lock().await;
+        let list = exposure_request(state.clone(), "tools/list", None);
+        let search = exposure_request(
+            state.clone(),
+            "tools/call",
+            Some(serde_json::json!({"name": "moor_search_tools", "arguments": {}})),
+        );
+        tokio::pin!(list, search);
+        assert!(futures::poll!(&mut list).is_pending());
+        assert!(futures::poll!(&mut search).is_pending());
+        ProfileRepository::new(&state.db)
+            .activate(&profile_id)
+            .unwrap();
+        drop(slots);
+        assert!(list.await["result"]["tools"].as_array().unwrap().is_empty());
+        let result = search.await;
+        let payload: Value =
+            serde_json::from_str(result["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(payload["tools"].as_array().unwrap().is_empty());
+        let logs = AuditLogRepository::new(&state.db)
+            .query_logs(None, None, None, None, None, None)
+            .unwrap();
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].profile_id.is_none());
+        assert_eq!(
+            exposure_request(state.clone(), "tools/list", None).await["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        state.server_manager.stop_server(&id).await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn exposure_storage_errors_are_protocol_errors_not_empty_results() {
+        let (dir, state, id, _) = exposure_fixture().await;
+        state
+            .db
+            .exec("ALTER TABLE tool_discoveries RENAME TO unavailable_tools")
+            .unwrap();
+        for (method, params) in [
+            ("tools/list", None),
+            (
+                "tools/call",
+                Some(serde_json::json!({"name": "moor_search_tools"})),
+            ),
+            (
+                "tools/call",
+                Some(serde_json::json!({"name": "discovery__initial"})),
+            ),
+            (
+                "tools/call",
+                Some(
+                    serde_json::json!({"name": "moor_call_tool", "arguments": {"name": "discovery__initial"}}),
+                ),
+            ),
+        ] {
+            let result = exposure_request(state.clone(), method, params).await;
+            assert_eq!(
+                result["error"]["code"],
+                crate::sidecar::mcp::jsonrpc::INTERNAL_ERROR
+            );
+            assert_eq!(result["error"]["message"], "Unable to read tool exposure");
+            assert!(result.get("result").is_none());
+        }
+        state.server_manager.stop_server(&id).await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
