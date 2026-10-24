@@ -1,5 +1,13 @@
 # moor
 
+## 0.9.1
+
+### Patch Changes
+
+- e174cf3: 修复部分远程 MCP 服务无法连接的问题：HTTP 连接优先使用 2025-03-26，校验协商版本，并仅在明确的版本错误下重试旧版本。
+
+  保留启动失败的 HTTP 状态、RPC 错误和 SSE 回退原因；诊断信息递归脱敏并分段限长，避免凭据泄露或首次错误被覆盖。
+
 ## 0.9.0
 
 ### Minor Changes
@@ -23,6 +31,7 @@
 ### Patch Changes
 
 - Fix dark-mode readability and theme synchronization in the JSON import editor (#75).
+
   - Apply theme-aware text, JSON syntax highlighting, line numbers, placeholders, selections, and diagnostic colors while preserving edits during theme changes.
   - Serialize settings changes, restore the previous login auto-start state when saving fails, and report runtime synchronization failures without reverting saved settings.
   - Keep tool calls and audit records associated with the profile and server resolved when each call starts, including calls that overlap a profile switch.
@@ -59,6 +68,7 @@
 ### Minor Changes
 
 - f5fd472: feat(clients): add Claude Desktop, Grok Build and Pi client presets
+
   - Client registry adds Claude Desktop (stdio bridged via `npx mcp-remote`), Grok Build (`~/.grok/config.toml`), and Pi (`~/.pi/agent/mcp.json`, requires the community `pi-mcp-adapter` package).
   - Claude Code preset renamed to `claude-code` with config path corrected to `~/.claude.json`.
 
@@ -72,6 +82,7 @@
 ### Patch Changes
 
 - c512eb8: feat(config): configuration import and client management enhancements
+
   - Client registry now declares a canonical gateway entry name; Kimi Code and dsh pin the entry to `moor-mcp`, so re-importing a client config replaces the handwritten entry instead of registering a second gateway connection.
   - ConverterPanel loads client snippets dynamically from the API instead of a hardcoded client list, and snippets now expose a stable `clientId`.
   - ServerCard and ServerDetail surface server status errors more robustly, and a mutation lock prevents concurrent execution of critical operations across hooks.
@@ -85,6 +96,7 @@
 ### Patch Changes
 
 - e0626d6: feat(gateway): MCP session idle TTL, capacity cap & SSE stream lifetime
+
   - Sessions now expire after an idle TTL (new setting `advanced.mcpSessionIdleTtlMs`, default 1h, valid range 5min–24h); validation on POST/GET refreshes liveness and a 60s background sweeper reclaims sessions leaked by crashed clients.
   - `initialize` beyond 128 concurrent sessions returns HTTP 503 instead of growing unboundedly.
   - GET SSE keep-alive streams close after a 30min total lifetime; clients reconnect per the Streamable HTTP spec.
@@ -175,6 +187,7 @@
 ### Patch Changes
 
 - Add Windows platform support and improve tool exposed name strategy
+
   - Add Windows x64 CI/CD build job producing installers
   - Adapt stdio environment handling for Windows (case-insensitive PATH, semicolon separator, PATHEXT resolution)
   - Conditionally compile tray icons per platform (macOS template icon / Windows regular icon)
@@ -217,6 +230,7 @@
 - Moor v0.3.0 — Settings Center, SSE, React Query migration and full Sidecar refactor
 
   **Features:**
+
   - Settings Center with General / Appearance / Advanced groups (9 configurable items)
   - SSE auto-reconnection and real-time data streaming
   - React Query data layer migration (Dashboard, Profiles, Servers, ServerDetail, ProfileDetail)
@@ -227,6 +241,7 @@
   - Session manager
 
   **Frontend:**
+
   - New Settings and AuditLogs pages
   - New shared components: ConverterPanel, CodeBlock, KeyValueTable, StatCard, DetailPageHeader
   - 6 new shadcn/ui components (Select, Checkbox, Textarea, Label, Separator, Skeleton)
@@ -234,6 +249,7 @@
   - ServerCard and ScrollArea component refinements
 
   **Sidecar:**
+
   - Service layer extraction: Profiles, Settings, Import, Audit Log
   - Server Manager refactored to lifecycle-based architecture
   - API schemas layer with Zod v4 validation
@@ -241,10 +257,12 @@
   - Enhanced client config scanner with Cursor support
 
   **Tauri:**
+
   - Major Rust backend enhancements in lib.rs (286+ lines added)
   - Settings persistence and sidecar port management
 
   **Fixes:**
+
   - Node.js version requirement updated to 22+
   - Enhanced config import documentation
   - Unified error and warning messages to English
@@ -261,11 +279,13 @@
 - feat: add auto-start for servers, React Query migration, and SSE reconnection
 
   **Features:**
+
   - Add auto-start functionality for servers with DB schema updates
   - Enhance SSE connection with automatic reconnection logic
   - Improve JSON parsing error handling in AddServerForm
 
   **Refactors:**
+
   - Migrate Dashboard, ProfileDetail, ServerDetail, and Servers pages to React Query
   - Introduce AddServerForm and ConfigImportPanel components
   - Remove unused hooks and simplify components
@@ -274,6 +294,7 @@
   - Update test imports to use vite-plus/test and enhance test configurations
 
   **Fixes:**
+
   - Update moor version to 0.2.1-beta.1 in Cargo.lock
 
 ## 0.3.0-beta.2
@@ -283,6 +304,7 @@
 - feat: add client configuration converter and new shadcn/ui components
 
   **Sidecar:**
+
   - Add configuration converter supporting Claude Code, Codex, OpenCode, and Cursor
   - Add `/api/import/convert` and `/api/import/parse` endpoints
   - Enhance scanner to support Cursor client configs
@@ -291,6 +313,7 @@
   - Refactor version sync scripts with core extraction and tests
 
   **Frontend:**
+
   - Add 6 new shadcn/ui components based on Radix UI: Select, Checkbox, Textarea, Label, Separator, Skeleton
   - Replace native `<select>`, `<input type="checkbox">`, and `<textarea>` elements with shadcn/ui equivalents
   - Add `ConverterPanel` component for cross-client MCP configuration conversion
@@ -331,6 +354,7 @@
 ### Patch Changes
 
 - 536ae72: Harden release pipeline and fix changeset versioning
+
   - Unify CI runners on macos-latest with Rosetta 2 cross-compilation for x86_64,eliminating macos-13 queue bottlenecks
   - Fix GitHub Actions cache keys and add per-arch Node.js setup to ensure correctsidecar binary targets
   - Remove fixed version grouping between moor and moor-sidecar in changeset config
