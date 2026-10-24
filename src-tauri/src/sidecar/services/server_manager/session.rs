@@ -154,6 +154,7 @@ impl StdioHttpConnector {
             server_name: config.name.clone(),
             url: url.to_string(),
             headers,
+            credential_provider: None,
             request_timeout_ms: timeouts.start_ms,
         })
         .await?;

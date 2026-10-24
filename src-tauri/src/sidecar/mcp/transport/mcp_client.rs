@@ -1,12 +1,13 @@
 use super::request_error::RequestError;
 use crate::sidecar::db::tool_discovery_repo::ToolInsert;
 use crate::sidecar::mcp::transport::http_client::{
-    HttpClientTransport, HTTP_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION,
+    HttpClientTransport, HttpCredentialProvider, HTTP_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION,
 };
 use crate::sidecar::mcp::transport::stdio_client::StdioClientTransport;
 use crate::sidecar::services::server_log::DiagnosticAttempt;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub struct McpClient {
@@ -33,6 +34,7 @@ pub struct HttpConnectConfig {
     pub server_name: String,
     pub url: String,
     pub headers: HashMap<String, String>,
+    pub credential_provider: Option<Arc<dyn HttpCredentialProvider>>,
     pub request_timeout_ms: u32,
 }
 
@@ -79,11 +81,15 @@ impl McpClient {
     }
 
     pub async fn connect_http(config: HttpConnectConfig) -> Result<Self, RequestError> {
-        let transport = HttpClientTransport::new(
-            &config.url,
-            config.headers,
-            Duration::from_millis(config.request_timeout_ms as u64),
-        );
+        let request_timeout = Duration::from_millis(config.request_timeout_ms as u64);
+        let transport = match config.credential_provider {
+            Some(provider) => HttpClientTransport::with_credential_provider(
+                &config.url,
+                provider,
+                request_timeout,
+            ),
+            None => HttpClientTransport::new(&config.url, config.headers, request_timeout),
+        };
         let mut client = Self {
             transport: McpTransport::Http(transport),
             server_name: config.server_name,

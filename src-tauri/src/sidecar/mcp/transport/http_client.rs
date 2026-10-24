@@ -1,6 +1,6 @@
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -13,11 +13,18 @@ const REMOTE_MCP_ERROR_PREFIX: &str = "Remote MCP server error: ";
 pub const HTTP_PROTOCOL_VERSION: &str = "2025-03-26";
 pub const LEGACY_PROTOCOL_VERSION: &str = "2024-11-05";
 
+pub trait HttpCredentialProvider: Send + Sync {
+    fn headers(
+        &self,
+    ) -> futures::future::BoxFuture<'static, Result<HashMap<String, String>, RequestError>>;
+}
+
 /// MCP Client over HTTP transport (Streamable HTTP or SSE).
 /// Uses reqwest to communicate with HTTP-based MCP servers.
 pub struct HttpClientTransport {
     url: String,
     headers: HashMap<String, String>,
+    credential_provider: Option<Arc<dyn HttpCredentialProvider>>,
     client: reqwest::Client,
     mode: Mutex<HttpMode>,
     session_id: Mutex<Option<String>>,
@@ -49,9 +56,32 @@ enum StreamableError {
 
 impl HttpClientTransport {
     pub fn new(url: &str, headers: HashMap<String, String>, request_timeout: Duration) -> Self {
+        Self::with_optional_credential_provider(url, headers, None, request_timeout)
+    }
+
+    pub fn with_credential_provider(
+        url: &str,
+        credential_provider: Arc<dyn HttpCredentialProvider>,
+        request_timeout: Duration,
+    ) -> Self {
+        Self::with_optional_credential_provider(
+            url,
+            HashMap::new(),
+            Some(credential_provider),
+            request_timeout,
+        )
+    }
+
+    fn with_optional_credential_provider(
+        url: &str,
+        headers: HashMap<String, String>,
+        credential_provider: Option<Arc<dyn HttpCredentialProvider>>,
+        request_timeout: Duration,
+    ) -> Self {
         Self {
             url: url.to_string(),
             headers,
+            credential_provider,
             client: reqwest::Client::new(),
             mode: Mutex::new(HttpMode::Unknown),
             session_id: Mutex::new(None),
@@ -69,7 +99,12 @@ impl HttpClientTransport {
     }
 
     pub fn restart_with_protocol_version(&mut self, version: &str) {
-        *self = Self::new(&self.url, self.headers.clone(), self.request_timeout);
+        *self = Self::with_optional_credential_provider(
+            &self.url,
+            self.headers.clone(),
+            self.credential_provider.clone(),
+            self.request_timeout,
+        );
         self.set_protocol_version(version);
     }
 
@@ -175,7 +210,7 @@ impl HttpClientTransport {
 
         let builder = self
             .streamable_post_builder()
-            .await
+            .await?
             .header("accept", "application/json, text/event-stream")
             .header("mcp-protocol-version", &self.protocol_version);
 
@@ -255,7 +290,7 @@ impl HttpClientTransport {
 
         let response = self
             .streamable_post_builder()
-            .await
+            .await?
             .header("accept", "application/json, text/event-stream")
             .header("mcp-protocol-version", &self.protocol_version)
             .json(&request_body)
@@ -270,16 +305,20 @@ impl HttpClientTransport {
         Ok(())
     }
 
-    async fn streamable_post_builder(&self) -> reqwest::RequestBuilder {
+    async fn streamable_post_builder(&self) -> Result<reqwest::RequestBuilder, StreamableError> {
+        let headers = self
+            .request_headers()
+            .await
+            .map_err(StreamableError::Failed)?;
         let session_id = self.session_id.lock().await.clone();
         let mut builder = self.client.post(&self.url);
-        for (key, value) in &self.headers {
+        for (key, value) in headers {
             builder = builder.header(key, value);
         }
         if let Some(session_id) = session_id {
             builder = builder.header(MCP_SESSION_ID_HEADER, session_id);
         }
-        builder
+        Ok(builder)
     }
 
     async fn capture_streamable_session_id(
@@ -301,9 +340,16 @@ impl HttpClientTransport {
         *self.session_id.lock().await = Some(session_id.to_string());
     }
 
+    async fn request_headers(&self) -> Result<HashMap<String, String>, RequestError> {
+        match &self.credential_provider {
+            Some(provider) => provider.headers().await,
+            None => Ok(self.headers.clone()),
+        }
+    }
+
     async fn open_sse(&self) -> Result<SseState, RequestError> {
         let mut builder = self.client.get(&self.url);
-        for (key, value) in &self.headers {
+        for (key, value) in self.request_headers().await? {
             builder = builder.header(key, value);
         }
         let response = builder
@@ -386,7 +432,7 @@ impl HttpClientTransport {
         message: &Value,
     ) -> Result<(), RequestError> {
         let mut builder = self.client.post(&state.endpoint);
-        for (key, value) in &self.headers {
+        for (key, value) in self.request_headers().await? {
             builder = builder.header(key, value);
         }
         let response = builder
@@ -979,6 +1025,7 @@ mod tests {
             server_name: "session-test".to_string(),
             url: format!("http://{addr}/mcp"),
             headers: HashMap::new(),
+            credential_provider: None,
             request_timeout_ms: 30_000,
         })
         .await
@@ -1088,6 +1135,205 @@ mod tests {
             .expect_err("SSE fallback request should use the overall request timeout");
 
         assert!(err.message.contains("timed out after 50ms"));
+        server.abort();
+    }
+
+    struct RotatingCredentials {
+        next: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HttpCredentialProvider for RotatingCredentials {
+        fn headers(
+            &self,
+        ) -> futures::future::BoxFuture<'static, Result<HashMap<String, String>, RequestError>>
+        {
+            let next = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            Box::pin(async move {
+                Ok(HashMap::from([(
+                    "authorization".to_string(),
+                    format!("Bearer token-{next}"),
+                )]))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn streamable_requests_resolve_credentials_for_each_request() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/mcp",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let sender = sender.clone();
+                async move {
+                    sender
+                        .send(
+                            headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string(),
+                        )
+                        .unwrap();
+                    Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "result": {}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let transport = HttpClientTransport::with_credential_provider(
+            &format!("http://{addr}/mcp"),
+            Arc::new(RotatingCredentials {
+                next: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Duration::from_secs(1),
+        );
+
+        transport.send_request(1, "ping", None).await.unwrap();
+        transport.send_request(2, "ping", None).await.unwrap();
+
+        assert_eq!(receiver.recv().await.as_deref(), Some("Bearer token-1"));
+        assert_eq!(receiver.recv().await.as_deref(), Some("Bearer token-2"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn legacy_sse_connection_and_messages_resolve_credentials_for_each_request() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (rpc_sender, rpc_receiver) = mpsc::unbounded_channel();
+        let state = SseTestState {
+            sender: rpc_sender,
+            receiver: Arc::new(Mutex::new(Some(rpc_receiver))),
+        };
+        let sse_sender = sender.clone();
+        let message_sender = sender.clone();
+        let app = Router::new()
+            .route(
+                "/sse",
+                get(move |state: State<SseTestState>, headers: HeaderMap| {
+                    let sender = sse_sender.clone();
+                    async move {
+                        sender
+                            .send(
+                                headers
+                                    .get("authorization")
+                                    .and_then(|value| value.to_str().ok())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            )
+                            .unwrap();
+                        sse_endpoint(state).await
+                    }
+                })
+                .post(streamable_unsupported),
+            )
+            .route(
+                "/messages",
+                post(
+                    move |state: State<SseTestState>, headers: HeaderMap, body: Json<Value>| {
+                        let sender = message_sender.clone();
+                        async move {
+                            sender
+                                .send(
+                                    headers
+                                        .get("authorization")
+                                        .and_then(|value| value.to_str().ok())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                )
+                                .unwrap();
+                            message_endpoint(state, body).await
+                        }
+                    },
+                ),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let transport = HttpClientTransport::with_credential_provider(
+            &format!("http://{addr}/sse"),
+            Arc::new(RotatingCredentials {
+                next: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            Duration::from_secs(1),
+        );
+
+        transport
+            .send_request(1, "initialize", Some(serde_json::json!({})))
+            .await
+            .unwrap();
+
+        assert_eq!(receiver.recv().await.as_deref(), Some("Bearer token-2"));
+        assert_eq!(receiver.recv().await.as_deref(), Some("Bearer token-3"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_client_uses_server_credential_provider_throughout_handshake() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/mcp",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let sender = sender.clone();
+                async move {
+                    sender
+                        .send(
+                            headers
+                                .get("authorization")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string(),
+                        )
+                        .unwrap();
+                    let method = body["method"].as_str().unwrap_or_default();
+                    let result = match method {
+                        "initialize" => serde_json::json!({
+                            "protocolVersion": HTTP_PROTOCOL_VERSION,
+                            "capabilities": { "tools": {} },
+                            "serverInfo": { "name": "protected", "version": "1.0.0" }
+                        }),
+                        "tools/list" => serde_json::json!({ "tools": [] }),
+                        _ => serde_json::json!({}),
+                    };
+                    Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": body["id"],
+                        "result": result
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = McpClient::connect_http(HttpConnectConfig {
+            server_name: "protected".to_string(),
+            url: format!("http://{addr}/mcp"),
+            headers: HashMap::new(),
+            credential_provider: Some(Arc::new(RotatingCredentials {
+                next: std::sync::atomic::AtomicUsize::new(0),
+            })),
+            request_timeout_ms: 1_000,
+        })
+        .await
+        .unwrap();
+        client.list_tools().await.unwrap();
+
+        assert_eq!(receiver.recv().await.as_deref(), Some("Bearer token-1"));
+        assert_eq!(receiver.recv().await.as_deref(), Some("Bearer token-2"));
+        assert_eq!(receiver.recv().await.as_deref(), Some("Bearer token-3"));
         server.abort();
     }
 }

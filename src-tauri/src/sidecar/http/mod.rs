@@ -119,3 +119,200 @@ pub async fn start_server(state: Arc<AppState>, host: &str, port: u16) -> Result
         .await
         .map_err(|e| format!("Server error: {e}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{http::HeaderMap, routing::post};
+    use serde_json::Value;
+    use tokio::sync::mpsc;
+
+    async fn spawn_router(app: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (addr, server)
+    }
+
+    #[tokio::test]
+    async fn gateway_preserves_static_credentials_across_upstream_request_types() {
+        let (methods, mut received) = mpsc::unbounded_channel();
+        let upstream = Router::new().route(
+            "/mcp",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let methods = methods.clone();
+                async move {
+                    let authorization = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let method = body["method"].as_str().unwrap_or_default().to_string();
+                    methods.send((method.clone(), authorization)).unwrap();
+                    if method == "notifications/initialized" {
+                        return StatusCode::ACCEPTED.into_response();
+                    }
+                    let result = match method.as_str() {
+                        "initialize" => json!({
+                            "protocolVersion": "2025-03-26",
+                            "capabilities": { "tools": {} },
+                            "serverInfo": { "name": "protected", "version": "1.0.0" }
+                        }),
+                        "tools/list" => json!({
+                            "tools": [{
+                                "name": "echo",
+                                "description": "Echo input",
+                                "inputSchema": { "type": "object" }
+                            }]
+                        }),
+                        "tools/call" => json!({
+                            "content": [{ "type": "text", "text": "ok" }]
+                        }),
+                        _ => json!({}),
+                    };
+                    Json(json!({ "jsonrpc": "2.0", "id": body["id"], "result": result }))
+                        .into_response()
+                }
+            }),
+        );
+        let (upstream_addr, upstream_server) = spawn_router(upstream).await;
+        let data_dir =
+            std::env::temp_dir().join(format!("moor-http-auth-{}", uuid::Uuid::new_v4()));
+        let state = AppState::for_test(&data_dir);
+        crate::sidecar::db::profile_repo::ProfileRepository::new(&state.db)
+            .seed_default()
+            .unwrap();
+        let (gateway_addr, gateway_server) = spawn_router(create_app(state)).await;
+        let gateway = format!("http://{gateway_addr}");
+        let client = reqwest::Client::new();
+
+        let create = client
+            .post(format!("{gateway}/api/servers"))
+            .header("x-moor-token", "test-token")
+            .json(&json!({
+                "name": "protected",
+                "connectionType": "http",
+                "url": format!("http://{upstream_addr}/mcp"),
+                "headers": { "Authorization": "Bearer static-token" }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let server_id = create.json::<Value>().await.unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let profiles = client
+            .get(format!("{gateway}/api/profiles"))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let profile_id = profiles
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|profile| profile["isActive"] == true)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap();
+        let direct = client
+            .put(format!("{gateway}/api/profiles/{profile_id}"))
+            .header("x-moor-token", "test-token")
+            .json(&json!({ "exposureMode": "direct" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(direct.status(), StatusCode::OK);
+        for path in ["start", "tools/refresh", "check-health"] {
+            let response = client
+                .post(format!("{gateway}/api/servers/{server_id}/{path}"))
+                .header("x-moor-token", "test-token")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+
+        let initialize = client
+            .post(format!("{gateway}/mcp"))
+            .header("accept", "application/json")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test-agent", "version": "1.0.0" }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        let session_id = initialize
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let call = client
+            .post(format!("{gateway}/mcp"))
+            .header("accept", "application/json")
+            .header("mcp-session-id", session_id)
+            .header("mcp-protocol-version", "2025-03-26")
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": "protected__echo", "arguments": { "value": "ok" } }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(call.status(), StatusCode::OK);
+        let call_body = call.json::<Value>().await.unwrap();
+        assert_eq!(
+            call_body["result"]["content"][0]["text"], "ok",
+            "{call_body}"
+        );
+
+        let mut requests = Vec::new();
+        while let Ok(request) = received.try_recv() {
+            requests.push(request);
+        }
+        assert!(requests
+            .iter()
+            .all(|(_, authorization)| authorization == "Bearer static-token"));
+        for method in [
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+            "ping",
+            "tools/call",
+        ] {
+            assert!(
+                requests.iter().any(|(actual, _)| actual == method),
+                "missing {method}: {requests:?}"
+            );
+        }
+        assert!(
+            requests
+                .iter()
+                .filter(|(method, _)| method == "tools/list")
+                .count()
+                >= 2
+        );
+
+        gateway_server.abort();
+        upstream_server.abort();
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+}
