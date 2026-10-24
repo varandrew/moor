@@ -112,7 +112,7 @@ fn sensitive_stderr_key_regex() -> &'static regex_lite::Regex {
     static REGEX: OnceLock<regex_lite::Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
         regex_lite::Regex::new(
-            r"(?i)\b([A-Za-z0-9_-]*(?:token|password|secret|api[_-]?(?:key|token)|cookie)[A-Za-z0-9_-]*)\b(\s*[:=]\s*)([^\s,;]+)",
+            r#"(?i)\b([A-Za-z0-9_-]*(?:token|password|secret|api[_-]?(?:key|token)|cookie|authorization)[A-Za-z0-9_-]*)\b(["']?\s*[:=]\s*)("(?:[^"\\]|\\.)*"|'[^']*'|[^\s,;]+)"#,
         )
         .expect("sensitive stderr key regex should compile")
     })

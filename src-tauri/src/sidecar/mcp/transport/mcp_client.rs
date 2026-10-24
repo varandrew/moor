@@ -1,6 +1,8 @@
 use super::request_error::RequestError;
 use crate::sidecar::db::tool_discovery_repo::ToolInsert;
-use crate::sidecar::mcp::transport::http_client::HttpClientTransport;
+use crate::sidecar::mcp::transport::http_client::{
+    HttpClientTransport, HTTP_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION,
+};
 use crate::sidecar::mcp::transport::stdio_client::StdioClientTransport;
 use crate::sidecar::services::server_log::DiagnosticAttempt;
 use serde_json::Value;
@@ -58,7 +60,7 @@ impl McpClient {
         }
         Ok(())
     }
-    pub async fn connect_stdio(config: StdioConnectConfig) -> Result<Self, String> {
+    pub async fn connect_stdio(config: StdioConnectConfig) -> Result<Self, RequestError> {
         let transport = StdioClientTransport::spawn(
             &config.command,
             &config.args,
@@ -76,7 +78,7 @@ impl McpClient {
         Ok(client)
     }
 
-    pub async fn connect_http(config: HttpConnectConfig) -> Result<Self, String> {
+    pub async fn connect_http(config: HttpConnectConfig) -> Result<Self, RequestError> {
         let transport = HttpClientTransport::new(
             &config.url,
             config.headers,
@@ -90,17 +92,16 @@ impl McpClient {
         Ok(client)
     }
 
-    pub async fn list_tools(&self) -> Result<Vec<ToolInsert>, String> {
+    pub async fn list_tools(&self) -> Result<Vec<ToolInsert>, RequestError> {
         let result = match &self.transport {
             McpTransport::Stdio(t) => t
                 .send_request("tools/list", Some(serde_json::json!({})))
                 .await
-                .map_err(|error| self.stdio_error_message(error.message))?,
+                .map_err(|error| self.enrich_stdio_error(error))?,
             McpTransport::Http(t) => {
                 let id = chrono::Utc::now().timestamp_millis();
                 t.send_request(id, "tools/list", Some(serde_json::json!({})))
-                    .await
-                    .map_err(|error| error.message)?
+                    .await?
             }
         };
         Ok(parse_tools_list(&result))
@@ -145,9 +146,9 @@ impl McpClient {
         }
     }
 
-    async fn handshake(&mut self) -> Result<(), String> {
+    async fn handshake(&mut self) -> Result<(), RequestError> {
         let init_params = serde_json::json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": LEGACY_PROTOCOL_VERSION,
             "capabilities": {},
             "clientInfo": {
                 "name": format!("moor-{}", self.server_name),
@@ -160,17 +161,57 @@ impl McpClient {
                 let _ = t
                     .send_request("initialize", Some(init_params))
                     .await
-                    .map_err(|error| t.with_startup_stderr_summary(error.message))?;
+                    .map_err(|error| RequestError {
+                        message: t.with_startup_stderr_summary(error.message),
+                        ..error
+                    })?;
                 t.send_notification("notifications/initialized", Some(serde_json::json!({})))
                     .await
                     .map_err(|err| t.with_startup_stderr_summary(err))?;
             }
             McpTransport::Http(t) => {
-                let id = chrono::Utc::now().timestamp_millis();
-                let _ = t
-                    .send_request(id, "initialize", Some(init_params))
-                    .await
-                    .map_err(|error| error.message)?;
+                let mut init_params = init_params;
+                let mut first_error = None;
+                loop {
+                    init_params["protocolVersion"] = t.protocol_version().into();
+                    let id = chrono::Utc::now().timestamp_millis();
+                    match t
+                        .send_request(id, "initialize", Some(init_params.clone()))
+                        .await
+                    {
+                        Ok(result) => {
+                            let version = result
+                                .get("protocolVersion")
+                                .and_then(Value::as_str)
+                                .ok_or("MCP initialize response is missing protocolVersion")?;
+                            if ![HTTP_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION].contains(&version)
+                            {
+                                return Err(format!(
+                                    "Unsupported negotiated MCP protocol version: {version}"
+                                )
+                                .into());
+                            }
+                            t.set_protocol_version(version);
+                            break;
+                        }
+                        Err(error)
+                            if first_error.is_none() && error.is_protocol_version_error() =>
+                        {
+                            first_error = Some(error);
+                            t.restart_with_protocol_version(LEGACY_PROTOCOL_VERSION);
+                        }
+                        Err(mut error) => {
+                            if let Some(first) = first_error {
+                                error.message = format!(
+                                    "{}; initial version attempt failed: {}",
+                                    error.message,
+                                    first.diagnostic_message()
+                                );
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
                 t.send_notification("notifications/initialized", Some(serde_json::json!({})))
                     .await?;
             }
@@ -234,7 +275,11 @@ impl crate::sidecar::services::server_manager::McpSession for McpClient {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Vec<ToolInsert>, String>> + Send + '_>,
     > {
-        Box::pin(async move { McpClient::list_tools(self).await })
+        Box::pin(async move {
+            McpClient::list_tools(self)
+                .await
+                .map_err(|error| error.message)
+        })
     }
 
     fn call_tool<'a>(

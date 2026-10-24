@@ -39,7 +39,11 @@ pub trait McpSession: Send {
 /// 连接工厂返回的会话盒。类型别名消除 clippy::type_complexity 警告,
 /// 也让 connect 签名更可读。
 pub type BoxedConnectFuture<'a> = Pin<
-    Box<dyn Future<Output = Result<(Vec<ToolInsert>, Box<dyn McpSession>), String>> + Send + 'a>,
+    Box<
+        dyn Future<Output = Result<(Vec<ToolInsert>, Box<dyn McpSession>), RequestError>>
+            + Send
+            + 'a,
+    >,
 >;
 
 /// 连接工厂接口。把"怎么从存储配置建立会话"藏到接缝背后。
@@ -71,7 +75,7 @@ impl McpConnector for StdioHttpConnector {
             match config.connection_type.as_str() {
                 "stdio" => Self::connect_stdio(config, timeouts, diagnostics).await,
                 "http" => Self::connect_http(config, timeouts).await,
-                other => Err(format!("Unknown connection type: {other}")),
+                other => Err(format!("Unknown connection type: {other}").into()),
             }
         })
     }
@@ -82,7 +86,7 @@ impl StdioHttpConnector {
         config: &StoredServerConfig,
         timeouts: ServerTimeouts,
         diagnostics: DiagnosticAttempt,
-    ) -> Result<(Vec<ToolInsert>, Box<dyn McpSession>), String> {
+    ) -> Result<(Vec<ToolInsert>, Box<dyn McpSession>), RequestError> {
         let command = config
             .command
             .as_deref()
@@ -128,7 +132,7 @@ impl StdioHttpConnector {
     async fn connect_http(
         config: &StoredServerConfig,
         timeouts: ServerTimeouts,
-    ) -> Result<(Vec<ToolInsert>, Box<dyn McpSession>), String> {
+    ) -> Result<(Vec<ToolInsert>, Box<dyn McpSession>), RequestError> {
         let url = config.url.as_deref().ok_or("http server requires url")?;
 
         let headers = config

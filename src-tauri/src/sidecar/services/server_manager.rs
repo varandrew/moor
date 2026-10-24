@@ -248,13 +248,13 @@ impl ServerManager {
         }
     }
 
-    pub async fn start_server(&self, id: &str) -> Result<(), String> {
+    pub async fn start_server(&self, id: &str) -> Result<(), RequestError> {
         let timeouts = self.get_timeout_settings();
         let config = self.get_stored_config(id);
         let (should_wait, start_token, start_deadline, start_timeout_ms, diagnostics) = {
             let mut slots = self.slots.lock().await;
             let Some(slot) = slots.get_mut(id) else {
-                return Err(format!("Server {id} not found"));
+                return Err(format!("Server {id} not found").into());
             };
             match &slot.status {
                 ServerStatus::Running => return Ok(()),
@@ -288,7 +288,8 @@ impl ServerManager {
         if should_wait {
             return self
                 .wait_for_start(id, start_deadline, start_timeout_ms)
-                .await;
+                .await
+                .map_err(Into::into);
         }
 
         self.persist_server_status(id, "starting", None);
@@ -303,16 +304,16 @@ impl ServerManager {
                             .connect(&config, timeouts, diagnostics.clone())
                             .await
                     }
-                    Err(err) => Err(err),
+                    Err(err) => Err(err.into()),
                 }
             })
             .await
             {
                 Ok(result) => result,
-                Err(_) => Err(format!(
+                Err(_) => Err(RequestError::timeout(format!(
                     "Server start timed out after {}",
                     format_timeout_ms(timeouts.start_ms)
-                )),
+                ))),
             };
 
         match result {
@@ -360,7 +361,7 @@ impl ServerManager {
                     Err(ToolRefreshError::Changed) => Ok(()),
                     Err(error) => {
                         diagnostics.append_event(&format!("Start failed: {error}"));
-                        Err(error.to_string())
+                        Err(error.to_string().into())
                     }
                 }
             }
@@ -384,7 +385,7 @@ impl ServerManager {
                         false
                     }
                 };
-                diagnostics.append_event(&format!("Start failed: {public_msg}"));
+                diagnostics.append_event(&format!("Start failed: {}", e.diagnostic_message()));
                 if should_persist {
                     self.persist_server_status(id, "error", Some(&public_msg));
                     Err(e)
@@ -997,7 +998,7 @@ process.stdin.on("data", (chunk) => {{
     fn public_error_prefers_stdio_stderr_summary() {
         assert_eq!(
             public_server_start_error_message(
-                "request timed out after 30s. stdio stderr: npm ERR! package not found"
+                &"request timed out after 30s. stdio stderr: npm ERR! package not found".into()
             ),
             "Server failed to start: npm ERR! package not found"
         );
@@ -1006,8 +1007,8 @@ process.stdin.on("data", (chunk) => {{
     #[test]
     fn public_error_falls_back_without_stdio_stderr_summary() {
         assert_eq!(
-            public_server_start_error_message("request timed out after 30s"),
-            "Server failed to start. Check logs for details."
+            public_server_start_error_message(&"request timed out after 30s".into()),
+            "Server failed to start. Check logs for details.\nrequest timed out after 30s"
         );
     }
 
@@ -1015,7 +1016,7 @@ process.stdin.on("data", (chunk) => {{
     fn public_error_exposes_remote_mcp_error_message() {
         assert_eq!(
             public_server_start_error_message(
-                "Remote MCP server error: Bad Request: No valid session ID provided"
+                &"Remote MCP server error: Bad Request: No valid session ID provided".into()
             ),
             "Server failed to start: Bad Request: No valid session ID provided"
         );
@@ -1289,7 +1290,7 @@ process.stdin.on("data", (chunk) => {{
         // 握手期请求超时被钳制到 start_ms(session.rs:111),与外层启动超时
         // 同 deadline 竞速,任一层先触发均证明 5s deadline 被尊重(同 :966 断言)
         assert!(
-            err.contains("timed out after 5s"),
+            err.message.contains("timed out after 5s"),
             "unexpected start error: {err}"
         );
         let runtime = manager
@@ -1303,10 +1304,10 @@ process.stdin.on("data", (chunk) => {{
             .expect("server should load")
             .expect("server should exist");
         assert_eq!(stored.status, "error");
-        assert_eq!(
-            stored.error_message.as_deref(),
-            Some("Server failed to start. Check logs for details.")
-        );
+        assert!(stored.error_message.as_deref().is_some_and(|message| {
+            message.starts_with("Server failed to start. Check logs for details.\n")
+                && message.contains("timed out after 5s")
+        }));
 
         let _ = std::fs::remove_dir_all(data_dir);
     }
@@ -1493,7 +1494,7 @@ process.stdin.on("data", (chunk) => {{
             .start_server(&server_id)
             .await
             .expect_err("tool discovery should fail");
-        assert_eq!(err.matches(". stdio stderr: ").count(), 1);
+        assert_eq!(err.message.matches(". stdio stderr: ").count(), 1);
 
         let stored = ServerRepository::new(&db)
             .find_by_id(&server_id)

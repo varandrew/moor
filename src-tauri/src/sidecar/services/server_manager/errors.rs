@@ -1,6 +1,8 @@
 // 面向用户脱敏后的启动错误消息 —— 自由函数,无运行时状态。
 
+use crate::sidecar::mcp::transport::request_error::{RequestError, RequestErrorKind};
 use crate::sidecar::mcp::transport::stdio_client::find_executable_on_path;
+use crate::sidecar::services::server_log::redact_sensitive_stderr_values;
 use std::collections::HashMap;
 
 pub(crate) fn verify_command_available(
@@ -21,7 +23,19 @@ pub(crate) fn verify_command_available(
     })
 }
 
-pub fn public_server_start_error_message(err: &str) -> String {
+pub fn public_server_start_error_message(error: &RequestError) -> String {
+    let diagnostic = error.diagnostic_message();
+    let message = redact_sensitive_stderr_values(&error.message);
+    let err = message.as_str();
+    if let Some(summary) = extract_stdio_stderr_summary(err) {
+        return format!(
+            "Server failed to start: {}",
+            summary.chars().take(4096).collect::<String>()
+        );
+    }
+    if error.kind == RequestErrorKind::Rpc || error.http_status.is_some() {
+        return format!("Server failed to start: {diagnostic}");
+    }
     if let Some(cmd) = extract_missing_command(err) {
         return format!("Command \"{cmd}\" was not found. Configure an absolute command path or update this server environment.");
     }
@@ -31,10 +45,9 @@ pub fn public_server_start_error_message(err: &str) -> String {
     if let Some(message) = extract_remote_mcp_error_message(err) {
         return format!("Server failed to start: {message}");
     }
-    if let Some(summary) = extract_stdio_stderr_summary(err) {
-        return format!("Server failed to start: {summary}");
-    }
-    "Server failed to start. Check logs for details.".to_string()
+    redact_sensitive_stderr_values(&format!(
+        "Server failed to start. Check logs for details.\n{diagnostic}"
+    ))
 }
 
 pub(super) fn format_timeout_ms(timeout_ms: u32) -> String {

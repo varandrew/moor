@@ -200,6 +200,7 @@ mod tests {
             Err(RequestError {
                 kind: crate::sidecar::mcp::transport::request_error::RequestErrorKind::Transport,
                 data: None,
+                http_status: None,
                 code: Some(-32601),
                 message: "Method not found".into(),
             }),

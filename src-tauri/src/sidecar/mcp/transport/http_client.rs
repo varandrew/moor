@@ -10,6 +10,8 @@ use super::request_error::{parse_response, RequestError};
 static ENV_PATTERN: OnceLock<regex_lite::Regex> = OnceLock::new();
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 const REMOTE_MCP_ERROR_PREFIX: &str = "Remote MCP server error: ";
+pub const HTTP_PROTOCOL_VERSION: &str = "2025-03-26";
+pub const LEGACY_PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// MCP Client over HTTP transport (Streamable HTTP or SSE).
 /// Uses reqwest to communicate with HTTP-based MCP servers.
@@ -20,6 +22,7 @@ pub struct HttpClientTransport {
     mode: Mutex<HttpMode>,
     session_id: Mutex<Option<String>>,
     request_timeout: Duration,
+    protocol_version: String,
 }
 
 enum HttpMode {
@@ -40,7 +43,7 @@ struct SseEvent {
 }
 
 enum StreamableError {
-    Unsupported(String),
+    Unsupported(RequestError),
     Failed(RequestError),
 }
 
@@ -53,7 +56,21 @@ impl HttpClientTransport {
             mode: Mutex::new(HttpMode::Unknown),
             session_id: Mutex::new(None),
             request_timeout,
+            protocol_version: HTTP_PROTOCOL_VERSION.to_string(),
         }
+    }
+
+    pub fn protocol_version(&self) -> &str {
+        &self.protocol_version
+    }
+
+    pub fn set_protocol_version(&mut self, version: &str) {
+        self.protocol_version = version.to_string();
+    }
+
+    pub fn restart_with_protocol_version(&mut self, version: &str) {
+        *self = Self::new(&self.url, self.headers.clone(), self.request_timeout);
+        self.set_protocol_version(version);
     }
 
     pub fn set_request_timeout(&mut self, request_timeout: Duration) {
@@ -79,14 +96,25 @@ impl HttpClientTransport {
         params: Option<Value>,
         timeout: Duration,
     ) -> Result<Value, RequestError> {
-        tokio::time::timeout(timeout, self.send_request_inner(id, method, params))
-            .await
-            .map_err(|_| {
-                RequestError::timeout(format!(
-                    "HTTP request timed out after {}",
-                    format_timeout_duration(timeout)
-                ))
-            })?
+        let mut fallback_error = None;
+        tokio::time::timeout(
+            timeout,
+            self.send_request_inner(id, method, params, &mut fallback_error),
+        )
+        .await
+        .map_err(|_| {
+            let error = RequestError::timeout(format!(
+                "HTTP request timed out after {}",
+                format_timeout_duration(timeout)
+            ));
+            match fallback_error {
+                Some(original) => RequestError {
+                    kind: error.kind,
+                    ..original.with_fallback_error(&error)
+                },
+                None => error,
+            }
+        })?
     }
 
     async fn send_request_inner(
@@ -94,6 +122,7 @@ impl HttpClientTransport {
         id: i64,
         method: &str,
         params: Option<Value>,
+        fallback_error: &mut Option<RequestError>,
     ) -> Result<Value, RequestError> {
         let mut mode = self.mode.lock().await;
         match &mut *mode {
@@ -110,14 +139,20 @@ impl HttpClientTransport {
                     *mode = HttpMode::Streamable;
                     Ok(value)
                 }
-                Err(StreamableError::Unsupported(_)) => {
-                    let mut state = self.open_sse().await?;
-                    let value = self
-                        .send_sse_request(&mut state, id, method, params)
-                        .await?;
-                    *mode = HttpMode::Sse(state);
-                    Ok(value)
+                Err(StreamableError::Unsupported(original)) if method == "initialize" => {
+                    *fallback_error = Some(original.clone());
+                    let fallback: Result<Value, RequestError> = async {
+                        let mut state = self.open_sse().await?;
+                        let value = self
+                            .send_sse_request(&mut state, id, method, params)
+                            .await?;
+                        *mode = HttpMode::Sse(state);
+                        Ok(value)
+                    }
+                    .await;
+                    fallback.map_err(|error| original.with_fallback_error(&error))
                 }
+                Err(StreamableError::Unsupported(error)) => Err(error),
                 Err(StreamableError::Failed(message)) => Err(message),
             },
         }
@@ -142,28 +177,17 @@ impl HttpClientTransport {
             .streamable_post_builder()
             .await
             .header("accept", "application/json, text/event-stream")
-            .header("mcp-protocol-version", "2024-11-05");
+            .header("mcp-protocol-version", &self.protocol_version);
 
         let response = builder
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| StreamableError::Unsupported(format!("HTTP request failed: {e}")))?;
+            .map_err(|e| StreamableError::Failed(format!("HTTP request failed: {e}").into()))?;
 
         let status = response.status();
         if !status.is_success() {
-            if let Some(error) = remote_jsonrpc_error(response).await {
-                return Err(StreamableError::Failed(error));
-            }
-            return if is_streamable_unsupported_status(status) {
-                Err(StreamableError::Unsupported(format!(
-                    "Streamable HTTP unsupported: {status}"
-                )))
-            } else {
-                Err(StreamableError::Failed(
-                    format!("HTTP request failed: {status}").into(),
-                ))
-            };
+            return Err(http_response_error(response).await);
         }
 
         self.capture_streamable_session_id(method, response.headers())
@@ -184,9 +208,9 @@ impl HttpClientTransport {
                 .map_err(StreamableError::Failed)
         } else {
             let body = response.json::<Value>().await.map_err(|e| {
-                StreamableError::Unsupported(format!(
-                    "Failed to parse JSON response ({status}): {e}"
-                ))
+                StreamableError::Failed(
+                    format!("Failed to parse JSON response ({status}): {e}").into(),
+                )
             })?;
 
             parse_response(&body).map_err(StreamableError::Failed)
@@ -197,13 +221,13 @@ impl HttpClientTransport {
         &self,
         method: &str,
         params: Option<Value>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RequestError> {
         let mut mode = self.mode.lock().await;
         match &mut *mode {
             HttpMode::Streamable => self
                 .send_streamable_notification(method, params)
                 .await
-                .map_err(StreamableError::into_message),
+                .map_err(StreamableError::into_request_error),
             HttpMode::Sse(state) => self.send_sse_notification(state, method, params).await,
             HttpMode::Unknown => match self
                 .send_streamable_notification(method, params.clone())
@@ -213,14 +237,7 @@ impl HttpClientTransport {
                     *mode = HttpMode::Streamable;
                     Ok(())
                 }
-                Err(StreamableError::Unsupported(_)) => {
-                    let mut state = self.open_sse().await?;
-                    self.send_sse_notification(&mut state, method, params)
-                        .await?;
-                    *mode = HttpMode::Sse(state);
-                    Ok(())
-                }
-                Err(StreamableError::Failed(error)) => Err(error.message),
+                Err(error) => Err(error.into_request_error()),
             },
         }
     }
@@ -240,27 +257,15 @@ impl HttpClientTransport {
             .streamable_post_builder()
             .await
             .header("accept", "application/json, text/event-stream")
-            .header("mcp-protocol-version", "2024-11-05")
+            .header("mcp-protocol-version", &self.protocol_version)
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| StreamableError::Unsupported(format!("HTTP notification failed: {e}")))?;
+            .map_err(|e| {
+                StreamableError::Failed(format!("HTTP notification failed: {e}").into())
+            })?;
         if !response.status().is_success() {
-            let status = response.status();
-            if let Some(message) = remote_jsonrpc_error_message(response).await {
-                return Err(StreamableError::Failed(
-                    format!("{REMOTE_MCP_ERROR_PREFIX}{message}").into(),
-                ));
-            }
-            return if is_streamable_unsupported_status(status) {
-                Err(StreamableError::Unsupported(format!(
-                    "Streamable HTTP unsupported: {status}"
-                )))
-            } else {
-                Err(StreamableError::Failed(
-                    format!("HTTP notification failed: {status}").into(),
-                ))
-            };
+            return Err(http_response_error(response).await);
         }
         Ok(())
     }
@@ -296,19 +301,28 @@ impl HttpClientTransport {
         *self.session_id.lock().await = Some(session_id.to_string());
     }
 
-    async fn open_sse(&self) -> Result<SseState, String> {
+    async fn open_sse(&self) -> Result<SseState, RequestError> {
         let mut builder = self.client.get(&self.url);
         for (key, value) in &self.headers {
             builder = builder.header(key, value);
         }
         let response = builder
             .header("accept", "text/event-stream")
-            .header("mcp-protocol-version", "2024-11-05")
+            .header("mcp-protocol-version", &self.protocol_version)
             .send()
             .await
             .map_err(|e| format!("SSE connection failed: {e}"))?;
         if !response.status().is_success() {
-            return Err(format!("SSE connection failed: {}", response.status()));
+            return Err(http_response_error(response).await.into_request_error());
+        }
+
+        if !response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|value| value.contains("text/event-stream"))
+        {
+            return Err("Legacy SSE endpoint did not return text/event-stream".into());
         }
 
         let mut state = SseState {
@@ -319,8 +333,7 @@ impl HttpClientTransport {
         loop {
             let event =
                 read_next_sse_event(&mut state.response, &mut state.buffer, self.request_timeout)
-                    .await
-                    .map_err(|error| error.message)?;
+                    .await?;
             if event.event.as_deref() == Some("endpoint") {
                 state.endpoint = resolve_sse_endpoint(&self.url, &event.data)?;
                 return Ok(state);
@@ -358,7 +371,7 @@ impl HttpClientTransport {
         state: &mut SseState,
         method: &str,
         params: Option<Value>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RequestError> {
         let request_body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -367,14 +380,18 @@ impl HttpClientTransport {
         self.post_sse_message(state, &request_body).await
     }
 
-    async fn post_sse_message(&self, state: &SseState, message: &Value) -> Result<(), String> {
+    async fn post_sse_message(
+        &self,
+        state: &SseState,
+        message: &Value,
+    ) -> Result<(), RequestError> {
         let mut builder = self.client.post(&state.endpoint);
         for (key, value) in &self.headers {
             builder = builder.header(key, value);
         }
         let response = builder
             .header("accept", "application/json")
-            .header("mcp-protocol-version", "2024-11-05")
+            .header("mcp-protocol-version", &self.protocol_version)
             .json(message)
             .send()
             .await
@@ -382,7 +399,7 @@ impl HttpClientTransport {
         if response.status().is_success() {
             Ok(())
         } else {
-            Err(format!("SSE message post failed: {}", response.status()))
+            Err(http_response_error(response).await.into_request_error())
         }
     }
 }
@@ -390,38 +407,76 @@ impl HttpClientTransport {
 impl StreamableError {
     fn into_request_error(self) -> RequestError {
         match self {
-            Self::Unsupported(message) => message.into(),
+            Self::Unsupported(error) => error,
             Self::Failed(error) => error,
         }
     }
-
-    fn into_message(self) -> String {
-        self.into_request_error().message
-    }
 }
 
-async fn remote_jsonrpc_error(response: reqwest::Response) -> Option<RequestError> {
-    let body = response.json::<Value>().await.ok()?;
-    let mut error = RequestError::from_rpc(body.get("error")?);
-    error.message = format!("{REMOTE_MCP_ERROR_PREFIX}{}", error.message);
-    Some(error)
+async fn http_response_error(mut response: reqwest::Response) -> StreamableError {
+    const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
+    let status = response.status();
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    let mut read_error = None;
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let remaining = MAX_ERROR_BODY_BYTES - bytes.len();
+                bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if chunk.len() > remaining {
+                    truncated = true;
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                read_error = Some(error);
+                break;
+            }
+        }
+    }
+    let body = serde_json::from_slice::<Value>(&bytes).ok();
+    let rpc = body
+        .as_ref()
+        .and_then(|body| body.get("error").map(RequestError::from_rpc));
+    let mut error = rpc.unwrap_or_else(|| {
+        let message = body
+            .as_ref()
+            .map(|body| {
+                crate::sidecar::services::audit_redaction::redact_for_audit(body).to_string()
+            })
+            .unwrap_or_else(|| String::from_utf8_lossy(&bytes).trim().to_string());
+        if message.is_empty() {
+            format!("HTTP request failed: {status}").into()
+        } else {
+            message.into()
+        }
+    });
+    error.http_status = Some(status.as_u16());
+    if error.kind == super::request_error::RequestErrorKind::Rpc {
+        error.message = format!("{REMOTE_MCP_ERROR_PREFIX}{}", error.message);
+    }
+    if truncated {
+        error.message.push_str(" [response truncated]");
+    }
+    if let Some(read_error) = read_error {
+        error
+            .message
+            .push_str(&format!("; response body read failed: {read_error}"));
+    }
+    if is_streamable_unsupported_status(status)
+        && error.kind != super::request_error::RequestErrorKind::Rpc
+        && !error.is_protocol_version_error()
+    {
+        StreamableError::Unsupported(error)
+    } else {
+        StreamableError::Failed(error)
+    }
 }
 
 fn is_streamable_unsupported_status(status: reqwest::StatusCode) -> bool {
     matches!(status.as_u16(), 400 | 404 | 405 | 406 | 415)
-}
-
-async fn remote_jsonrpc_error_message(response: reqwest::Response) -> Option<String> {
-    let body = response.json::<Value>().await.ok()?;
-    jsonrpc_error_message(&body).map(String::from)
-}
-
-fn jsonrpc_error_message(body: &Value) -> Option<&str> {
-    body.get("error")
-        .and_then(|error| error.get("message"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
 }
 
 async fn read_sse_jsonrpc_response(
