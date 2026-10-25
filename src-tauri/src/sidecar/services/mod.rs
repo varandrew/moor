@@ -3,6 +3,7 @@ pub mod audit_redaction;
 pub mod event_bus;
 pub mod import_service;
 pub mod profile_service;
+pub mod server_authorization;
 pub mod server_log;
 pub mod server_manager;
 pub mod server_service;

@@ -19,6 +19,9 @@ pub enum Evt {
     },
     /// 服务器工具列表变更(启动后重新发现工具)。
     ServerTools { server_id: String },
+    ServerAuthorization {
+        snapshot: super::server_authorization::AuthorizationSnapshot,
+    },
     /// 活动 Profile 切换。
     ProfileActivated { profile_id: String },
     /// 工具目录因治理操作（置顶、禁用、曝光模式、风险策略）发生变化。
@@ -34,6 +37,7 @@ impl Evt {
             Evt::ServerHealth { .. } => "server:health",
             Evt::ServerStatus { .. } => "server:status",
             Evt::ServerTools { .. } => "server:tools",
+            Evt::ServerAuthorization { .. } => "server:authorization",
             Evt::ProfileActivated { .. } => "profile:activated",
             Evt::ToolsChanged { .. } => "tools:changed",
             Evt::SettingsChanged { .. } => "settings:changed",
@@ -56,6 +60,9 @@ impl Evt {
                 "errorMessage": error_message,
             }),
             Evt::ServerTools { server_id } => serde_json::json!({ "serverId": server_id }),
+            Evt::ServerAuthorization { snapshot } => {
+                serde_json::to_value(snapshot).expect("authorization snapshot serializes")
+            }
             Evt::ProfileActivated { profile_id } => {
                 serde_json::json!({ "profileId": profile_id })
             }

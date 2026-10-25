@@ -19,6 +19,7 @@ use crate::sidecar::db::Database;
 use crate::sidecar::mcp::transport::request_error::{RequestError, RequestErrorKind};
 use crate::sidecar::services::audit_recorder::{AuditRecorder, ToolCallRecord, ToolCallVia};
 use crate::sidecar::services::event_bus::{EventBus, Evt};
+use crate::sidecar::services::server_authorization::ServerAuthorization;
 use crate::sidecar::services::server_log::{DiagnosticAttempt, ServerDiagnostics};
 use crate::sidecar::services::settings;
 use crate::sidecar::services::tool_catalog::{ToolCatalogService, ToolDetail, ToolExposure};
@@ -127,6 +128,7 @@ pub struct ServerManager {
     db: Arc<Database>,
     event_bus: Arc<EventBus>,
     connector: Arc<dyn McpConnector>,
+    authorization: Arc<ServerAuthorization>,
     diagnostics: ServerDiagnostics,
 }
 
@@ -138,22 +140,67 @@ pub(crate) struct ServerTimeouts {
 
 impl ServerManager {
     pub fn new(db: Arc<Database>, event_bus: Arc<EventBus>) -> Self {
-        Self::with_connector(db, event_bus, Arc::new(StdioHttpConnector))
+        let authorization = Arc::new(ServerAuthorization::new(db.clone(), event_bus.clone()));
+        Self::with_connector_and_authorization(
+            db,
+            event_bus,
+            Arc::new(StdioHttpConnector {
+                authorization: authorization.clone(),
+            }),
+            authorization,
+        )
+    }
+
+    #[cfg(test)]
+    pub fn new_with_credential_store(
+        db: Arc<Database>,
+        event_bus: Arc<EventBus>,
+        store: Arc<dyn crate::sidecar::services::server_authorization::CredentialStore>,
+    ) -> Self {
+        let authorization = Arc::new(ServerAuthorization::with_credential_store(
+            db.clone(),
+            event_bus.clone(),
+            store,
+        ));
+        Self::with_connector_and_authorization(
+            db,
+            event_bus,
+            Arc::new(StdioHttpConnector {
+                authorization: authorization.clone(),
+            }),
+            authorization,
+        )
     }
 
     /// 测试入口:注入自定义连接工厂,让 start_server 状态机可在没有真实子进程的情况下测。
+    #[cfg(test)]
     pub fn with_connector(
         db: Arc<Database>,
         event_bus: Arc<EventBus>,
         connector: Arc<dyn McpConnector>,
+    ) -> Self {
+        let authorization = Arc::new(ServerAuthorization::new(db.clone(), event_bus.clone()));
+        Self::with_connector_and_authorization(db, event_bus, connector, authorization)
+    }
+
+    fn with_connector_and_authorization(
+        db: Arc<Database>,
+        event_bus: Arc<EventBus>,
+        connector: Arc<dyn McpConnector>,
+        authorization: Arc<ServerAuthorization>,
     ) -> Self {
         Self {
             slots: Arc::new(Mutex::new(HashMap::new())),
             db,
             event_bus,
             connector,
+            authorization,
             diagnostics: ServerDiagnostics::default(),
         }
+    }
+
+    pub fn authorization(&self) -> Arc<ServerAuthorization> {
+        self.authorization.clone()
     }
 
     /// 生产入口:开启 per-server 日志(<logs_dir>/<server_id>.log),测试默认关闭。
@@ -709,6 +756,7 @@ impl ServerManager {
             .find_by_id(id)?
             .ok_or_else(|| format!("Server {id} not found"))?;
         Ok(StoredServerConfig {
+            id: server.id,
             name: server.name,
             connection_type: server.connection_type,
             command: server.command,
@@ -746,6 +794,7 @@ impl ServerManager {
 }
 
 pub(crate) struct StoredServerConfig {
+    id: String,
     name: String,
     connection_type: String,
     command: Option<String>,

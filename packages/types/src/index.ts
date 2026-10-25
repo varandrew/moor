@@ -8,6 +8,12 @@ export type {
   ServerUpdateInput,
 } from "./server.js";
 export type {
+  AuthorizationClientInput,
+  AuthorizationStart,
+  AuthorizationState,
+  ServerAuthorization,
+} from "./authorization.js";
+export type {
   ImportDiagnostic,
   ImportPreview,
   ParsedImport,
@@ -32,6 +38,7 @@ export type {
   MoorEventData,
   MoorEventType,
   ProfileActivatedEvent,
+  ServerAuthorizationEvent,
   ServerStatusEvent,
   ServerToolsEvent,
   SettingsChangedEvent,

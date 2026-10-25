@@ -13,6 +13,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// 运行时 MCP 会话接口。连接建立后,ServerManager 通过它列工具、调工具、断开、
@@ -62,7 +63,9 @@ pub trait McpConnector: Send + Sync {
 /// 真实连接工厂适配器。按 connection_type 分派到 stdio/http 连接,
 /// 在内部完成环境变量构建、命令可用性检查、header 解析、MCP 握手,
 /// 然后返回一个装在 Box<dyn McpSession> 里的 McpClient。
-pub(super) struct StdioHttpConnector;
+pub(super) struct StdioHttpConnector {
+    pub authorization: Arc<crate::sidecar::services::server_authorization::ServerAuthorization>,
+}
 
 impl McpConnector for StdioHttpConnector {
     fn connect<'a>(
@@ -74,7 +77,7 @@ impl McpConnector for StdioHttpConnector {
         Box::pin(async move {
             match config.connection_type.as_str() {
                 "stdio" => Self::connect_stdio(config, timeouts, diagnostics).await,
-                "http" => Self::connect_http(config, timeouts).await,
+                "http" => self.connect_http(config, timeouts).await,
                 other => Err(format!("Unknown connection type: {other}").into()),
             }
         })
@@ -130,6 +133,7 @@ impl StdioHttpConnector {
     }
 
     async fn connect_http(
+        &self,
         config: &StoredServerConfig,
         timeouts: ServerTimeouts,
     ) -> Result<(Vec<ToolInsert>, Box<dyn McpSession>), RequestError> {
@@ -154,7 +158,7 @@ impl StdioHttpConnector {
             server_name: config.name.clone(),
             url: url.to_string(),
             headers,
-            credential_provider: None,
+            credential_provider: self.authorization.credential_provider(&config.id)?,
             request_timeout_ms: timeouts.start_ms,
         })
         .await?;

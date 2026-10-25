@@ -83,8 +83,9 @@ impl McpClient {
     pub async fn connect_http(config: HttpConnectConfig) -> Result<Self, RequestError> {
         let request_timeout = Duration::from_millis(config.request_timeout_ms as u64);
         let transport = match config.credential_provider {
-            Some(provider) => HttpClientTransport::with_credential_provider(
+            Some(provider) => HttpClientTransport::with_credential_provider_and_headers(
                 &config.url,
+                config.headers,
                 provider,
                 request_timeout,
             ),

@@ -123,10 +123,26 @@ pub fn run_migrations(db: &Database) -> Result<(), String> {
     )?;
     ensure_column(db, "audit_logs", "via", "TEXT NOT NULL DEFAULT 'direct'")?;
     ensure_column(db, "audit_logs", "refusal", "TEXT")?;
+    db.exec(
+        "CREATE TABLE IF NOT EXISTS server_authorizations (
+            server_id TEXT PRIMARY KEY REFERENCES mcp_servers(id) ON DELETE CASCADE,
+            status TEXT NOT NULL CHECK(status IN ('required', 'authorized', 'error')),
+            issuer TEXT,
+            client_id TEXT,
+            client_secret_ref TEXT,
+            resource TEXT,
+            scopes TEXT NOT NULL DEFAULT '[]',
+            access_token_ref TEXT,
+            refresh_token_ref TEXT,
+            expires_at TEXT,
+            error_message TEXT,
+            updated_at TEXT NOT NULL
+        )",
+    )?;
     backfill_server_sort_order(db)?;
     normalize_audit_timestamps(db)?;
     // 版本号在列补齐之后才推进：迁移中途失败时下一次启动仍会重跑 ensure_column（幂等）。
-    db.exec("PRAGMA user_version = 2")?;
+    db.exec("PRAGMA user_version = 3")?;
 
     Ok(())
 }
@@ -363,7 +379,7 @@ mod tests {
         assert_eq!(
             db.query_one("PRAGMA user_version", &[], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            Some(2)
+            Some(3)
         );
         let plan = db.query_all("EXPLAIN QUERY PLAN SELECT * FROM audit_logs WHERE timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp DESC", &[&timestamps[0], &timestamps[1]], |row| row.get::<_, String>(3)).unwrap();
         assert!(plan

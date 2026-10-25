@@ -59,14 +59,29 @@ impl HttpClientTransport {
         Self::with_optional_credential_provider(url, headers, None, request_timeout)
     }
 
+    #[cfg(test)]
     pub fn with_credential_provider(
         url: &str,
         credential_provider: Arc<dyn HttpCredentialProvider>,
         request_timeout: Duration,
     ) -> Self {
-        Self::with_optional_credential_provider(
+        Self::with_credential_provider_and_headers(
             url,
             HashMap::new(),
+            credential_provider,
+            request_timeout,
+        )
+    }
+
+    pub fn with_credential_provider_and_headers(
+        url: &str,
+        headers: HashMap<String, String>,
+        credential_provider: Arc<dyn HttpCredentialProvider>,
+        request_timeout: Duration,
+    ) -> Self {
+        Self::with_optional_credential_provider(
+            url,
+            headers,
             Some(credential_provider),
             request_timeout,
         )
@@ -341,10 +356,11 @@ impl HttpClientTransport {
     }
 
     async fn request_headers(&self) -> Result<HashMap<String, String>, RequestError> {
-        match &self.credential_provider {
-            Some(provider) => provider.headers().await,
-            None => Ok(self.headers.clone()),
+        let mut headers = self.headers.clone();
+        if let Some(provider) = &self.credential_provider {
+            headers.extend(provider.headers().await?);
         }
+        Ok(headers)
     }
 
     async fn open_sse(&self) -> Result<SseState, RequestError> {
@@ -1286,13 +1302,18 @@ mod tests {
                 let sender = sender.clone();
                 async move {
                     sender
-                        .send(
+                        .send((
                             headers
                                 .get("authorization")
                                 .and_then(|value| value.to_str().ok())
                                 .unwrap_or_default()
                                 .to_string(),
-                        )
+                            headers
+                                .get("x-custom")
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string(),
+                        ))
                         .unwrap();
                     let method = body["method"].as_str().unwrap_or_default();
                     let result = match method {
@@ -1321,7 +1342,10 @@ mod tests {
         let client = McpClient::connect_http(HttpConnectConfig {
             server_name: "protected".to_string(),
             url: format!("http://{addr}/mcp"),
-            headers: HashMap::new(),
+            headers: HashMap::from([
+                ("authorization".to_string(), "Bearer manual".to_string()),
+                ("x-custom".to_string(), "preserved".to_string()),
+            ]),
             credential_provider: Some(Arc::new(RotatingCredentials {
                 next: std::sync::atomic::AtomicUsize::new(0),
             })),
@@ -1331,9 +1355,12 @@ mod tests {
         .unwrap();
         client.list_tools().await.unwrap();
 
-        assert_eq!(receiver.recv().await.as_deref(), Some("Bearer token-1"));
-        assert_eq!(receiver.recv().await.as_deref(), Some("Bearer token-2"));
-        assert_eq!(receiver.recv().await.as_deref(), Some("Bearer token-3"));
+        for token in ["Bearer token-1", "Bearer token-2", "Bearer token-3"] {
+            assert_eq!(
+                receiver.recv().await,
+                Some((token.to_string(), "preserved".to_string()))
+            );
+        }
         server.abort();
     }
 }

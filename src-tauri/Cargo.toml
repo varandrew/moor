@@ -36,6 +36,9 @@ regex-lite = "0.1"
 toml = "0.8"
 getrandom = "0.2"
 dirs = "6"
+keyring = "3"
+sha2 = "0.10"
+base64 = "0.22"
 
 [profile.release]
 strip = true

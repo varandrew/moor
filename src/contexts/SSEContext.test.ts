@@ -68,3 +68,19 @@ describe("server health events", () => {
     }
   });
 });
+
+describe("server authorization events", () => {
+  it("accepts authorization snapshots and rejects unknown states", () => {
+    const snapshot = {
+      serverId: "demo",
+      state: "authorized",
+      scopes: ["mcp.read"],
+      errorMessage: null,
+    };
+    expect(parseMoorSSEEvent("server:authorization", snapshot)).toEqual({
+      type: "server:authorization",
+      data: snapshot,
+    });
+    expect(parseMoorSSEEvent("server:authorization", { ...snapshot, state: "running" })).toBeNull();
+  });
+});

@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { hasChanges, type EditForm } from "@/lib/server-form";
 import { ServerEditFields } from "./ServerDetail";
 import { ToolCategoryBadge } from "@/components/shared/ToolCategoryBadge";
+import { AuthorizationBadge, AuthorizationButton } from "@/components/servers/ServerAuthorization";
 
 const baseForm: EditForm = {
   name: "Create Tools",
@@ -74,5 +75,32 @@ describe("ServerDetail", () => {
     };
 
     expect(hasChanges(form, baseline)).toBe(false);
+  });
+
+  it("renders OAuth states and reauthorization actions", () => {
+    for (const [state, label] of [
+      ["not_required", "Not configured"],
+      ["required", "Authorization required"],
+      ["authorizing", "Waiting for browser"],
+      ["authorized", "Authorized"],
+      ["error", "Authorization failed"],
+    ] as const) {
+      expect(renderToStaticMarkup(<AuthorizationBadge state={state} />)).toContain(`>${label}<`);
+    }
+    expect(
+      renderToStaticMarkup(
+        <AuthorizationButton state="authorized" pending={false} onClick={() => undefined} />,
+      ),
+    ).toContain(">Reauthorize<");
+    expect(
+      renderToStaticMarkup(
+        <AuthorizationButton state="required" pending={false} onClick={() => undefined} />,
+      ),
+    ).toContain(">Authorize<");
+    const restart = renderToStaticMarkup(
+      <AuthorizationButton state="authorizing" pending={false} onClick={() => undefined} />,
+    );
+    expect(restart).toContain(">Restart authorization<");
+    expect(restart).not.toContain(" disabled=");
   });
 });

@@ -1,6 +1,12 @@
 import { createContext, useContext, useEffect, useRef, useCallback, type ReactNode } from "react";
 import { getApiRuntime, buildApiUrl, buildApiHeaders, resetRuntime } from "@/lib/api/runtime";
-import type { MoorEvent, MoorEventData, MoorEventType, ServerStatus } from "@moor/types";
+import type {
+  AuthorizationState,
+  MoorEvent,
+  MoorEventData,
+  MoorEventType,
+  ServerStatus,
+} from "@moor/types";
 
 interface SSEContextValue {
   subscribe: <T extends MoorEventType>(
@@ -13,6 +19,13 @@ const SSEContext = createContext<SSEContextValue | null>(null);
 
 type WarnFn = (message: string) => void;
 const serverStatuses = new Set<ServerStatus>(["stopped", "starting", "running", "error"]);
+const authorizationStates = new Set<AuthorizationState>([
+  "not_required",
+  "required",
+  "authorizing",
+  "authorized",
+  "error",
+]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -37,6 +50,19 @@ function isServerStatusEvent(data: unknown): data is MoorEventData<"server:statu
 
 function isServerToolsEvent(data: unknown): data is MoorEventData<"server:tools"> {
   return isRecord(data) && typeof data.serverId === "string";
+}
+
+function isServerAuthorizationEvent(data: unknown): data is MoorEventData<"server:authorization"> {
+  return (
+    isRecord(data) &&
+    typeof data.serverId === "string" &&
+    authorizationStates.has(data.state as AuthorizationState) &&
+    Array.isArray(data.scopes) &&
+    data.scopes.every((scope) => typeof scope === "string") &&
+    (data.errorMessage === undefined ||
+      data.errorMessage === null ||
+      typeof data.errorMessage === "string")
+  );
 }
 
 function isProfileActivatedEvent(data: unknown): data is MoorEventData<"profile:activated"> {
@@ -72,6 +98,8 @@ export function parseMoorSSEEvent(
         : invalidEvent(event, warn);
     case "server:tools":
       return isServerToolsEvent(data) ? { type: event, data } : invalidEvent(event, warn);
+    case "server:authorization":
+      return isServerAuthorizationEvent(data) ? { type: event, data } : invalidEvent(event, warn);
     case "profile:activated":
       return isProfileActivatedEvent(data) ? { type: event, data } : invalidEvent(event, warn);
     case "tools:changed":

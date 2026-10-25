@@ -1,0 +1,74 @@
+use crate::sidecar::http::{app_error::AppError, AppState};
+use crate::sidecar::services::server_authorization::AuthorizationSnapshot;
+use axum::{
+    extract::{Path, State},
+    response::Json,
+    routing::{get, post, put},
+    Router,
+};
+use serde::Deserialize;
+use serde_json::Value;
+use std::sync::Arc;
+
+pub fn router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/api/servers/{id}/authorization", get(snapshot))
+        .route(
+            "/api/servers/{id}/authorization/client",
+            put(register_client),
+        )
+        .route("/api/servers/{id}/authorization/start", post(start))
+}
+
+async fn snapshot(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<AuthorizationSnapshot>, AppError> {
+    state
+        .server_manager
+        .authorization()
+        .snapshot(&id)
+        .await
+        .map(Json)
+        .map_err(AppError::internal)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClientBody {
+    client_id: String,
+    client_secret: Option<String>,
+}
+
+async fn register_client(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<ClientBody>,
+) -> Result<Json<AuthorizationSnapshot>, AppError> {
+    state
+        .server_manager
+        .authorization()
+        .register_client(&id, &body.client_id, body.client_secret.as_deref())
+        .await
+        .map(Json)
+        .map_err(AppError::validation)
+}
+
+async fn start(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    state
+        .server_manager
+        .authorization()
+        .start(&id)
+        .await
+        .map(Json)
+        .map_err(|error| {
+            AppError::upstream(
+                "OAUTH_START_FAILED",
+                error,
+                "Failed to start OAuth authorization. Check the Server and try again.",
+            )
+        })
+}

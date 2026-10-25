@@ -1,0 +1,116 @@
+import { useState } from "react";
+import type { AuthorizationState } from "@moor/types";
+import { useServerAuthorization } from "@/hooks/useServerAuthorization";
+import { useLockedMutation } from "@/hooks/useLockedMutation";
+import { useTranslation } from "@/contexts/LocaleContext";
+import { getErrorMessage } from "@/lib/utils";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { ErrorBanner } from "@/components/shared/ErrorBanner";
+
+const labels: Record<AuthorizationState, string> = {
+  not_required: "Not configured",
+  required: "Authorization required",
+  authorizing: "Waiting for browser",
+  authorized: "Authorized",
+  error: "Authorization failed",
+};
+
+export function AuthorizationBadge({ state }: { state: AuthorizationState }) {
+  const { t } = useTranslation();
+  return (
+    <Badge variant={state === "authorized" ? "success" : state === "error" ? "error" : "subtle"}>
+      {t(labels[state] as Parameters<typeof t>[0])}
+    </Badge>
+  );
+}
+
+export function AuthorizationButton({
+  state,
+  pending,
+  onClick,
+}: {
+  state: AuthorizationState;
+  pending: boolean;
+  onClick: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <Button variant="outline" size="sm" disabled={pending} onClick={onClick}>
+      {t(
+        pending
+          ? "Authorizing..."
+          : state === "authorized"
+            ? "Reauthorize"
+            : state === "authorizing"
+              ? "Restart authorization"
+              : "Authorize",
+      )}
+    </Button>
+  );
+}
+
+export function ServerAuthorization({ serverId }: { serverId: string }) {
+  const { t } = useTranslation();
+  const { authorization, registerClient, start } = useServerAuthorization(serverId);
+  const [clientId, setClientId] = useState<string | null>(null);
+  const [clientSecret, setClientSecret] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const state = authorization?.state ?? "not_required";
+  const mutation = useLockedMutation(
+    async () => {
+      const id = (clientId ?? authorization?.clientId ?? "").trim();
+      if (!id) throw new Error("Client ID is required");
+      await registerClient({ clientId: id, ...(clientSecret ? { clientSecret } : {}) });
+      await start();
+    },
+    {
+      onMutate: () => setError(null),
+      onError: (error) => setError(getErrorMessage(error)),
+    },
+  );
+
+  return (
+    <div className="rounded-xl border border-[var(--fg-08)] p-4 space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-sm">{t("OAuth Authorization")}</span>
+        <AuthorizationBadge state={state} />
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <div className="space-y-1.5">
+          <Label>{t("Client ID")}</Label>
+          <Input
+            value={clientId ?? authorization?.clientId ?? ""}
+            onChange={(event) => setClientId(event.target.value)}
+            autoComplete="off"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label>{t("Client Secret (optional)")}</Label>
+          <Input
+            type="password"
+            value={clientSecret}
+            onChange={(event) => setClientSecret(event.target.value)}
+            placeholder={t("Leave blank to keep the current secret")}
+            autoComplete="new-password"
+          />
+        </div>
+      </div>
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-xs text-[var(--fg-45)]">
+          {t("Tokens are stored in the system credential store and never shared with agents.")}
+        </p>
+        <AuthorizationButton
+          state={state}
+          pending={mutation.pending}
+          onClick={() => void mutation.mutate()}
+        />
+      </div>
+      {(error || authorization?.errorMessage) && (
+        <ErrorBanner message={error ?? authorization?.errorMessage ?? ""} />
+      )}
+    </div>
+  );
+}

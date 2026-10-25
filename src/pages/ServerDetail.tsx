@@ -1,5 +1,6 @@
 import { ErrorBanner } from "@/components/shared/ErrorBanner";
 import { ServerHealth } from "@/components/servers/ServerHealth";
+import { ServerAuthorization } from "@/components/servers/ServerAuthorization";
 import { useTranslation } from "@/contexts/LocaleContext";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -294,6 +295,7 @@ export function ServerDetail() {
       </div>
 
       {/* Configuration */}
+      {server.connectionType === "http" && <ServerAuthorization serverId={server.id} />}
       <ServerHealth serverId={server.id} running={server.status === "running"} />
       <Card>
         <CardHeader className="pb-3">
