@@ -3,7 +3,11 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { hasChanges, type EditForm } from "@/lib/server-form";
 import { ServerEditFields } from "./ServerDetail";
 import { ToolCategoryBadge } from "@/components/shared/ToolCategoryBadge";
-import { AuthorizationBadge, AuthorizationButton } from "@/components/servers/ServerAuthorization";
+import {
+  AuthorizationBadge,
+  AuthorizationButton,
+  RevocationButton,
+} from "@/components/servers/ServerAuthorization";
 
 const baseForm: EditForm = {
   name: "Create Tools",
@@ -102,5 +106,8 @@ describe("ServerDetail", () => {
     );
     expect(restart).toContain(">Restart authorization<");
     expect(restart).not.toContain(" disabled=");
+    expect(
+      renderToStaticMarkup(<RevocationButton pending={false} onClick={() => undefined} />),
+    ).toContain(">Revoke<");
   });
 });

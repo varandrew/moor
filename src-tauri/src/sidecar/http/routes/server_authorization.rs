@@ -1,5 +1,5 @@
 use crate::sidecar::http::{app_error::AppError, AppState};
-use crate::sidecar::services::server_authorization::AuthorizationSnapshot;
+use crate::sidecar::services::server_authorization::{AuthorizationSnapshot, RevocationResult};
 use axum::{
     extract::{Path, State},
     response::Json,
@@ -12,7 +12,10 @@ use std::sync::Arc;
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/servers/{id}/authorization", get(snapshot))
+        .route(
+            "/api/servers/{id}/authorization",
+            get(snapshot).delete(revoke),
+        )
         .route(
             "/api/servers/{id}/authorization/client",
             put(register_client),
@@ -28,6 +31,19 @@ async fn snapshot(
         .server_manager
         .authorization()
         .snapshot(&id)
+        .await
+        .map(Json)
+        .map_err(AppError::internal)
+}
+
+async fn revoke(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<RevocationResult>, AppError> {
+    state
+        .server_manager
+        .authorization()
+        .revoke(&id)
         .await
         .map(Json)
         .map_err(AppError::internal)

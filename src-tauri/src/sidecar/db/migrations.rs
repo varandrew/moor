@@ -132,6 +132,7 @@ pub fn run_migrations(db: &Database) -> Result<(), String> {
             client_secret_ref TEXT,
             resource TEXT,
             token_endpoint TEXT,
+            revocation_endpoint TEXT,
             scopes TEXT NOT NULL DEFAULT '[]',
             access_token_ref TEXT,
             refresh_token_ref TEXT,
@@ -141,10 +142,11 @@ pub fn run_migrations(db: &Database) -> Result<(), String> {
         )",
     )?;
     ensure_column(db, "server_authorizations", "token_endpoint", "TEXT")?;
+    ensure_column(db, "server_authorizations", "revocation_endpoint", "TEXT")?;
     backfill_server_sort_order(db)?;
     normalize_audit_timestamps(db)?;
     // 版本号在列补齐之后才推进：迁移中途失败时下一次启动仍会重跑 ensure_column（幂等）。
-    db.exec("PRAGMA user_version = 4")?;
+    db.exec("PRAGMA user_version = 5")?;
 
     Ok(())
 }
@@ -381,7 +383,7 @@ mod tests {
         assert_eq!(
             db.query_one("PRAGMA user_version", &[], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            Some(4)
+            Some(5)
         );
         let plan = db.query_all("EXPLAIN QUERY PLAN SELECT * FROM audit_logs WHERE timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp DESC", &[&timestamps[0], &timestamps[1]], |row| row.get::<_, String>(3)).unwrap();
         assert!(plan

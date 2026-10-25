@@ -2,9 +2,10 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type {
   AuthorizationClientInput,
   AuthorizationStart,
+  RevocationResult,
   ServerAuthorization,
 } from "@moor/types";
-import { api, apiPost, apiPut } from "@/lib/api/client";
+import { api, apiDelete, apiPost, apiPut } from "@/lib/api/client";
 import { useSSEEvent } from "@/contexts/SSEContext";
 import { open } from "@tauri-apps/plugin-shell";
 import { isTauriRuntime } from "@/lib/tauri";
@@ -42,5 +43,13 @@ export function useServerAuthorization(serverId?: string) {
     else window.open(started.authorizationUrl, "_blank", "noopener,noreferrer");
   };
 
-  return { authorization: query.data, ...query, registerClient, start };
+  const revoke = async () => {
+    const result = await apiDelete<RevocationResult>(
+      `/api/servers/${encodeURIComponent(serverId!)}/authorization`,
+    );
+    client.setQueryData(queryKey, result.snapshot);
+    return result;
+  };
+
+  return { authorization: query.data, ...query, registerClient, start, revoke };
 }

@@ -52,12 +52,22 @@ export function AuthorizationButton({
   );
 }
 
+export function RevocationButton({ pending, onClick }: { pending: boolean; onClick: () => void }) {
+  const { t } = useTranslation();
+  return (
+    <Button variant="outline" size="sm" disabled={pending} onClick={onClick}>
+      {t(pending ? "Revoking..." : "Revoke")}
+    </Button>
+  );
+}
+
 export function ServerAuthorization({ serverId }: { serverId: string }) {
   const { t } = useTranslation();
-  const { authorization, registerClient, start } = useServerAuthorization(serverId);
+  const { authorization, registerClient, start, revoke } = useServerAuthorization(serverId);
   const [clientId, setClientId] = useState<string | null>(null);
   const [clientSecret, setClientSecret] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
   const state = authorization?.state ?? "not_required";
   const mutation = useLockedMutation(
     async () => {
@@ -68,6 +78,19 @@ export function ServerAuthorization({ serverId }: { serverId: string }) {
     },
     {
       onMutate: () => setError(null),
+      onError: (error) => setError(getErrorMessage(error)),
+    },
+  );
+  const revocation = useLockedMutation(
+    async () => {
+      const result = await revoke();
+      setWarning(result.warning ?? null);
+    },
+    {
+      onMutate: () => {
+        setError(null);
+        setWarning(null);
+      },
       onError: (error) => setError(getErrorMessage(error)),
     },
   );
@@ -102,12 +125,21 @@ export function ServerAuthorization({ serverId }: { serverId: string }) {
         <p className="text-xs text-[var(--fg-45)]">
           {t("Tokens are stored in the system credential store and never shared with agents.")}
         </p>
-        <AuthorizationButton
-          state={state}
-          pending={mutation.pending}
-          onClick={() => void mutation.mutate()}
-        />
+        <div className="flex gap-2">
+          {state === "authorized" && (
+            <RevocationButton
+              pending={revocation.pending}
+              onClick={() => void revocation.mutate()}
+            />
+          )}
+          <AuthorizationButton
+            state={state}
+            pending={mutation.pending}
+            onClick={() => void mutation.mutate()}
+          />
+        </div>
       </div>
+      {warning && <p className="text-xs text-[var(--fg-45)]">{warning}</p>}
       {(error || authorization?.errorMessage) && (
         <ErrorBanner message={error ?? authorization?.errorMessage ?? ""} />
       )}

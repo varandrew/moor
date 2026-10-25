@@ -23,3 +23,8 @@ export interface AuthorizationStart {
   authorizationUrl: string;
   expiresAt: string;
 }
+
+export interface RevocationResult {
+  snapshot: ServerAuthorization;
+  warning?: string | null;
+}

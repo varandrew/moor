@@ -295,6 +295,8 @@ export const messages = {
   Reauthorize: "重新授权",
   Authorize: "授权",
   "Restart authorization": "重新发起授权",
+  Revoke: "撤销授权",
+  "Revoking...": "正在撤销授权…",
   "Client ID is required": "客户端 ID 不能为空",
   "Check for updates": "检查更新",
   "An update is available.": "有可用更新。",

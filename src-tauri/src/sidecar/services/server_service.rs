@@ -1,5 +1,6 @@
 use crate::sidecar::db::server_repo::{Server, ServerInsertInput, ServerRepository};
 use crate::sidecar::db::Database;
+use crate::sidecar::services::server_authorization::canonical_resource;
 use crate::sidecar::services::server_manager::ServerManager;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -220,6 +221,24 @@ impl ServerService {
                 .ok_or_else(|| ServerServiceError::NotFound("Server not found".into()))?;
             body.validate_for(&existing.connection_type)
                 .map_err(ServerServiceError::Validation)?;
+            let resource_changed = body.url.as_ref().is_some_and(|url| {
+                let next = reqwest::Url::parse(url)
+                    .ok()
+                    .and_then(|url| canonical_resource(&url).ok());
+                let previous = existing.url.as_deref().and_then(|url| {
+                    reqwest::Url::parse(url)
+                        .ok()
+                        .and_then(|url| canonical_resource(&url).ok())
+                });
+                next != previous
+            });
+            if resource_changed {
+                server_manager
+                    .authorization()
+                    .cleanup(id)
+                    .await
+                    .map_err(ServerServiceError::Internal)?;
+            }
 
             let mut set_clauses = Vec::new();
             let mut param_idx = 1u32;
@@ -311,6 +330,11 @@ impl ServerService {
             .find_by_id(id)
             .map_err(ServerServiceError::Internal)?
             .ok_or_else(|| ServerServiceError::NotFound("Server not found".into()))?;
+        server_manager
+            .authorization()
+            .cleanup(id)
+            .await
+            .map_err(ServerServiceError::Internal)?;
         if !server_manager.remove_server(id).await {
             return Err(ServerServiceError::Internal(
                 "Failed to delete server".into(),

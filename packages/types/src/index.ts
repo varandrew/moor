@@ -11,6 +11,7 @@ export type {
   AuthorizationClientInput,
   AuthorizationStart,
   AuthorizationState,
+  RevocationResult,
   ServerAuthorization,
 } from "./authorization.js";
 export type {

@@ -37,6 +37,13 @@ pub struct AuthorizationSnapshot {
     pub scopes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevocationResult {
+    pub snapshot: AuthorizationSnapshot,
+    pub warning: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct AuthorizationRecord {
     status: String,
@@ -45,6 +52,7 @@ struct AuthorizationRecord {
     client_secret_ref: Option<String>,
     resource: Option<String>,
     token_endpoint: Option<String>,
+    revocation_endpoint: Option<String>,
     scopes: Vec<String>,
     access_token_ref: Option<String>,
     refresh_token_ref: Option<String>,
@@ -61,6 +69,7 @@ impl AuthorizationRecord {
             client_secret_ref: None,
             resource: None,
             token_endpoint: None,
+            revocation_endpoint: None,
             scopes: Vec::new(),
             access_token_ref: None,
             refresh_token_ref: None,
@@ -73,6 +82,7 @@ impl AuthorizationRecord {
 pub trait CredentialStore: Send + Sync {
     fn get(&self, reference: &str) -> Result<Option<String>, String>;
     fn set(&self, reference: &str, value: &str) -> Result<(), String>;
+    fn delete(&self, reference: &str) -> Result<(), String>;
 }
 
 struct KeyringCredentialStore;
@@ -98,6 +108,13 @@ impl CredentialStore for KeyringCredentialStore {
             .set_password(value)
             .map_err(|_| "System credential store is unavailable".to_string())
     }
+
+    fn delete(&self, reference: &str) -> Result<(), String> {
+        match Self::entry(reference)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(_) => Err("System credential store is unavailable".into()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -114,6 +131,15 @@ impl MemoryCredentialStore {
             values: StdMutex::new(HashMap::new()),
             unavailable: true,
         }
+    }
+
+    pub fn values_for_test(&self) -> Vec<(String, String)> {
+        self.values
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
     }
 }
 
@@ -134,6 +160,11 @@ impl CredentialStore for MemoryCredentialStore {
             .lock()
             .unwrap()
             .insert(reference.to_string(), value.to_string());
+        Ok(())
+    }
+
+    fn delete(&self, reference: &str) -> Result<(), String> {
+        self.values.lock().unwrap().remove(reference);
         Ok(())
     }
 }
@@ -196,6 +227,7 @@ struct AuthorizationServerMetadata {
     authorization_endpoint: String,
     token_endpoint: String,
     registration_endpoint: Option<String>,
+    revocation_endpoint: Option<String>,
     code_challenge_methods_supported: Option<Vec<String>>,
     #[serde(default)]
     authorization_response_iss_parameter_supported: bool,
@@ -220,6 +252,7 @@ struct PendingAttempt {
     client_id: String,
     client_secret: Option<String>,
     token_endpoint: String,
+    revocation_endpoint: Option<String>,
     expected_issuer: String,
     issuer_parameter_required: bool,
     resource: String,
@@ -257,6 +290,117 @@ impl ServerAuthorization {
             refresh_locks: Arc::new(Mutex::new(HashMap::new())),
             refresh_completed: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub async fn revoke(&self, server_id: &str) -> Result<RevocationResult, String> {
+        let record = self.load(server_id)?;
+        let mut warning = None;
+        if let Some(record) = record {
+            if let Some(endpoint) = record.revocation_endpoint {
+                let endpoint = match Url::parse(&endpoint) {
+                    Ok(endpoint) => match validate_oauth_http_url(&endpoint) {
+                        Ok(()) => Some(endpoint),
+                        Err(_) => None,
+                    },
+                    Err(_) => None,
+                };
+                let Some(endpoint) = endpoint else {
+                    warning = Some(
+                        "Provider revocation failed; local credentials were removed.".to_string(),
+                    );
+                    return self
+                        .cleanup(server_id)
+                        .await
+                        .map(|snapshot| RevocationResult { snapshot, warning });
+                };
+                let client_secret = match &record.client_secret_ref {
+                    Some(reference) => match self.store.get(reference) {
+                        Ok(secret) => secret,
+                        Err(_) => {
+                            warning = Some(
+                                "Provider revocation failed; local credentials were removed."
+                                    .to_string(),
+                            );
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                for (token, hint) in [
+                    (record.access_token_ref, "access_token"),
+                    (record.refresh_token_ref, "refresh_token"),
+                ] {
+                    let Some(reference) = token else {
+                        continue;
+                    };
+                    let token = match self.store.get(&reference) {
+                        Ok(Some(token)) => token,
+                        Ok(None) => continue,
+                        Err(_) => {
+                            warning = Some(
+                                "Provider revocation failed; local credentials were removed."
+                                    .to_string(),
+                            );
+                            continue;
+                        }
+                    };
+                    let mut form = HashMap::from([
+                        ("token".to_string(), token),
+                        ("token_type_hint".to_string(), hint.to_string()),
+                    ]);
+                    if let Some(client_id) = &record.client_id {
+                        form.insert("client_id".to_string(), client_id.clone());
+                    }
+                    if let Some(secret) = &client_secret {
+                        form.insert("client_secret".to_string(), secret.clone());
+                    }
+                    let revoked = self.client.post(endpoint.clone()).form(&form).send().await;
+                    if !matches!(revoked, Ok(ref response) if response.status().is_success()) {
+                        warning = Some(
+                            "Provider revocation failed; local credentials were removed."
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+        let snapshot = self.cleanup(server_id).await?;
+        Ok(RevocationResult { snapshot, warning })
+    }
+
+    pub async fn cleanup(&self, server_id: &str) -> Result<AuthorizationSnapshot, String> {
+        for reference in [
+            access_token_ref(server_id),
+            refresh_token_ref(server_id),
+            client_secret_ref(server_id),
+        ] {
+            if let Err(error) = self.store.delete(&reference) {
+                tracing::warn!(server_id, %error, "OAuth credential cleanup failed");
+            }
+        }
+        let stale = {
+            let mut attempts = self.attempts.lock().await;
+            let states: Vec<String> = attempts
+                .iter()
+                .filter(|(_, attempt)| attempt.server_id == server_id)
+                .map(|(state, _)| state.clone())
+                .collect();
+            states
+                .into_iter()
+                .filter_map(|state| attempts.remove(&state))
+                .collect::<Vec<_>>()
+        };
+        for attempt in stale {
+            let _ = attempt.shutdown.send(());
+        }
+        self.refresh_locks.lock().await.remove(server_id);
+        self.refresh_completed.lock().await.remove(server_id);
+        self.db.run(
+            "DELETE FROM server_authorizations WHERE server_id = ?1",
+            &[&server_id],
+        )?;
+        self.save(server_id, &AuthorizationRecord::required())?;
+        self.emit_snapshot(server_id).await
     }
 
     async fn require_step_up(
@@ -571,13 +715,28 @@ impl ServerAuthorization {
         if client_id.trim().is_empty() {
             return Err("Client ID is required".into());
         }
+        let mut previous_secret = None;
+        if let Some(previous) = self.load(server_id)? {
+            previous_secret = match &previous.client_secret_ref {
+                Some(reference) => self.store.get(reference)?,
+                None => None,
+            };
+            let client_changed = previous.client_id.as_deref() != Some(client_id.trim());
+            let secret_changed = client_secret.is_some_and(|secret| !secret.is_empty());
+            if client_changed || secret_changed {
+                self.cleanup(server_id).await?;
+            }
+        }
         let mut record = self
             .load(server_id)?
             .unwrap_or_else(AuthorizationRecord::required);
         record.status = "required".into();
         record.error_message = None;
         record.client_id = Some(client_id.trim().to_string());
-        if let Some(secret) = client_secret.filter(|secret| !secret.is_empty()) {
+        if let Some(secret) = client_secret
+            .filter(|secret| !secret.is_empty())
+            .or(previous_secret.as_deref())
+        {
             self.persist_client_secret(&mut record, server_id, secret)?;
         }
         self.save(server_id, &record)?;
@@ -604,6 +763,8 @@ impl ServerAuthorization {
                 client_id,
                 client_secret,
                 record.scopes.clone(),
+                record.issuer.clone(),
+                record.resource.clone(),
             )
             .await
         {
@@ -633,6 +794,8 @@ impl ServerAuthorization {
         client_id: Option<String>,
         client_secret: Option<String>,
         previous_scopes: Vec<String>,
+        previous_issuer: Option<String>,
+        previous_resource: Option<String>,
     ) -> Result<Value, String> {
         let mut discovery = self.discover(server_url).await?;
         for scope in previous_scopes {
@@ -648,6 +811,18 @@ impl ServerAuthorization {
             &Url::parse(&discovery.metadata.token_endpoint)
                 .map_err(|_| "Invalid token endpoint")?,
         )?;
+        let context_changed = previous_issuer
+            .as_ref()
+            .is_some_and(|issuer| *issuer != discovery.metadata.issuer)
+            || previous_resource
+                .as_ref()
+                .is_some_and(|resource| *resource != discovery.resource);
+        let (client_id, client_secret) = if context_changed {
+            self.cleanup(server_id).await?;
+            (None, None)
+        } else {
+            (client_id, client_secret)
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|error| format!("Failed to bind OAuth callback: {error}"))?;
@@ -684,6 +859,7 @@ impl ServerAuthorization {
                     client_id: client_id.clone(),
                     client_secret,
                     token_endpoint: discovery.metadata.token_endpoint.clone(),
+                    revocation_endpoint: discovery.metadata.revocation_endpoint.clone(),
                     expected_issuer: discovery.metadata.issuer.clone(),
                     issuer_parameter_required: discovery
                         .metadata
@@ -913,10 +1089,10 @@ impl ServerAuthorization {
 
     fn load(&self, server_id: &str) -> Result<Option<AuthorizationRecord>, String> {
         self.db.query_one(
-            "SELECT status, issuer, client_id, client_secret_ref, resource, token_endpoint, scopes, access_token_ref, refresh_token_ref, expires_at, error_message FROM server_authorizations WHERE server_id = ?1",
+            "SELECT status, issuer, client_id, client_secret_ref, resource, token_endpoint, revocation_endpoint, scopes, access_token_ref, refresh_token_ref, expires_at, error_message FROM server_authorizations WHERE server_id = ?1",
             &[&server_id],
             |row| {
-                let scopes: String = row.get(6)?;
+                let scopes: String = row.get(7)?;
                 Ok(AuthorizationRecord {
                     status: row.get(0)?,
                     issuer: row.get(1)?,
@@ -924,11 +1100,12 @@ impl ServerAuthorization {
                     client_secret_ref: row.get(3)?,
                     resource: row.get(4)?,
                     token_endpoint: row.get(5)?,
+                    revocation_endpoint: row.get(6)?,
                     scopes: serde_json::from_str(&scopes).unwrap_or_default(),
-                    access_token_ref: row.get(7)?,
-                    refresh_token_ref: row.get(8)?,
-                    expires_at: row.get(9)?,
-                    error_message: row.get(10)?,
+                    access_token_ref: row.get(8)?,
+                    refresh_token_ref: row.get(9)?,
+                    expires_at: row.get(10)?,
+                    error_message: row.get(11)?,
                 })
             },
         )
@@ -938,7 +1115,7 @@ impl ServerAuthorization {
         let scopes = serde_json::to_string(&record.scopes).map_err(|error| error.to_string())?;
         let now = Utc::now().to_rfc3339();
         self.db.run(
-            "INSERT INTO server_authorizations (server_id, status, issuer, client_id, client_secret_ref, resource, token_endpoint, scopes, access_token_ref, refresh_token_ref, expires_at, error_message, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) ON CONFLICT(server_id) DO UPDATE SET status = excluded.status, issuer = excluded.issuer, client_id = excluded.client_id, client_secret_ref = excluded.client_secret_ref, resource = excluded.resource, token_endpoint = excluded.token_endpoint, scopes = excluded.scopes, access_token_ref = excluded.access_token_ref, refresh_token_ref = excluded.refresh_token_ref, expires_at = excluded.expires_at, error_message = excluded.error_message, updated_at = excluded.updated_at",
+            "INSERT INTO server_authorizations (server_id, status, issuer, client_id, client_secret_ref, resource, token_endpoint, revocation_endpoint, scopes, access_token_ref, refresh_token_ref, expires_at, error_message, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) ON CONFLICT(server_id) DO UPDATE SET status = excluded.status, issuer = excluded.issuer, client_id = excluded.client_id, client_secret_ref = excluded.client_secret_ref, resource = excluded.resource, token_endpoint = excluded.token_endpoint, revocation_endpoint = excluded.revocation_endpoint, scopes = excluded.scopes, access_token_ref = excluded.access_token_ref, refresh_token_ref = excluded.refresh_token_ref, expires_at = excluded.expires_at, error_message = excluded.error_message, updated_at = excluded.updated_at",
             &[
                 &server_id,
                 &record.status,
@@ -947,6 +1124,7 @@ impl ServerAuthorization {
                 &record.client_secret_ref,
                 &record.resource,
                 &record.token_endpoint,
+                &record.revocation_endpoint,
                 &scopes,
                 &record.access_token_ref,
                 &record.refresh_token_ref,
@@ -1095,6 +1273,7 @@ async fn oauth_callback(
     record.issuer = Some(attempt.expected_issuer);
     record.resource = Some(attempt.resource);
     record.token_endpoint = Some(attempt.token_endpoint);
+    record.revocation_endpoint = attempt.revocation_endpoint;
     record.scopes = token
         .scope
         .map(|scope| scope.split_whitespace().map(str::to_string).collect())
@@ -1141,7 +1320,7 @@ fn validate_oauth_http_url(url: &Url) -> Result<(), String> {
     Ok(())
 }
 
-fn canonical_resource(url: &Url) -> Result<String, String> {
+pub(crate) fn canonical_resource(url: &Url) -> Result<String, String> {
     validate_oauth_http_url(url)?;
     let mut canonical = url.clone();
     canonical.set_fragment(None);
