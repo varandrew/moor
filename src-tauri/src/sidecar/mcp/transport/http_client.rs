@@ -17,6 +17,17 @@ pub trait HttpCredentialProvider: Send + Sync {
     fn headers(
         &self,
     ) -> futures::future::BoxFuture<'static, Result<HashMap<String, String>, RequestError>>;
+
+    fn on_unauthorized(&self) -> futures::future::BoxFuture<'static, Result<bool, RequestError>> {
+        Box::pin(async { Ok(false) })
+    }
+
+    fn on_insufficient_scope(
+        &self,
+        _challenge: Option<String>,
+    ) -> futures::future::BoxFuture<'static, Result<(), RequestError>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// MCP Client over HTTP transport (Streamable HTTP or SSE).
@@ -214,12 +225,23 @@ impl HttpClientTransport {
         method: &str,
         params: Option<Value>,
     ) -> Result<Value, StreamableError> {
+        self.send_streamable_request_inner(id, method, params, true)
+            .await
+    }
+
+    async fn send_streamable_request_inner(
+        &self,
+        id: i64,
+        method: &str,
+        params: Option<Value>,
+        allow_retry: bool,
+    ) -> Result<Value, StreamableError> {
         let mut request_body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": method,
         });
-        if let Some(params) = params {
+        if let Some(params) = params.clone() {
             request_body["params"] = params;
         }
 
@@ -236,6 +258,20 @@ impl HttpClientTransport {
             .map_err(|e| StreamableError::Failed(format!("HTTP request failed: {e}").into()))?;
 
         let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            && allow_retry
+            && self
+                .handle_unauthorized()
+                .await
+                .map_err(StreamableError::Failed)?
+        {
+            return Box::pin(self.send_streamable_request_inner(id, method, params, false)).await;
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            self.handle_insufficient_scope(response.headers())
+                .await
+                .map_err(StreamableError::Failed)?;
+        }
         if !status.is_success() {
             return Err(http_response_error(response).await);
         }
@@ -297,10 +333,20 @@ impl HttpClientTransport {
         method: &str,
         params: Option<Value>,
     ) -> Result<(), StreamableError> {
+        self.send_streamable_notification_inner(method, params, true)
+            .await
+    }
+
+    async fn send_streamable_notification_inner(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        allow_retry: bool,
+    ) -> Result<(), StreamableError> {
         let request_body = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
-            "params": params.unwrap_or(Value::Null),
+            "params": params.clone().unwrap_or(Value::Null),
         });
 
         let response = self
@@ -314,6 +360,20 @@ impl HttpClientTransport {
             .map_err(|e| {
                 StreamableError::Failed(format!("HTTP notification failed: {e}").into())
             })?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && allow_retry
+            && self
+                .handle_unauthorized()
+                .await
+                .map_err(StreamableError::Failed)?
+        {
+            return Box::pin(self.send_streamable_notification_inner(method, params, false)).await;
+        }
+        if response.status() == reqwest::StatusCode::FORBIDDEN {
+            self.handle_insufficient_scope(response.headers())
+                .await
+                .map_err(StreamableError::Failed)?;
+        }
         if !response.status().is_success() {
             return Err(http_response_error(response).await);
         }
@@ -334,6 +394,27 @@ impl HttpClientTransport {
             builder = builder.header(MCP_SESSION_ID_HEADER, session_id);
         }
         Ok(builder)
+    }
+
+    async fn handle_unauthorized(&self) -> Result<bool, RequestError> {
+        match &self.credential_provider {
+            Some(provider) => provider.on_unauthorized().await,
+            None => Ok(false),
+        }
+    }
+
+    async fn handle_insufficient_scope(
+        &self,
+        headers: &reqwest::header::HeaderMap,
+    ) -> Result<(), RequestError> {
+        let Some(provider) = &self.credential_provider else {
+            return Ok(());
+        };
+        let challenge = headers
+            .get("www-authenticate")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        provider.on_insufficient_scope(challenge).await
     }
 
     async fn capture_streamable_session_id(
@@ -364,6 +445,10 @@ impl HttpClientTransport {
     }
 
     async fn open_sse(&self) -> Result<SseState, RequestError> {
+        self.open_sse_inner(true).await
+    }
+
+    async fn open_sse_inner(&self, allow_retry: bool) -> Result<SseState, RequestError> {
         let mut builder = self.client.get(&self.url);
         for (key, value) in self.request_headers().await? {
             builder = builder.header(key, value);
@@ -374,6 +459,15 @@ impl HttpClientTransport {
             .send()
             .await
             .map_err(|e| format!("SSE connection failed: {e}"))?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && allow_retry
+            && self.handle_unauthorized().await?
+        {
+            return Box::pin(self.open_sse_inner(false)).await;
+        }
+        if response.status() == reqwest::StatusCode::FORBIDDEN {
+            self.handle_insufficient_scope(response.headers()).await?;
+        }
         if !response.status().is_success() {
             return Err(http_response_error(response).await.into_request_error());
         }
@@ -447,6 +541,15 @@ impl HttpClientTransport {
         state: &SseState,
         message: &Value,
     ) -> Result<(), RequestError> {
+        self.post_sse_message_inner(state, message, true).await
+    }
+
+    async fn post_sse_message_inner(
+        &self,
+        state: &SseState,
+        message: &Value,
+        allow_retry: bool,
+    ) -> Result<(), RequestError> {
         let mut builder = self.client.post(&state.endpoint);
         for (key, value) in self.request_headers().await? {
             builder = builder.header(key, value);
@@ -458,6 +561,15 @@ impl HttpClientTransport {
             .send()
             .await
             .map_err(|e| format!("SSE message post failed: {e}"))?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && allow_retry
+            && self.handle_unauthorized().await?
+        {
+            return Box::pin(self.post_sse_message_inner(state, message, false)).await;
+        }
+        if response.status() == reqwest::StatusCode::FORBIDDEN {
+            self.handle_insufficient_scope(response.headers()).await?;
+        }
         if response.status().is_success() {
             Ok(())
         } else {

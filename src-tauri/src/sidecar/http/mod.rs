@@ -338,6 +338,12 @@ mod tests {
     async fn preregistered_oauth_completes_callback_and_authorizes_upstream_requests() {
         let (token_requests, mut token_forms) = mpsc::unbounded_channel();
         let (registrations, mut registration_forms) = mpsc::unbounded_channel();
+        let refresh_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_refresh_count = refresh_count.clone();
+        let reject_oauth = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reject_retried = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let insufficient_scope = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let missing_scope = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let authorization_server = Router::new()
             .route(
                 "/.well-known/oauth-authorization-server",
@@ -373,6 +379,27 @@ mod tests {
                         let token_requests = token_requests.clone();
                         async move {
                             token_requests.send(form.clone()).unwrap();
+                            if form.get("refresh_token").map(String::as_str)
+                                == Some("rotated-refresh-token")
+                            {
+                                return StatusCode::BAD_REQUEST.into_response();
+                            }
+                            if form["grant_type"] == "refresh_token" {
+                                let refresh = token_refresh_count
+                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                let access_token = match refresh {
+                                    0 => "refreshed-access-token",
+                                    1 => "retried-access-token",
+                                    _ => "rejected-access-token",
+                                };
+                                return Json(json!({
+                                    "access_token": access_token,
+                                    "refresh_token": "rotated-refresh-token",
+                                    "token_type": "Bearer",
+                                    "expires_in": 3600
+                                }))
+                                .into_response();
+                            }
                             if form["code"] == "bad-code" {
                                 return StatusCode::BAD_REQUEST.into_response();
                             }
@@ -391,6 +418,10 @@ mod tests {
         let issuer = format!("http://{as_addr}");
         let (upstream_requests, mut upstream) = mpsc::unbounded_channel();
         let issuer_for_resource = issuer.clone();
+        let reject_oauth_upstream = reject_oauth.clone();
+        let reject_retried_upstream = reject_retried.clone();
+        let insufficient_scope_upstream = insufficient_scope.clone();
+        let missing_scope_upstream = missing_scope.clone();
         let protected = Router::new()
             .route(
                 "/custom-resource-metadata",
@@ -415,6 +446,29 @@ mod tests {
                             .and_then(|value| value.to_str().ok())
                             .unwrap_or_default()
                             .to_string();
+                        if insufficient_scope_upstream.load(std::sync::atomic::Ordering::SeqCst)
+                            && body["method"] == "tools/call"
+                        {
+                            let challenge = if missing_scope_upstream
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                            {
+                                "Bearer error=\"insufficient_scope\""
+                            } else {
+                                "Bearer error=\"insufficient_scope\", scope=\"mcp.write\""
+                            };
+                            return (
+                                StatusCode::FORBIDDEN,
+                                [("www-authenticate", challenge)],
+                            )
+                                .into_response();
+                        }
+                        if (reject_oauth_upstream.load(std::sync::atomic::Ordering::SeqCst)
+                            && authorization == "Bearer oauth-access-token")
+                            || (reject_retried_upstream.load(std::sync::atomic::Ordering::SeqCst)
+                                && matches!(authorization.as_str(), "Bearer retried-access-token" | "Bearer rejected-access-token"))
+                        {
+                            return StatusCode::UNAUTHORIZED.into_response();
+                        }
                         if authorization.is_empty() {
                             let host = headers.get("host").unwrap().to_str().unwrap();
                             let challenge = format!(
@@ -630,6 +684,74 @@ mod tests {
             }
         }
         assert!(authorized_requests >= 4);
+        state
+            .db
+            .run(
+                "UPDATE server_authorizations SET expires_at = ?1 WHERE server_id = ?2",
+                &[&"2000-01-01T00:00:00Z", &server_id],
+            )
+            .unwrap();
+        let expired_call = client
+            .post(format!("{gateway}/mcp"))
+            .header("accept", "application/json")
+            .header("mcp-session-id", session_id)
+            .header("mcp-protocol-version", "2025-03-26")
+            .json(&json!({
+                "jsonrpc": "2.0", "id": 20, "method": "tools/call",
+                "params": { "name": "protected__echo", "arguments": {} }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            expired_call.json::<Value>().await.unwrap()["result"]["content"][0]["text"],
+            "oauth-ok"
+        );
+        let refresh_forms: Vec<HashMap<String, String>> =
+            std::iter::from_fn(|| token_forms.try_recv().ok()).collect();
+        let refresh = refresh_forms
+            .iter()
+            .find(|form| form["grant_type"] == "refresh_token")
+            .expect("expired token should be refreshed");
+        assert_eq!(refresh["refresh_token"], "oauth-refresh-token");
+        assert_eq!(refresh["client_id"], "moor-test-client");
+        assert_eq!(refresh["client_secret"], "client-secret");
+        assert_eq!(refresh["resource"], format!("http://{upstream_addr}/mcp"));
+        let refreshed = std::iter::from_fn(|| upstream.try_recv().ok())
+            .any(|(_, authorization)| authorization == "Bearer refreshed-access-token");
+        assert!(refreshed);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        state
+            .db
+            .run(
+                "UPDATE server_authorizations SET expires_at = ?1 WHERE server_id = ?2",
+                &[&"2000-01-01T00:00:00Z", &server_id],
+            )
+            .unwrap();
+        let rejected = client
+            .post(format!("{gateway}/mcp"))
+            .header("accept", "application/json")
+            .header("mcp-session-id", session_id)
+            .header("mcp-protocol-version", "2025-03-26")
+            .json(&json!({
+                "jsonrpc": "2.0", "id": 21, "method": "tools/call",
+                "params": { "name": "protected__echo", "arguments": {} }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(rejected.json::<Value>().await.unwrap()["error"].is_object());
+        let rejected_snapshot = client
+            .get(format!("{gateway}/api/servers/{server_id}/authorization"))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(rejected_snapshot["state"], "required");
+
         let stored = state.db.query_all(
             "SELECT client_secret_ref, access_token_ref, refresh_token_ref FROM server_authorizations",
             &[],
@@ -675,7 +797,7 @@ mod tests {
             .json::<Value>()
             .await
             .unwrap();
-        assert_eq!(abandoned["state"], "authorized");
+        assert_eq!(abandoned["state"], "required");
         abandoned_gateway.abort();
         let second_restart = client
             .post(format!(
@@ -718,6 +840,49 @@ mod tests {
         );
         let replay = client.get(valid_callback).send().await;
         assert!(replay.is_err() || replay.unwrap().status() == StatusCode::BAD_REQUEST);
+
+        reject_oauth.store(true, std::sync::atomic::Ordering::SeqCst);
+        let retried = client
+            .post(format!("{gateway}/mcp"))
+            .header("accept", "application/json")
+            .header("mcp-session-id", session_id)
+            .header("mcp-protocol-version", "2025-03-26")
+            .json(&json!({
+                "jsonrpc": "2.0", "id": 30, "method": "tools/call",
+                "params": { "name": "protected__echo", "arguments": {} }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            retried.json::<Value>().await.unwrap()["result"]["content"][0]["text"],
+            "oauth-ok"
+        );
+        assert!(std::iter::from_fn(|| upstream.try_recv().ok())
+            .any(|(_, authorization)| authorization == "Bearer retried-access-token"));
+        reject_retried.store(true, std::sync::atomic::Ordering::SeqCst);
+        let bounded = client
+            .post(format!("{gateway}/mcp"))
+            .header("accept", "application/json")
+            .header("mcp-session-id", session_id)
+            .header("mcp-protocol-version", "2025-03-26")
+            .json(&json!({
+                "jsonrpc": "2.0", "id": 31, "method": "tools/call",
+                "params": { "name": "protected__echo", "arguments": {} }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(bounded.json::<Value>().await.unwrap()["error"].is_object());
+        let attempts = std::iter::from_fn(|| upstream.try_recv().ok())
+            .filter(|(_, authorization)| authorization == "Bearer rejected-access-token")
+            .count();
+        assert!(
+            attempts <= 1,
+            "a rejected token must be retried at most once"
+        );
+        reject_oauth.store(false, std::sync::atomic::Ordering::SeqCst);
+        reject_retried.store(false, std::sync::atomic::Ordering::SeqCst);
 
         for (code, expected_status, expected_state) in [
             ("bad-code", StatusCode::BAD_REQUEST, "error"),
@@ -769,10 +934,8 @@ mod tests {
                     .send()
                     .await
                     .unwrap();
-                assert_eq!(
-                    call.json::<Value>().await.unwrap()["result"]["content"][0]["text"],
-                    "oauth-ok"
-                );
+                let body = call.json::<Value>().await.unwrap();
+                assert_eq!(body["result"]["content"][0]["text"], "oauth-ok");
             }
         }
 
@@ -838,7 +1001,13 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(dynamic_started.status(), StatusCode::OK);
+        let dynamic_started_status = dynamic_started.status();
+        let dynamic_started_body = dynamic_started.text().await.unwrap();
+        assert_eq!(
+            dynamic_started_status,
+            StatusCode::OK,
+            "{dynamic_started_body}"
+        );
         let dynamic_call = client
             .post(format!("{gateway}/mcp"))
             .header("accept", "application/json")
@@ -855,6 +1024,111 @@ mod tests {
             dynamic_call.json::<Value>().await.unwrap()["result"]["content"][0]["text"],
             "oauth-ok"
         );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let before = refresh_count.load(std::sync::atomic::Ordering::SeqCst);
+        let authorization = state.server_manager.authorization();
+        let refreshes: Vec<_> = (0..8)
+            .map(|_| authorization.refresh(&dynamic_id, true))
+            .collect();
+        for result in futures::future::join_all(refreshes).await {
+            result.unwrap();
+        }
+        assert_eq!(
+            refresh_count.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+            "concurrent refreshes for one Server must share one AS request"
+        );
+
+        insufficient_scope.store(true, std::sync::atomic::Ordering::SeqCst);
+        let before_step_up = refresh_count.load(std::sync::atomic::Ordering::SeqCst);
+        let step_up = client
+            .post(format!("{gateway}/mcp"))
+            .header("accept", "application/json")
+            .header("mcp-session-id", session_id)
+            .header("mcp-protocol-version", "2025-03-26")
+            .json(&json!({
+                "jsonrpc": "2.0", "id": 40, "method": "tools/call",
+                "params": { "name": "dynamic__echo", "arguments": {} }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(step_up.json::<Value>().await.unwrap()["error"].is_object());
+        assert_eq!(
+            refresh_count.load(std::sync::atomic::Ordering::SeqCst),
+            before_step_up
+        );
+        let required = client
+            .get(format!("{gateway}/api/servers/{dynamic_id}/authorization"))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(required["state"], "required");
+        assert!(required["scopes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("mcp.read")));
+        assert!(required["scopes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("mcp.write")));
+        let step_up_start = client
+            .post(format!(
+                "{gateway}/api/servers/{dynamic_id}/authorization/start"
+            ))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let step_up_url =
+            reqwest::Url::parse(step_up_start["authorizationUrl"].as_str().unwrap()).unwrap();
+        let step_up_query: HashMap<String, String> =
+            step_up_url.query_pairs().into_owned().collect();
+        assert!(step_up_query["scope"].contains("mcp.read"));
+        assert!(step_up_query["scope"].contains("mcp.write"));
+        let mut step_up_callback = reqwest::Url::parse(&step_up_query["redirect_uri"]).unwrap();
+        step_up_callback
+            .query_pairs_mut()
+            .append_pair("code", "step-up-code")
+            .append_pair("state", &step_up_query["state"])
+            .append_pair("iss", &issuer);
+        assert_eq!(
+            client.get(step_up_callback).send().await.unwrap().status(),
+            StatusCode::OK
+        );
+        missing_scope.store(true, std::sync::atomic::Ordering::SeqCst);
+        let missing = client
+            .post(format!("{gateway}/mcp"))
+            .header("accept", "application/json")
+            .header("mcp-session-id", session_id)
+            .header("mcp-protocol-version", "2025-03-26")
+            .json(&json!({
+                "jsonrpc": "2.0", "id": 41, "method": "tools/call",
+                "params": { "name": "dynamic__echo", "arguments": {} }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(missing.json::<Value>().await.unwrap()["error"].is_object());
+        let missing_snapshot = client
+            .get(format!("{gateway}/api/servers/{dynamic_id}/authorization"))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(missing_snapshot["state"], "required");
+        insufficient_scope.store(false, std::sync::atomic::Ordering::SeqCst);
+        missing_scope.store(false, std::sync::atomic::Ordering::SeqCst);
 
         let restarted_state = AppState::for_test(&data_dir);
         let (restarted_addr, restarted_gateway) = spawn_router(create_app(restarted_state)).await;
@@ -881,7 +1155,7 @@ mod tests {
             .json::<Value>()
             .await
             .unwrap();
-        assert_eq!(dynamic_persisted["state"], "authorized");
+        assert_eq!(dynamic_persisted["state"], "required");
         assert_eq!(dynamic_persisted["clientId"], "dynamic-client-id");
         assert!(!dynamic_persisted
             .to_string()

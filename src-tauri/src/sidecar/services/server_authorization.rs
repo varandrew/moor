@@ -44,6 +44,7 @@ struct AuthorizationRecord {
     client_id: Option<String>,
     client_secret_ref: Option<String>,
     resource: Option<String>,
+    token_endpoint: Option<String>,
     scopes: Vec<String>,
     access_token_ref: Option<String>,
     refresh_token_ref: Option<String>,
@@ -59,6 +60,7 @@ impl AuthorizationRecord {
             client_id: None,
             client_secret_ref: None,
             resource: None,
+            token_endpoint: None,
             scopes: Vec::new(),
             access_token_ref: None,
             refresh_token_ref: None,
@@ -139,13 +141,18 @@ impl CredentialStore for MemoryCredentialStore {
 struct OAuthCredentialProvider {
     store: Arc<dyn CredentialStore>,
     access_token_ref: String,
+    authorization: Arc<ServerAuthorization>,
+    server_id: String,
 }
 
 impl HttpCredentialProvider for OAuthCredentialProvider {
     fn headers(&self) -> BoxFuture<'static, Result<HashMap<String, String>, RequestError>> {
         let store = self.store.clone();
         let reference = self.access_token_ref.clone();
+        let authorization = self.authorization.clone();
+        let server_id = self.server_id.clone();
         Box::pin(async move {
+            authorization.refresh_if_needed(&server_id).await?;
             let token = store
                 .get(&reference)
                 .map_err(RequestError::from)?
@@ -155,6 +162,24 @@ impl HttpCredentialProvider for OAuthCredentialProvider {
                 format!("Bearer {token}"),
             )]))
         })
+    }
+
+    fn on_unauthorized(&self) -> BoxFuture<'static, Result<bool, RequestError>> {
+        let authorization = self.authorization.clone();
+        let server_id = self.server_id.clone();
+        Box::pin(async move {
+            authorization.refresh(&server_id, true).await?;
+            Ok(true)
+        })
+    }
+
+    fn on_insufficient_scope(
+        &self,
+        challenge: Option<String>,
+    ) -> BoxFuture<'static, Result<(), RequestError>> {
+        let authorization = self.authorization.clone();
+        let server_id = self.server_id.clone();
+        Box::pin(async move { authorization.require_step_up(&server_id, challenge).await })
     }
 }
 
@@ -209,6 +234,8 @@ pub struct ServerAuthorization {
     store: Arc<dyn CredentialStore>,
     client: reqwest::Client,
     attempts: Arc<Mutex<HashMap<String, PendingAttempt>>>,
+    refresh_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    refresh_completed: Arc<Mutex<HashMap<String, chrono::DateTime<Utc>>>>,
 }
 
 impl ServerAuthorization {
@@ -227,7 +254,200 @@ impl ServerAuthorization {
             store,
             client: reqwest::Client::new(),
             attempts: Arc::new(Mutex::new(HashMap::new())),
+            refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+            refresh_completed: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    async fn require_step_up(
+        &self,
+        server_id: &str,
+        challenge: Option<String>,
+    ) -> Result<(), RequestError> {
+        let required = challenge
+            .as_deref()
+            .and_then(|challenge| challenge_parameter(challenge, "scope"))
+            .map(|scope| {
+                scope
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let is_insufficient_scope = challenge
+            .as_deref()
+            .and_then(|challenge| challenge_parameter(challenge, "error"))
+            .is_some_and(|error| error == "insufficient_scope");
+        if required.is_empty() && !is_insufficient_scope {
+            return Ok(());
+        }
+        let mut record = self
+            .load(server_id)
+            .map_err(RequestError::from)?
+            .ok_or("OAuth authorization required")?;
+        for scope in required {
+            if !record.scopes.contains(&scope) {
+                record.scopes.push(scope);
+            }
+        }
+        record.status = "required".into();
+        record.error_message = Some("Additional OAuth scopes are required".into());
+        self.save(server_id, &record).map_err(RequestError::from)?;
+        self.emit_snapshot(server_id)
+            .await
+            .map_err(RequestError::from)?;
+        Ok(())
+    }
+
+    async fn refresh_if_needed(&self, server_id: &str) -> Result<(), RequestError> {
+        let record = self
+            .load(server_id)
+            .map_err(RequestError::from)?
+            .ok_or("OAuth authorization required")?;
+        let Some(expires_at) = record.expires_at.as_deref() else {
+            return Ok(());
+        };
+        let expires_at = chrono::DateTime::parse_from_rfc3339(expires_at)
+            .map_err(|_| RequestError::from("OAuth expiry is invalid"))?;
+        if expires_at > Utc::now() + ChronoDuration::seconds(60) {
+            return Ok(());
+        }
+        self.refresh(server_id, false).await
+    }
+
+    async fn require_refresh(&self, server_id: &str, message: &str) -> RequestError {
+        if let Ok(Some(mut record)) = self.load(server_id) {
+            record.status = "required".into();
+            record.error_message = Some(message.to_string());
+            let _ = self.save(server_id, &record);
+            let _ = self.emit_snapshot(server_id).await;
+        }
+        RequestError::from(message)
+    }
+
+    pub async fn refresh(&self, server_id: &str, force: bool) -> Result<(), RequestError> {
+        let lock = {
+            let mut locks = self.refresh_locks.lock().await;
+            locks
+                .entry(server_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _guard = lock.lock().await;
+        if self
+            .refresh_completed
+            .lock()
+            .await
+            .get(server_id)
+            .is_some_and(|completed| *completed > Utc::now() - ChronoDuration::seconds(1))
+        {
+            return Ok(());
+        }
+        let record = self
+            .load(server_id)
+            .map_err(RequestError::from)?
+            .ok_or("OAuth authorization required")?;
+        if !force {
+            let Some(expires_at) = record.expires_at.as_deref() else {
+                return Ok(());
+            };
+            let expires_at = chrono::DateTime::parse_from_rfc3339(expires_at)
+                .map_err(|_| RequestError::from("OAuth expiry is invalid"))?;
+            if expires_at > Utc::now() + ChronoDuration::seconds(60) {
+                return Ok(());
+            }
+        }
+        let Some(refresh_ref) = record.refresh_token_ref.clone() else {
+            return Err(self
+                .require_refresh(server_id, "OAuth refresh token is unavailable")
+                .await);
+        };
+        let refresh_token = match self.store.get(&refresh_ref) {
+            Ok(Some(token)) => token,
+            _ => {
+                return Err(self
+                    .require_refresh(server_id, "OAuth refresh token is unavailable")
+                    .await);
+            }
+        };
+        let Some(endpoint) = record.token_endpoint.clone() else {
+            return Err(self
+                .require_refresh(
+                    server_id,
+                    "OAuth token endpoint is unavailable; reauthorize the Server",
+                )
+                .await);
+        };
+        let Some(client_id) = record.client_id.clone() else {
+            return Err(self
+                .require_refresh(server_id, "OAuth client registration is unavailable")
+                .await);
+        };
+        let client_secret = match &record.client_secret_ref {
+            Some(reference) => self.store.get(reference).map_err(RequestError::from)?,
+            None => None,
+        };
+        let mut form = HashMap::from([
+            ("grant_type".to_string(), "refresh_token".to_string()),
+            ("refresh_token".to_string(), refresh_token),
+            ("client_id".to_string(), client_id),
+            (
+                "resource".to_string(),
+                record.resource.clone().unwrap_or_default(),
+            ),
+        ]);
+        if let Some(secret) = client_secret {
+            form.insert("client_secret".to_string(), secret);
+        }
+        let response = self
+            .client
+            .post(endpoint)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|_| RequestError::from("OAuth token endpoint is unavailable"))?;
+        if !response.status().is_success() {
+            return Err(self
+                .require_refresh(
+                    server_id,
+                    "OAuth refresh was rejected; reauthorize the Server",
+                )
+                .await);
+        }
+        let token = response
+            .json::<TokenResponse>()
+            .await
+            .map_err(|_| RequestError::from("Invalid OAuth refresh response"))?;
+        if token.access_token.is_empty() {
+            return Err(RequestError::from("Invalid OAuth refresh response"));
+        }
+        let access_ref = access_token_ref(server_id);
+        self.store
+            .set(&access_ref, &token.access_token)
+            .map_err(RequestError::from)?;
+        if let Some(refresh) = &token.refresh_token {
+            self.store
+                .set(&refresh_ref, refresh)
+                .map_err(RequestError::from)?;
+        }
+        let mut updated = record;
+        updated.status = "authorized".into();
+        updated.access_token_ref = Some(access_ref);
+        updated.refresh_token_ref = Some(refresh_ref);
+        updated.expires_at = token
+            .expires_in
+            .map(|seconds| (Utc::now() + ChronoDuration::seconds(seconds)).to_rfc3339());
+        updated.error_message = None;
+        self.save(server_id, &updated).map_err(RequestError::from)?;
+        self.refresh_completed
+            .lock()
+            .await
+            .insert(server_id.to_string(), Utc::now());
+        drop(_guard);
+        self.emit_snapshot(server_id)
+            .await
+            .map_err(RequestError::from)?;
+        Ok(())
     }
 
     pub fn credential_provider(
@@ -246,6 +466,8 @@ impl ServerAuthorization {
         Ok(Some(Arc::new(OAuthCredentialProvider {
             store: self.store.clone(),
             access_token_ref,
+            authorization: self.shared(),
+            server_id: server_id.to_string(),
         })))
     }
 
@@ -303,6 +525,11 @@ impl ServerAuthorization {
     ) -> AuthorizationSnapshot {
         let state = if authorizing {
             "authorizing".to_string()
+        } else if record
+            .as_ref()
+            .is_some_and(|record| record.status == "required")
+        {
+            "required".to_string()
         } else if record
             .as_ref()
             .is_some_and(|record| record.error_message.is_some())
@@ -371,7 +598,13 @@ impl ServerAuthorization {
             .ok_or("Server not found")?;
         let server_url = server.url.ok_or("OAuth requires an HTTP Server URL")?;
         match self
-            .start_inner(server_id, &server_url, client_id, client_secret)
+            .start_inner(
+                server_id,
+                &server_url,
+                client_id,
+                client_secret,
+                record.scopes.clone(),
+            )
             .await
         {
             Ok(result) => Ok(result),
@@ -399,8 +632,14 @@ impl ServerAuthorization {
         server_url: &str,
         client_id: Option<String>,
         client_secret: Option<String>,
+        previous_scopes: Vec<String>,
     ) -> Result<Value, String> {
-        let discovery = self.discover(server_url).await?;
+        let mut discovery = self.discover(server_url).await?;
+        for scope in previous_scopes {
+            if !discovery.scopes.contains(&scope) {
+                discovery.scopes.push(scope);
+            }
+        }
         validate_oauth_http_url(
             &Url::parse(&discovery.metadata.authorization_endpoint)
                 .map_err(|_| "Invalid authorization endpoint")?,
@@ -642,6 +881,8 @@ impl ServerAuthorization {
             store: self.store.clone(),
             client: self.client.clone(),
             attempts: self.attempts.clone(),
+            refresh_locks: self.refresh_locks.clone(),
+            refresh_completed: self.refresh_completed.clone(),
         })
     }
 
@@ -672,21 +913,22 @@ impl ServerAuthorization {
 
     fn load(&self, server_id: &str) -> Result<Option<AuthorizationRecord>, String> {
         self.db.query_one(
-            "SELECT status, issuer, client_id, client_secret_ref, resource, scopes, access_token_ref, refresh_token_ref, expires_at, error_message FROM server_authorizations WHERE server_id = ?1",
+            "SELECT status, issuer, client_id, client_secret_ref, resource, token_endpoint, scopes, access_token_ref, refresh_token_ref, expires_at, error_message FROM server_authorizations WHERE server_id = ?1",
             &[&server_id],
             |row| {
-                let scopes: String = row.get(5)?;
+                let scopes: String = row.get(6)?;
                 Ok(AuthorizationRecord {
                     status: row.get(0)?,
                     issuer: row.get(1)?,
                     client_id: row.get(2)?,
                     client_secret_ref: row.get(3)?,
                     resource: row.get(4)?,
+                    token_endpoint: row.get(5)?,
                     scopes: serde_json::from_str(&scopes).unwrap_or_default(),
-                    access_token_ref: row.get(6)?,
-                    refresh_token_ref: row.get(7)?,
-                    expires_at: row.get(8)?,
-                    error_message: row.get(9)?,
+                    access_token_ref: row.get(7)?,
+                    refresh_token_ref: row.get(8)?,
+                    expires_at: row.get(9)?,
+                    error_message: row.get(10)?,
                 })
             },
         )
@@ -696,7 +938,7 @@ impl ServerAuthorization {
         let scopes = serde_json::to_string(&record.scopes).map_err(|error| error.to_string())?;
         let now = Utc::now().to_rfc3339();
         self.db.run(
-            "INSERT INTO server_authorizations (server_id, status, issuer, client_id, client_secret_ref, resource, scopes, access_token_ref, refresh_token_ref, expires_at, error_message, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) ON CONFLICT(server_id) DO UPDATE SET status = excluded.status, issuer = excluded.issuer, client_id = excluded.client_id, client_secret_ref = excluded.client_secret_ref, resource = excluded.resource, scopes = excluded.scopes, access_token_ref = excluded.access_token_ref, refresh_token_ref = excluded.refresh_token_ref, expires_at = excluded.expires_at, error_message = excluded.error_message, updated_at = excluded.updated_at",
+            "INSERT INTO server_authorizations (server_id, status, issuer, client_id, client_secret_ref, resource, token_endpoint, scopes, access_token_ref, refresh_token_ref, expires_at, error_message, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) ON CONFLICT(server_id) DO UPDATE SET status = excluded.status, issuer = excluded.issuer, client_id = excluded.client_id, client_secret_ref = excluded.client_secret_ref, resource = excluded.resource, token_endpoint = excluded.token_endpoint, scopes = excluded.scopes, access_token_ref = excluded.access_token_ref, refresh_token_ref = excluded.refresh_token_ref, expires_at = excluded.expires_at, error_message = excluded.error_message, updated_at = excluded.updated_at",
             &[
                 &server_id,
                 &record.status,
@@ -704,6 +946,7 @@ impl ServerAuthorization {
                 &record.client_id,
                 &record.client_secret_ref,
                 &record.resource,
+                &record.token_endpoint,
                 &scopes,
                 &record.access_token_ref,
                 &record.refresh_token_ref,
@@ -851,6 +1094,7 @@ async fn oauth_callback(
     record.status = "authorized".into();
     record.issuer = Some(attempt.expected_issuer);
     record.resource = Some(attempt.resource);
+    record.token_endpoint = Some(attempt.token_endpoint);
     record.scopes = token
         .scope
         .map(|scope| scope.split_whitespace().map(str::to_string).collect())
