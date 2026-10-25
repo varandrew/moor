@@ -170,9 +170,16 @@ struct AuthorizationServerMetadata {
     issuer: String,
     authorization_endpoint: String,
     token_endpoint: String,
+    registration_endpoint: Option<String>,
     code_challenge_methods_supported: Option<Vec<String>>,
     #[serde(default)]
     authorization_response_iss_parameter_supported: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DynamicClientRegistration {
+    client_id: String,
+    client_secret: Option<String>,
 }
 
 struct Discovery {
@@ -318,6 +325,16 @@ impl ServerAuthorization {
         }
     }
 
+    fn persist_client_secret(
+        &self,
+        record: &mut AuthorizationRecord,
+        server_id: &str,
+        secret: &str,
+    ) -> Result<(), String> {
+        record.client_secret_ref = Some(client_secret_ref(server_id));
+        self.store.set(&client_secret_ref(server_id), secret)
+    }
+
     pub async fn register_client(
         &self,
         server_id: &str,
@@ -334,8 +351,7 @@ impl ServerAuthorization {
         record.error_message = None;
         record.client_id = Some(client_id.trim().to_string());
         if let Some(secret) = client_secret.filter(|secret| !secret.is_empty()) {
-            record.client_secret_ref = Some(client_secret_ref(server_id));
-            self.store.set(&client_secret_ref(server_id), secret)?;
+            self.persist_client_secret(&mut record, server_id, secret)?;
         }
         self.save(server_id, &record)?;
         self.emit_snapshot(server_id).await
@@ -345,10 +361,7 @@ impl ServerAuthorization {
         let record = self
             .load(server_id)?
             .unwrap_or_else(AuthorizationRecord::required);
-        let client_id = record
-            .client_id
-            .clone()
-            .ok_or("Register an OAuth client before authorizing")?;
+        let client_id = record.client_id.clone();
         let client_secret = match &record.client_secret_ref {
             Some(reference) => self.store.get(reference)?,
             None => None,
@@ -384,7 +397,7 @@ impl ServerAuthorization {
         &self,
         server_id: &str,
         server_url: &str,
-        client_id: String,
+        client_id: Option<String>,
         client_secret: Option<String>,
     ) -> Result<Value, String> {
         let discovery = self.discover(server_url).await?;
@@ -401,6 +414,15 @@ impl ServerAuthorization {
             .map_err(|error| format!("Failed to bind OAuth callback: {error}"))?;
         let callback_addr = listener.local_addr().map_err(|error| error.to_string())?;
         let redirect_uri = format!("http://{callback_addr}/oauth/callback");
+        let (client_id, client_secret) = self
+            .resolve_client(
+                server_id,
+                &discovery.metadata,
+                client_id,
+                client_secret,
+                &redirect_uri,
+            )
+            .await?;
         let state = random_url_safe(32)?;
         let code_verifier = random_url_safe(48)?;
         let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()));
@@ -466,6 +488,57 @@ impl ServerAuthorization {
             "authorizationUrl": authorization_url.to_string(),
             "expiresAt": expires_at.to_rfc3339(),
         }))
+    }
+
+    async fn resolve_client(
+        &self,
+        server_id: &str,
+        metadata: &AuthorizationServerMetadata,
+        client_id: Option<String>,
+        client_secret: Option<String>,
+        redirect_uri: &str,
+    ) -> Result<(String, Option<String>), String> {
+        if let Some(client_id) = client_id {
+            return Ok((client_id, client_secret));
+        }
+        let endpoint = metadata
+            .registration_endpoint
+            .as_deref()
+            .ok_or("Register an OAuth client before authorizing")?;
+        let endpoint = Url::parse(endpoint).map_err(|_| "Invalid client registration endpoint")?;
+        validate_oauth_http_url(&endpoint)?;
+        let response = self
+            .client
+            .post(endpoint)
+            .json(&serde_json::json!({
+                "client_name": "Moor",
+                "redirect_uris": [redirect_uri],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "client_secret_post"
+            }))
+            .send()
+            .await
+            .map_err(|_| "Dynamic client registration failed")?;
+        if !response.status().is_success() {
+            return Err("Dynamic client registration was rejected".into());
+        }
+        let registration = response
+            .json::<DynamicClientRegistration>()
+            .await
+            .map_err(|_| "Invalid dynamic client registration response")?;
+        if registration.client_id.trim().is_empty() {
+            return Err("Dynamic client registration returned no client ID".into());
+        }
+        let mut record = self
+            .load(server_id)?
+            .unwrap_or_else(AuthorizationRecord::required);
+        record.client_id = Some(registration.client_id.clone());
+        if let Some(secret) = registration.client_secret.as_deref() {
+            self.persist_client_secret(&mut record, server_id, secret)?;
+        }
+        self.save(server_id, &record)?;
+        Ok((registration.client_id, registration.client_secret))
     }
 
     async fn discover(&self, server_url: &str) -> Result<Discovery, String> {
@@ -846,18 +919,27 @@ fn protected_resource_candidates(url: &Url) -> Result<Vec<Url>, String> {
 }
 
 fn authorization_metadata_candidates(issuer: &Url) -> Result<Vec<Url>, String> {
-    let mut endpoint = issuer.clone();
-    endpoint.set_path(&format!(
-        "/.well-known/oauth-authorization-server{}",
-        issuer.path()
-    ));
-    endpoint.set_query(None);
-    endpoint.set_fragment(None);
-    let mut root = issuer.clone();
-    root.set_path("/.well-known/oauth-authorization-server");
-    root.set_query(None);
-    root.set_fragment(None);
-    Ok(vec![endpoint, root])
+    let candidate = |path: String| {
+        let mut url = issuer.clone();
+        url.set_path(&path);
+        url.set_query(None);
+        url.set_fragment(None);
+        url
+    };
+    let issuer_path = issuer.path();
+    if issuer_path.is_empty() || issuer_path == "/" {
+        return Ok(vec![
+            candidate("/.well-known/oauth-authorization-server".into()),
+            candidate("/.well-known/openid-configuration".into()),
+        ]);
+    }
+    Ok(vec![
+        candidate(format!(
+            "/.well-known/oauth-authorization-server{issuer_path}"
+        )),
+        candidate(format!("/.well-known/openid-configuration{issuer_path}")),
+        candidate(format!("{issuer_path}/.well-known/openid-configuration")),
+    ])
 }
 
 fn challenge_parameter(challenge: &str, name: &str) -> Option<String> {

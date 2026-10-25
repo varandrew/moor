@@ -337,6 +337,7 @@ mod tests {
     #[tokio::test]
     async fn preregistered_oauth_completes_callback_and_authorizes_upstream_requests() {
         let (token_requests, mut token_forms) = mpsc::unbounded_channel();
+        let (registrations, mut registration_forms) = mpsc::unbounded_channel();
         let authorization_server = Router::new()
             .route(
                 "/.well-known/oauth-authorization-server",
@@ -346,9 +347,23 @@ mod tests {
                         "issuer": base,
                         "authorization_endpoint": format!("{base}/authorize"),
                         "token_endpoint": format!("{base}/token"),
+                        "registration_endpoint": format!("{base}/register"),
                         "code_challenge_methods_supported": ["S256"],
                         "authorization_response_iss_parameter_supported": true
                     }))
+                }),
+            )
+            .route(
+                "/register",
+                post(move |Json(body): Json<Value>| {
+                    let registrations = registrations.clone();
+                    async move {
+                        registrations.send(body).unwrap();
+                        Json(json!({
+                            "client_id": "dynamic-client-id",
+                            "client_secret": "dynamic-client-secret"
+                        }))
+                    }
                 }),
             )
             .route(
@@ -761,6 +776,86 @@ mod tests {
             }
         }
 
+        let dynamic = client
+            .post(format!("{gateway}/api/servers"))
+            .header("x-moor-token", "test-token")
+            .json(&json!({
+                "name": "dynamic",
+                "connectionType": "http",
+                "url": format!("http://{upstream_addr}/mcp")
+            }))
+            .send()
+            .await
+            .unwrap();
+        let dynamic_id = dynamic.json::<Value>().await.unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let dynamic_start = client
+            .post(format!(
+                "{gateway}/api/servers/{dynamic_id}/authorization/start"
+            ))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let dynamic_url =
+            reqwest::Url::parse(dynamic_start["authorizationUrl"].as_str().unwrap()).unwrap();
+        let dynamic_query: HashMap<String, String> =
+            dynamic_url.query_pairs().into_owned().collect();
+        assert_eq!(dynamic_query["client_id"], "dynamic-client-id");
+        assert_eq!(dynamic_query["scope"], "mcp.read");
+        assert_eq!(
+            dynamic_query["resource"],
+            format!("http://{upstream_addr}/mcp")
+        );
+        let registration = registration_forms.recv().await.unwrap();
+        assert_eq!(registration["client_name"], "Moor");
+        assert_eq!(
+            registration["redirect_uris"][0],
+            dynamic_query["redirect_uri"]
+        );
+        assert_eq!(
+            registration["token_endpoint_auth_method"],
+            "client_secret_post"
+        );
+        let mut dynamic_callback = reqwest::Url::parse(&dynamic_query["redirect_uri"]).unwrap();
+        dynamic_callback
+            .query_pairs_mut()
+            .append_pair("code", "dynamic-code")
+            .append_pair("state", &dynamic_query["state"])
+            .append_pair("iss", &issuer);
+        assert_eq!(
+            client.get(dynamic_callback).send().await.unwrap().status(),
+            StatusCode::OK
+        );
+        let dynamic_started = client
+            .post(format!("{gateway}/api/servers/{dynamic_id}/start"))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(dynamic_started.status(), StatusCode::OK);
+        let dynamic_call = client
+            .post(format!("{gateway}/mcp"))
+            .header("accept", "application/json")
+            .header("mcp-session-id", session_id)
+            .header("mcp-protocol-version", "2025-03-26")
+            .json(&json!({
+                "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": { "name": "dynamic__echo", "arguments": {} }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            dynamic_call.json::<Value>().await.unwrap()["result"]["content"][0]["text"],
+            "oauth-ok"
+        );
+
         let restarted_state = AppState::for_test(&data_dir);
         let (restarted_addr, restarted_gateway) = spawn_router(create_app(restarted_state)).await;
         let persisted = client
@@ -775,6 +870,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(persisted["state"], "authorized");
+        let dynamic_persisted = client
+            .get(format!(
+                "http://{restarted_addr}/api/servers/{dynamic_id}/authorization"
+            ))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(dynamic_persisted["state"], "authorized");
+        assert_eq!(dynamic_persisted["clientId"], "dynamic-client-id");
+        assert!(!dynamic_persisted
+            .to_string()
+            .contains("dynamic-client-secret"));
 
         restarted_gateway.abort();
         gateway_server.abort();
@@ -931,5 +1042,296 @@ mod tests {
         upstream_server.abort();
         as_server.abort();
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn oidc_discovery_variants_complete_dynamic_authorization() {
+        for (issuer_path, metadata_path) in [
+            (
+                "/tenant1",
+                "/.well-known/oauth-authorization-server/tenant1",
+            ),
+            ("/tenant1", "/.well-known/openid-configuration/tenant1"),
+            ("/tenant1", "/tenant1/.well-known/openid-configuration"),
+            ("", "/.well-known/openid-configuration"),
+        ] {
+            let issuer_slot = Arc::new(std::sync::Mutex::new(String::new()));
+            let metadata_issuer = issuer_slot.clone();
+            let authorization_server = Router::new()
+                .route(
+                    metadata_path,
+                    axum::routing::get(move |headers: HeaderMap| {
+                        let issuer = metadata_issuer.lock().unwrap().clone();
+                        async move {
+                            let base = format!(
+                                "http://{}",
+                                headers.get("host").unwrap().to_str().unwrap()
+                            );
+                            Json(json!({
+                                "issuer": issuer,
+                                "authorization_endpoint": format!("{base}/authorize"),
+                                "token_endpoint": format!("{base}/token"),
+                                "registration_endpoint": format!("{base}/register"),
+                                "code_challenge_methods_supported": ["S256"],
+                                "authorization_response_iss_parameter_supported": true
+                            }))
+                        }
+                    }),
+                )
+                .route(
+                    "/register",
+                    post(|| async {
+                        Json(json!({
+                            "client_id": "oidc-dynamic-client",
+                            "client_secret": "oidc-dynamic-secret"
+                        }))
+                    }),
+                )
+                .route(
+                    "/token",
+                    post(|| async {
+                        Json(json!({
+                            "access_token": "oidc-access-token",
+                            "token_type": "Bearer",
+                            "expires_in": 3600
+                        }))
+                    }),
+                );
+            let (as_addr, as_server) = spawn_router(authorization_server).await;
+            let issuer = format!("http://{as_addr}{issuer_path}");
+            *issuer_slot.lock().unwrap() = issuer.clone();
+            let resource_issuer = issuer.clone();
+            let protected = Router::new()
+                .route(
+                    "/custom-resource",
+                    axum::routing::get(move || {
+                        let issuer = resource_issuer.clone();
+                        async move {
+                            Json(json!({
+                                "authorization_servers": [issuer],
+                                "scopes_supported": ["mcp.read"]
+                            }))
+                        }
+                    }),
+                )
+                .route(
+                    "/mcp",
+                    post(|headers: HeaderMap| async move {
+                        let host = headers.get("host").unwrap().to_str().unwrap();
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            [(
+                                "www-authenticate",
+                                format!(
+                                    "Bearer resource_metadata=\"http://{host}/custom-resource\""
+                                ),
+                            )],
+                        )
+                    }),
+                );
+            let (upstream_addr, upstream_server) = spawn_router(protected).await;
+            let data_dir = std::env::temp_dir().join(format!("moor-oidc-{}", uuid::Uuid::new_v4()));
+            let state = AppState::for_test(&data_dir);
+            let (gateway_addr, gateway_server) = spawn_router(create_app(state)).await;
+            let gateway = format!("http://{gateway_addr}");
+            let client = reqwest::Client::new();
+            let created = client
+                .post(format!("{gateway}/api/servers"))
+                .header("x-moor-token", "test-token")
+                .json(&json!({
+                    "name": "oidc", "connectionType": "http",
+                    "url": format!("http://{upstream_addr}/mcp")
+                }))
+                .send()
+                .await
+                .unwrap();
+            let server_id = created.json::<Value>().await.unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let started = client
+                .post(format!(
+                    "{gateway}/api/servers/{server_id}/authorization/start"
+                ))
+                .header("x-moor-token", "test-token")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(started.status(), StatusCode::OK, "{metadata_path}");
+            let started = started.json::<Value>().await.unwrap();
+            let url = reqwest::Url::parse(started["authorizationUrl"].as_str().unwrap()).unwrap();
+            let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
+            assert_eq!(query["client_id"], "oidc-dynamic-client");
+            assert_eq!(query["scope"], "mcp.read");
+            assert_eq!(query["resource"], format!("http://{upstream_addr}/mcp"));
+            let mut callback = reqwest::Url::parse(&query["redirect_uri"]).unwrap();
+            callback
+                .query_pairs_mut()
+                .append_pair("code", "oidc-code")
+                .append_pair("state", &query["state"])
+                .append_pair("iss", &issuer);
+            assert_eq!(
+                client.get(callback).send().await.unwrap().status(),
+                StatusCode::OK,
+                "{metadata_path}"
+            );
+            let snapshot = client
+                .get(format!("{gateway}/api/servers/{server_id}/authorization"))
+                .header("x-moor-token", "test-token")
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap();
+            assert_eq!(snapshot["state"], "authorized");
+            assert_eq!(snapshot["clientId"], "oidc-dynamic-client");
+            assert!(!snapshot.to_string().contains("oidc-dynamic-secret"));
+
+            gateway_server.abort();
+            upstream_server.abort();
+            as_server.abort();
+            let _ = std::fs::remove_dir_all(data_dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_metadata_and_missing_dcr_fall_back_safely() {
+        for malformed in [true, false] {
+            let issuer_slot = Arc::new(std::sync::Mutex::new(String::new()));
+            let metadata_issuer = issuer_slot.clone();
+            let authorization_server = Router::new()
+                .route(
+                    "/.well-known/oauth-authorization-server",
+                    axum::routing::get(move |headers: HeaderMap| {
+                        let issuer = metadata_issuer.lock().unwrap().clone();
+                        async move {
+                            if malformed {
+                                return Json(json!({ "issuer": issuer }));
+                            }
+                            let base = format!(
+                                "http://{}",
+                                headers.get("host").unwrap().to_str().unwrap()
+                            );
+                            Json(json!({
+                                "issuer": issuer,
+                                "authorization_endpoint": format!("{base}/authorize"),
+                                "token_endpoint": format!("{base}/token"),
+                                "code_challenge_methods_supported": ["S256"],
+                                "authorization_response_iss_parameter_supported": true,
+                                "client_id_metadata_document_supported": true
+                            }))
+                        }
+                    }),
+                )
+                .route(
+                    "/token",
+                    post(|| async {
+                        Json(json!({
+                            "access_token": "fallback-access-token",
+                            "token_type": "Bearer"
+                        }))
+                    }),
+                );
+            let (as_addr, as_server) = spawn_router(authorization_server).await;
+            *issuer_slot.lock().unwrap() = format!("http://{as_addr}");
+            let issuer = format!("http://{as_addr}");
+            let resource_issuer = issuer.clone();
+            let protected = Router::new()
+                .route(
+                    "/.well-known/oauth-protected-resource/mcp",
+                    axum::routing::get(move || {
+                        let issuer = resource_issuer.clone();
+                        async move { Json(json!({ "authorization_servers": [issuer] })) }
+                    }),
+                )
+                .route("/mcp", post(|| async { StatusCode::UNAUTHORIZED }));
+            let (upstream_addr, upstream_server) = spawn_router(protected).await;
+            let data_dir =
+                std::env::temp_dir().join(format!("moor-oauth-fallback-{}", uuid::Uuid::new_v4()));
+            let state = AppState::for_test(&data_dir);
+            let (gateway_addr, gateway_server) = spawn_router(create_app(state)).await;
+            let gateway = format!("http://{gateway_addr}");
+            let client = reqwest::Client::new();
+            let created = client
+                .post(format!("{gateway}/api/servers"))
+                .header("x-moor-token", "test-token")
+                .json(&json!({
+                    "name": "fallback", "connectionType": "http",
+                    "url": format!("http://{upstream_addr}/mcp")
+                }))
+                .send()
+                .await
+                .unwrap();
+            let server_id = created.json::<Value>().await.unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let start = client
+                .post(format!(
+                    "{gateway}/api/servers/{server_id}/authorization/start"
+                ))
+                .header("x-moor-token", "test-token")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(start.status(), StatusCode::BAD_GATEWAY);
+            if malformed {
+                let snapshot = client
+                    .get(format!("{gateway}/api/servers/{server_id}/authorization"))
+                    .header("x-moor-token", "test-token")
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<Value>()
+                    .await
+                    .unwrap();
+                assert_eq!(snapshot["state"], "error");
+                assert!(snapshot["errorMessage"]
+                    .as_str()
+                    .unwrap()
+                    .contains("metadata"));
+            } else {
+                client
+                    .put(format!(
+                        "{gateway}/api/servers/{server_id}/authorization/client"
+                    ))
+                    .header("x-moor-token", "test-token")
+                    .json(&json!({ "clientId": "manual-fallback-client" }))
+                    .send()
+                    .await
+                    .unwrap();
+                let start = client
+                    .post(format!(
+                        "{gateway}/api/servers/{server_id}/authorization/start"
+                    ))
+                    .header("x-moor-token", "test-token")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(start.status(), StatusCode::OK);
+                let started = start.json::<Value>().await.unwrap();
+                let url =
+                    reqwest::Url::parse(started["authorizationUrl"].as_str().unwrap()).unwrap();
+                let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
+                assert_eq!(query["client_id"], "manual-fallback-client");
+                assert!(!query["client_id"].starts_with("https://"));
+                let mut callback = reqwest::Url::parse(&query["redirect_uri"]).unwrap();
+                callback
+                    .query_pairs_mut()
+                    .append_pair("code", "fallback-code")
+                    .append_pair("state", &query["state"])
+                    .append_pair("iss", &issuer);
+                assert_eq!(
+                    client.get(callback).send().await.unwrap().status(),
+                    StatusCode::OK
+                );
+            }
+
+            gateway_server.abort();
+            upstream_server.abort();
+            as_server.abort();
+            let _ = std::fs::remove_dir_all(data_dir);
+        }
     }
 }
