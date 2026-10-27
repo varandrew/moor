@@ -31,6 +31,7 @@ const ATTEMPT_TTL_SECONDS: i64 = 600;
 pub struct AuthorizationSnapshot {
     pub server_id: String,
     pub state: String,
+    pub error_code: Option<String>,
     pub error_message: Option<String>,
     pub issuer: Option<String>,
     pub client_id: Option<String>,
@@ -57,6 +58,7 @@ struct AuthorizationRecord {
     access_token_ref: Option<String>,
     refresh_token_ref: Option<String>,
     expires_at: Option<String>,
+    error_code: Option<String>,
     error_message: Option<String>,
 }
 
@@ -74,8 +76,16 @@ impl AuthorizationRecord {
             access_token_ref: None,
             refresh_token_ref: None,
             expires_at: None,
+            error_code: None,
             error_message: None,
         }
+    }
+
+    fn set_error(&mut self, message: Option<String>) {
+        self.error_code = message
+            .as_deref()
+            .map(|message| authorization_error_code(message).to_string());
+        self.error_message = message;
     }
 }
 
@@ -435,7 +445,7 @@ impl ServerAuthorization {
             }
         }
         record.status = "required".into();
-        record.error_message = Some("Additional OAuth scopes are required".into());
+        record.set_error(Some("Additional OAuth scopes are required".into()));
         self.save(server_id, &record).map_err(RequestError::from)?;
         self.emit_snapshot(server_id)
             .await
@@ -462,7 +472,7 @@ impl ServerAuthorization {
     async fn require_refresh(&self, server_id: &str, message: &str) -> RequestError {
         if let Ok(Some(mut record)) = self.load(server_id) {
             record.status = "required".into();
-            record.error_message = Some(message.to_string());
+            record.set_error(Some(message.to_string()));
             let _ = self.save(server_id, &record);
             let _ = self.emit_snapshot(server_id).await;
         }
@@ -581,7 +591,7 @@ impl ServerAuthorization {
         updated.expires_at = token
             .expires_in
             .map(|seconds| (Utc::now() + ChronoDuration::seconds(seconds)).to_rfc3339());
-        updated.error_message = None;
+        updated.set_error(None);
         self.save(server_id, &updated).map_err(RequestError::from)?;
         self.refresh_completed
             .lock()
@@ -641,7 +651,7 @@ impl ServerAuthorization {
             if record.status != "authorized" {
                 record.status = "error".into();
             }
-            record.error_message = Some("OAuth attempt expired".into());
+            record.set_error(Some("OAuth attempt expired".into()));
             self.save(server_id, &record)?;
         }
         let attempts = self.attempts.lock().await;
@@ -689,6 +699,7 @@ impl ServerAuthorization {
         AuthorizationSnapshot {
             server_id: server_id.to_string(),
             state,
+            error_code: record.error_code,
             error_message: record.error_message,
             issuer: record.issuer,
             client_id: record.client_id,
@@ -731,7 +742,7 @@ impl ServerAuthorization {
             .load(server_id)?
             .unwrap_or_else(AuthorizationRecord::required);
         record.status = "required".into();
-        record.error_message = None;
+        record.set_error(None);
         record.client_id = Some(client_id.trim().to_string());
         if let Some(secret) = client_secret
             .filter(|secret| !secret.is_empty())
@@ -743,14 +754,24 @@ impl ServerAuthorization {
         self.emit_snapshot(server_id).await
     }
 
-    pub async fn start(&self, server_id: &str) -> Result<Value, String> {
+    pub async fn start(
+        &self,
+        server_id: &str,
+        requested_client_id: Option<&str>,
+    ) -> Result<Value, String> {
         let record = self
             .load(server_id)?
             .unwrap_or_else(AuthorizationRecord::required);
-        let client_id = record.client_id.clone();
-        let client_secret = match &record.client_secret_ref {
-            Some(reference) => self.store.get(reference)?,
-            None => None,
+        let dynamic_registration =
+            requested_client_id.is_some_and(|client_id| client_id.trim().is_empty());
+        let (client_id, client_secret) = if dynamic_registration {
+            (None, None)
+        } else {
+            let client_secret = match &record.client_secret_ref {
+                Some(reference) => self.store.get(reference)?,
+                None => None,
+            };
+            (record.client_id.clone(), client_secret)
         };
         let server = ServerRepository::new(&self.db)
             .find_by_id(server_id)?
@@ -948,6 +969,12 @@ impl ServerAuthorization {
         let mut record = self
             .load(server_id)?
             .unwrap_or_else(AuthorizationRecord::required);
+        if record.client_id.is_some() || record.client_secret_ref.is_some() {
+            self.cleanup(server_id).await?;
+            record = self
+                .load(server_id)?
+                .unwrap_or_else(AuthorizationRecord::required);
+        }
         record.client_id = Some(registration.client_id.clone());
         if let Some(secret) = registration.client_secret.as_deref() {
             self.persist_client_secret(&mut record, server_id, secret)?;
@@ -1074,7 +1101,7 @@ impl ServerAuthorization {
         if status != "error" || record.status != "authorized" {
             record.status = status.to_string();
         }
-        record.error_message = error_message;
+        record.set_error(error_message);
         self.save(server_id, &record)?;
         self.emit_snapshot(server_id).await.map(|_| ())
     }
@@ -1089,7 +1116,7 @@ impl ServerAuthorization {
 
     fn load(&self, server_id: &str) -> Result<Option<AuthorizationRecord>, String> {
         self.db.query_one(
-            "SELECT status, issuer, client_id, client_secret_ref, resource, token_endpoint, revocation_endpoint, scopes, access_token_ref, refresh_token_ref, expires_at, error_message FROM server_authorizations WHERE server_id = ?1",
+            "SELECT status, issuer, client_id, client_secret_ref, resource, token_endpoint, revocation_endpoint, scopes, access_token_ref, refresh_token_ref, expires_at, error_code, error_message FROM server_authorizations WHERE server_id = ?1",
             &[&server_id],
             |row| {
                 let scopes: String = row.get(7)?;
@@ -1105,7 +1132,8 @@ impl ServerAuthorization {
                     access_token_ref: row.get(8)?,
                     refresh_token_ref: row.get(9)?,
                     expires_at: row.get(10)?,
-                    error_message: row.get(11)?,
+                    error_code: row.get(11)?,
+                    error_message: row.get(12)?,
                 })
             },
         )
@@ -1115,7 +1143,7 @@ impl ServerAuthorization {
         let scopes = serde_json::to_string(&record.scopes).map_err(|error| error.to_string())?;
         let now = Utc::now().to_rfc3339();
         self.db.run(
-            "INSERT INTO server_authorizations (server_id, status, issuer, client_id, client_secret_ref, resource, token_endpoint, revocation_endpoint, scopes, access_token_ref, refresh_token_ref, expires_at, error_message, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) ON CONFLICT(server_id) DO UPDATE SET status = excluded.status, issuer = excluded.issuer, client_id = excluded.client_id, client_secret_ref = excluded.client_secret_ref, resource = excluded.resource, token_endpoint = excluded.token_endpoint, revocation_endpoint = excluded.revocation_endpoint, scopes = excluded.scopes, access_token_ref = excluded.access_token_ref, refresh_token_ref = excluded.refresh_token_ref, expires_at = excluded.expires_at, error_message = excluded.error_message, updated_at = excluded.updated_at",
+            "INSERT INTO server_authorizations (server_id, status, issuer, client_id, client_secret_ref, resource, token_endpoint, revocation_endpoint, scopes, access_token_ref, refresh_token_ref, expires_at, error_code, error_message, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) ON CONFLICT(server_id) DO UPDATE SET status = excluded.status, issuer = excluded.issuer, client_id = excluded.client_id, client_secret_ref = excluded.client_secret_ref, resource = excluded.resource, token_endpoint = excluded.token_endpoint, revocation_endpoint = excluded.revocation_endpoint, scopes = excluded.scopes, access_token_ref = excluded.access_token_ref, refresh_token_ref = excluded.refresh_token_ref, expires_at = excluded.expires_at, error_code = excluded.error_code, error_message = excluded.error_message, updated_at = excluded.updated_at",
             &[
                 &server_id,
                 &record.status,
@@ -1129,6 +1157,7 @@ impl ServerAuthorization {
                 &record.access_token_ref,
                 &record.refresh_token_ref,
                 &record.expires_at,
+                &record.error_code,
                 &record.error_message,
                 &now,
             ],
@@ -1283,7 +1312,7 @@ async fn oauth_callback(
     record.expires_at = token
         .expires_in
         .map(|seconds| (Utc::now() + ChronoDuration::seconds(seconds)).to_rfc3339());
-    record.error_message = None;
+    record.set_error(None);
     if let Err(error) = authorization.save(&attempt.server_id, &record) {
         return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
     }
@@ -1301,6 +1330,52 @@ struct TokenResponse {
     refresh_token: Option<String>,
     expires_in: Option<i64>,
     scope: Option<String>,
+}
+
+fn authorization_error_code(message: &str) -> &'static str {
+    if message.starts_with("MCP authorization discovery failed:") {
+        return "discovery_failed";
+    }
+    if message.starts_with("Failed to bind OAuth callback:") {
+        return "callback_invalid";
+    }
+    if message.starts_with("Token exchange failed:") {
+        return "token_exchange_failed";
+    }
+    match message {
+        "Authorization server does not support PKCE S256" => "pkce_unsupported",
+        "Invalid MCP Server URL"
+        | "Protected resource metadata has no authorization servers"
+        | "Invalid resource metadata URL"
+        | "Invalid protected resource metadata"
+        | "Protected resource metadata is unavailable"
+        | "Invalid authorization server issuer"
+        | "Authorization server issuer mismatch"
+        | "Invalid authorization server metadata"
+        | "Authorization server metadata is unavailable"
+        | "Invalid authorization endpoint"
+        | "Invalid token endpoint"
+        | "OAuth endpoints must use HTTPS" => "discovery_failed",
+        "Register an OAuth client before authorizing"
+        | "Invalid client registration endpoint"
+        | "Dynamic client registration failed"
+        | "Dynamic client registration was rejected"
+        | "Invalid dynamic client registration response"
+        | "Dynamic client registration returned no client ID"
+        | "OAuth client registration is unavailable" => "registration_failed",
+        "OAuth issuer mismatch" | "Authorization was denied" => "callback_invalid",
+        "Invalid token response" | "Invalid OAuth refresh response" | "OAuth expiry is invalid" => {
+            "token_exchange_failed"
+        }
+        "OAuth token endpoint is unavailable"
+        | "OAuth token endpoint is unavailable; reauthorize the Server"
+        | "Token endpoint is unavailable" => "token_endpoint_unavailable",
+        "System credential store is unavailable" => "credential_store_unavailable",
+        "OAuth refresh token is unavailable"
+        | "OAuth refresh was rejected; reauthorize the Server" => "refresh_rejected",
+        "Additional OAuth scopes are required" => "insufficient_scope",
+        _ => "authorization_failed",
+    }
 }
 
 fn random_url_safe(bytes: usize) -> Result<String, String> {

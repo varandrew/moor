@@ -3,10 +3,14 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { hasChanges, type EditForm } from "@/lib/server-form";
 import { ServerEditFields } from "./ServerDetail";
 import { ToolCategoryBadge } from "@/components/shared/ToolCategoryBadge";
+import { LocaleContext } from "@/contexts/LocaleContext";
 import {
   AuthorizationBadge,
   AuthorizationButton,
+  AuthorizationClientError,
+  AuthorizationErrorBanner,
   RevocationButton,
+  authorizeServer,
 } from "@/components/servers/ServerAuthorization";
 
 const baseForm: EditForm = {
@@ -109,5 +113,65 @@ describe("ServerDetail", () => {
     expect(
       renderToStaticMarkup(<RevocationButton pending={false} onClick={() => undefined} />),
     ).toContain(">Revoke<");
+  });
+
+  it("starts DCR without a client ID and preserves pre-registration", async () => {
+    const calls: string[] = [];
+    const registerClient = async (input: { clientId: string; clientSecret?: string }) => {
+      calls.push(`register:${input.clientId}:${input.clientSecret ?? ""}`);
+    };
+    const start = async (clientId: string) => {
+      calls.push(`start:${clientId}`);
+    };
+
+    await authorizeServer({
+      clientId: "",
+      clientSecret: "",
+      registerClient,
+      start,
+    });
+    expect(calls).toEqual(["start:"]);
+
+    await authorizeServer({
+      clientId: "manual-client",
+      clientSecret: "secret",
+      registerClient,
+      start,
+    });
+    expect(calls).toEqual(["start:", "register:manual-client:secret", "start:manual-client"]);
+
+    await expect(
+      authorizeServer({ clientId: "", clientSecret: "secret", registerClient, start }),
+    ).rejects.toBeInstanceOf(AuthorizationClientError);
+
+    await expect(
+      authorizeServer({
+        clientId: "manual-client",
+        clientSecret: "",
+        registerClient: async () => {
+          throw new Error("Registration failed");
+        },
+        start,
+      }),
+    ).rejects.toBeInstanceOf(AuthorizationClientError);
+  });
+
+  it("localizes known authorization errors and safely handles unknown codes", () => {
+    const localized = renderToStaticMarkup(
+      <LocaleContext.Provider value="zh-CN">
+        <AuthorizationErrorBanner
+          errorCode="pkce_unsupported"
+          errorMessage="Authorization server does not support PKCE S256"
+        />
+      </LocaleContext.Provider>,
+    );
+    expect(localized).toContain("授权服务器不支持所需的 PKCE S256");
+    expect(localized).not.toContain("Authorization server does not support");
+
+    const fallback = renderToStaticMarkup(
+      <AuthorizationErrorBanner errorCode="future_error" errorMessage="Authorization was denied" />,
+    );
+    expect(fallback).toContain("Authorization was denied");
+    expect(fallback).not.toContain("future_error");
   });
 });

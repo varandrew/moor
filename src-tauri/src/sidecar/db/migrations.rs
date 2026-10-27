@@ -137,16 +137,18 @@ pub fn run_migrations(db: &Database) -> Result<(), String> {
             access_token_ref TEXT,
             refresh_token_ref TEXT,
             expires_at TEXT,
+            error_code TEXT,
             error_message TEXT,
             updated_at TEXT NOT NULL
         )",
     )?;
     ensure_column(db, "server_authorizations", "token_endpoint", "TEXT")?;
     ensure_column(db, "server_authorizations", "revocation_endpoint", "TEXT")?;
+    ensure_column(db, "server_authorizations", "error_code", "TEXT")?;
     backfill_server_sort_order(db)?;
     normalize_audit_timestamps(db)?;
     // 版本号在列补齐之后才推进：迁移中途失败时下一次启动仍会重跑 ensure_column（幂等）。
-    db.exec("PRAGMA user_version = 5")?;
+    db.exec("PRAGMA user_version = 6")?;
 
     Ok(())
 }
@@ -351,6 +353,45 @@ mod tests {
     }
 
     #[test]
+    fn authorization_error_code_is_added_to_an_existing_grant() {
+        let db = temp_db();
+        db.exec(
+            "CREATE TABLE server_authorizations (
+                server_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                scopes TEXT NOT NULL DEFAULT '[]',
+                error_message TEXT,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO server_authorizations (server_id, status, error_message, updated_at)
+            VALUES ('server-1', 'error', 'Authorization was denied', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        run_migrations(&db).unwrap();
+
+        let column_count = db
+            .query_one(
+                "SELECT COUNT(*) FROM pragma_table_info('server_authorizations') WHERE name = 'error_code'",
+                &[],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(column_count, Some(1));
+        assert_eq!(
+            db.query_one(
+                "SELECT error_message FROM server_authorizations WHERE server_id = 'server-1'",
+                &[],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .as_deref(),
+            Some("Authorization was denied")
+        );
+        run_migrations(&db).unwrap();
+    }
+
+    #[test]
     fn audit_timestamp_migration_preserves_precision_and_time_index() {
         let db = temp_db();
         run_migrations(&db).unwrap();
@@ -383,7 +424,7 @@ mod tests {
         assert_eq!(
             db.query_one("PRAGMA user_version", &[], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            Some(5)
+            Some(6)
         );
         let plan = db.query_all("EXPLAIN QUERY PLAN SELECT * FROM audit_logs WHERE timestamp >= ?1 AND timestamp < ?2 ORDER BY timestamp DESC", &[&timestamps[0], &timestamps[1]], |row| row.get::<_, String>(3)).unwrap();
         assert!(plan

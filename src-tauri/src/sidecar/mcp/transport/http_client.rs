@@ -439,6 +439,7 @@ impl HttpClientTransport {
     async fn request_headers(&self) -> Result<HashMap<String, String>, RequestError> {
         let mut headers = self.headers.clone();
         if let Some(provider) = &self.credential_provider {
+            headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
             headers.extend(provider.headers().await?);
         }
         Ok(headers)
@@ -1413,6 +1414,7 @@ mod tests {
             post(move |headers: HeaderMap, Json(body): Json<Value>| {
                 let sender = sender.clone();
                 async move {
+                    assert_eq!(headers.get_all("authorization").iter().count(), 1);
                     sender
                         .send((
                             headers
@@ -1455,7 +1457,7 @@ mod tests {
             server_name: "protected".to_string(),
             url: format!("http://{addr}/mcp"),
             headers: HashMap::from([
-                ("authorization".to_string(), "Bearer manual".to_string()),
+                ("Authorization".to_string(), "Bearer manual".to_string()),
                 ("x-custom".to_string(), "preserved".to_string()),
             ]),
             credential_provider: Some(Arc::new(RotatingCredentials {

@@ -75,6 +75,7 @@ describe("server authorization events", () => {
       serverId: "demo",
       state: "authorized",
       scopes: ["mcp.read"],
+      errorCode: "pkce_unsupported",
       errorMessage: null,
     };
     expect(parseMoorSSEEvent("server:authorization", snapshot)).toEqual({
@@ -82,5 +83,6 @@ describe("server authorization events", () => {
       data: snapshot,
     });
     expect(parseMoorSSEEvent("server:authorization", { ...snapshot, state: "running" })).toBeNull();
+    expect(parseMoorSSEEvent("server:authorization", { ...snapshot, errorCode: 1 })).toBeNull();
   });
 });

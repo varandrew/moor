@@ -1,9 +1,10 @@
 import { useState } from "react";
-import type { AuthorizationState } from "@moor/types";
+import type { AuthorizationClientInput, AuthorizationState } from "@moor/types";
 import { useServerAuthorization } from "@/hooks/useServerAuthorization";
 import { useLockedMutation } from "@/hooks/useLockedMutation";
 import { useTranslation } from "@/contexts/LocaleContext";
 import { getErrorMessage } from "@/lib/utils";
+import { messages } from "@/lib/messages";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -61,24 +62,63 @@ export function RevocationButton({ pending, onClick }: { pending: boolean; onCli
   );
 }
 
+export class AuthorizationClientError extends Error {
+  cause?: unknown;
+
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.cause = cause;
+  }
+}
+
+export async function authorizeServer({
+  clientId,
+  clientSecret,
+  registerClient,
+  start,
+}: {
+  clientId: string;
+  clientSecret: string;
+  registerClient: (input: AuthorizationClientInput) => Promise<unknown>;
+  start: (clientId: string) => Promise<void>;
+}) {
+  const id = clientId.trim();
+  if (id) {
+    try {
+      await registerClient({ clientId: id, ...(clientSecret ? { clientSecret } : {}) });
+    } catch (error) {
+      throw new AuthorizationClientError(getErrorMessage(error), error);
+    }
+  } else if (clientSecret) {
+    throw new AuthorizationClientError("Client ID is required");
+  }
+  await start(id);
+}
+
 export function ServerAuthorization({ serverId }: { serverId: string }) {
   const { t } = useTranslation();
   const { authorization, registerClient, start, revoke } = useServerAuthorization(serverId);
   const [clientId, setClientId] = useState<string | null>(null);
   const [clientSecret, setClientSecret] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<{ message: string; preferSnapshot: boolean } | null>(null);
   const [warning, setWarning] = useState<string | null>(null);
   const state = authorization?.state ?? "not_required";
   const mutation = useLockedMutation(
     async () => {
-      const id = (clientId ?? authorization?.clientId ?? "").trim();
-      if (!id) throw new Error("Client ID is required");
-      await registerClient({ clientId: id, ...(clientSecret ? { clientSecret } : {}) });
-      await start();
+      await authorizeServer({
+        clientId: clientId ?? authorization?.clientId ?? "",
+        clientSecret,
+        registerClient,
+        start,
+      });
     },
     {
       onMutate: () => setError(null),
-      onError: (error) => setError(getErrorMessage(error)),
+      onError: (error) =>
+        setError({
+          message: getErrorMessage(error),
+          preferSnapshot: !(error instanceof AuthorizationClientError),
+        }),
     },
   );
   const revocation = useLockedMutation(
@@ -91,7 +131,7 @@ export function ServerAuthorization({ serverId }: { serverId: string }) {
         setError(null);
         setWarning(null);
       },
-      onError: (error) => setError(getErrorMessage(error)),
+      onError: (error) => setError({ message: getErrorMessage(error), preferSnapshot: false }),
     },
   );
 
@@ -140,9 +180,23 @@ export function ServerAuthorization({ serverId }: { serverId: string }) {
         </div>
       </div>
       {warning && <p className="text-xs text-[var(--fg-45)]">{warning}</p>}
-      {(error || authorization?.errorMessage) && (
-        <ErrorBanner message={error ?? authorization?.errorMessage ?? ""} />
-      )}
+      <AuthorizationErrorBanner
+        errorCode={error?.preferSnapshot === false ? null : authorization?.errorCode}
+        errorMessage={error?.message ?? authorization?.errorMessage}
+      />
     </div>
   );
+}
+
+export function AuthorizationErrorBanner({
+  errorCode,
+  errorMessage,
+}: {
+  errorCode?: string | null;
+  errorMessage?: string | null;
+}) {
+  const { text } = useTranslation();
+  const hasTranslation = errorCode && Object.prototype.hasOwnProperty.call(messages, errorCode);
+  const message = hasTranslation ? text(errorCode) : errorMessage;
+  return message ? <ErrorBanner message={message} /> : null;
 }

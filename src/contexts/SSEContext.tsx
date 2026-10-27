@@ -59,6 +59,9 @@ function isServerAuthorizationEvent(data: unknown): data is MoorEventData<"serve
     authorizationStates.has(data.state as AuthorizationState) &&
     Array.isArray(data.scopes) &&
     data.scopes.every((scope) => typeof scope === "string") &&
+    (data.errorCode === undefined ||
+      data.errorCode === null ||
+      typeof data.errorCode === "string") &&
     (data.errorMessage === undefined ||
       data.errorMessage === null ||
       typeof data.errorMessage === "string")

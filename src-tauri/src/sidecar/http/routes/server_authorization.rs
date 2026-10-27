@@ -70,14 +70,22 @@ async fn register_client(
         .map_err(AppError::validation)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StartBody {
+    client_id: Option<String>,
+}
+
 async fn start(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    body: Option<Json<StartBody>>,
 ) -> Result<Json<Value>, AppError> {
+    let client_id = body.and_then(|body| body.0.client_id);
     state
         .server_manager
         .authorization()
-        .start(&id)
+        .start(&id, client_id.as_deref())
         .await
         .map(Json)
         .map_err(|error| {

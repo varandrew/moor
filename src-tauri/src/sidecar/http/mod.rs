@@ -775,6 +775,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rejected_snapshot["state"], "required");
+        assert_eq!(rejected_snapshot["errorCode"], "refresh_rejected");
 
         let stored = state.db.query_all(
             "SELECT client_secret_ref, access_token_ref, refresh_token_ref FROM server_authorizations",
@@ -1092,6 +1093,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(required["state"], "required");
+        assert_eq!(required["errorCode"], "insufficient_scope");
         assert!(required["scopes"]
             .as_array()
             .unwrap()
@@ -1520,6 +1522,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(snapshot["state"], "error");
+        assert_eq!(snapshot["errorCode"], "pkce_unsupported");
         assert!(snapshot["errorMessage"]
             .as_str()
             .unwrap()
@@ -1636,11 +1639,25 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .to_string();
+            let preregistered = client
+                .put(format!(
+                    "{gateway}/api/servers/{server_id}/authorization/client"
+                ))
+                .header("x-moor-token", "test-token")
+                .json(&json!({
+                    "clientId": "old-manual-client",
+                    "clientSecret": "old-manual-secret"
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(preregistered.status(), StatusCode::OK);
             let started = client
                 .post(format!(
                     "{gateway}/api/servers/{server_id}/authorization/start"
                 ))
                 .header("x-moor-token", "test-token")
+                .json(&json!({ "clientId": "" }))
                 .send()
                 .await
                 .unwrap();

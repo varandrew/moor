@@ -34,10 +34,10 @@ export function useServerAuthorization(serverId?: string) {
     client.setQueryData(queryKey, snapshot);
   };
 
-  const start = async () => {
+  const start = async (clientId?: string) => {
     const started = await apiPost<AuthorizationStart>(
       `/api/servers/${encodeURIComponent(serverId!)}/authorization/start`,
-      {},
+      { clientId },
     );
     if (isTauriRuntime()) await open(started.authorizationUrl);
     else window.open(started.authorizationUrl, "_blank", "noopener,noreferrer");

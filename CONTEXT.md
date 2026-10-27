@@ -92,6 +92,10 @@ Names for deepened modules from the 2026-05-29 architecture review, updated for 
 管理 Server 完整生命周期的 deep module，统一 registry、状态机、会话、Tool 清单、Tool 调用与审计归属。规范实现为 Rust `server_manager.rs` 及域内文件 `server_manager/{status,session,errors,health}.rs`。`call_tool(exposed_name, arguments, agent_info)` interface 一次解析 Tool Call Context，完成执行、计时与审计，区分 Tool 不可用和执行失败；MCP 协议层只负责参数校验与响应编码。ToolDiscovery 仅在仍属于当前启动代次且保存成功时被接纳并发布变更；启动时保存失败须断开新会话并报告启动失败。手动刷新保存失败保留原清单与运行状态，停止或重启导致的过期结果须明确报告失效。
 _Avoid_: ServerManager, ServerService (the split).
 
+**Server Authorization**:
+管理 HTTP Server 的 OAuth 授权、动态客户端注册、Token 刷新、权限提升与撤销。规范实现为 Rust `server_authorization.rs` 与前端 `ServerAuthorization.tsx`。状态为 `not_required | required | authorizing | authorized | error`。Client ID 留空时使用动态客户端注册；手工填写时先保存预注册客户端再开始授权。`errorCode` 是稳定的错误分类，界面据此本地化；未知错误码回退到 `errorMessage`。Token、Client Secret 等凭据仅保存在系统凭据库，不进入授权快照或提供给 Agent。
+_Avoid_: 把静态 Authorization header 当作 OAuth 授权状态。
+
 **Settings**:
 管理设置读取、更新与重置的 deep module，规范实现为 `src/hooks/useSettings.ts`。`updateSettings(payload)` 与 `resetSettings()` interface 在同一 QueryClient 内串行执行；涉及登录自启时读取执行前已保存的值作为补偿基线。保存失败则恢复登录自启，补偿失败保留两种错误；保存成功立即更新缓存，运行时应用失败明确报告部分成功，不撤销已保存设置。页面负责交互确认与状态展示，语言上下文负责语言同步。
 _Avoid_: 页面内登录自启补偿、调用方自行同步运行时。
