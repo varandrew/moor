@@ -96,7 +96,7 @@ export async function authorizeServer({
 }
 
 export function ServerAuthorization({ serverId }: { serverId: string }) {
-  const { t } = useTranslation();
+  const { t, text } = useTranslation();
   const { authorization, registerClient, start, revoke } = useServerAuthorization(serverId);
   const [clientId, setClientId] = useState<string | null>(null);
   const [clientSecret, setClientSecret] = useState("");
@@ -108,7 +108,10 @@ export function ServerAuthorization({ serverId }: { serverId: string }) {
       await authorizeServer({
         clientId: clientId ?? authorization?.clientId ?? "",
         clientSecret,
-        registerClient,
+        registerClient: async (input) => {
+          await registerClient(input);
+          setClientSecret("");
+        },
         start,
       });
     },
@@ -166,7 +169,7 @@ export function ServerAuthorization({ serverId }: { serverId: string }) {
           {t("Tokens are stored in the system credential store and never shared with agents.")}
         </p>
         <div className="flex gap-2">
-          {state === "authorized" && (
+          {(authorization?.canRevoke ?? state === "authorized") && (
             <RevocationButton
               pending={revocation.pending}
               onClick={() => void revocation.mutate()}
@@ -179,7 +182,7 @@ export function ServerAuthorization({ serverId }: { serverId: string }) {
           />
         </div>
       </div>
-      {warning && <p className="text-xs text-[var(--fg-45)]">{warning}</p>}
+      {warning && <p className="text-xs text-[var(--fg-45)]">{text(warning)}</p>}
       <AuthorizationErrorBanner
         errorCode={error?.preferSnapshot === false ? null : authorization?.errorCode}
         errorMessage={error?.message ?? authorization?.errorMessage}

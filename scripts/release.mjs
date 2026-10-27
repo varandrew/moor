@@ -59,6 +59,9 @@ run("pnpm changeset version");
 
 // changeset writes CHANGELOG.md for the root package (moor) at the repo root.
 run("pnpm version:sync");
+run(
+  "pnpm exec vp fmt CHANGELOG.md package.json packages/types/package.json src-tauri/tauri.conf.json",
+);
 
 const version = getRootVersion();
 const tagName = `v${version}`;

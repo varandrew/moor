@@ -281,6 +281,11 @@ export const messages = {
     "健康检查仅提示问题，请手动停止并启动服务器以恢复。",
   "Last checked: {time}; consecutive failures: {count}": "最近检查：{time}；连续失败：{count} 次",
   "OAuth Authorization": "OAuth 授权",
+  "Provider revocation failed; local credentials were removed.":
+    "服务提供商撤销授权失败；本地凭据已删除。",
+  "Unable to remove OAuth credentials.": "无法删除 OAuth 凭据。",
+  "Failed to remove OAuth credentials. Check your system credential store and try again.":
+    "无法删除 OAuth 凭据，请检查系统凭据库后重试。",
   "Not configured": "未配置",
   "Authorization required": "需要授权",
   "Waiting for browser": "等待浏览器授权",

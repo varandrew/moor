@@ -7,6 +7,8 @@ import { twMerge } from "tailwind-merge";
 const localizedApiDetails: Record<string, string> = {
   SERVER_CHANGED: "Server changed while refreshing tools. Refresh again.",
   TOOL_DISCOVERY_FAILED: "Failed to refresh tools from the server.",
+  OAUTH_CREDENTIAL_CLEANUP_FAILED:
+    "Failed to remove OAuth credentials. Check your system credential store and try again.",
   INTERNAL_ERROR: "Failed to save discovered tools.",
 };
 

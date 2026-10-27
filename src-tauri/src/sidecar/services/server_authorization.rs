@@ -31,6 +31,7 @@ const ATTEMPT_TTL_SECONDS: i64 = 600;
 pub struct AuthorizationSnapshot {
     pub server_id: String,
     pub state: String,
+    pub can_revoke: bool,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
     pub issuer: Option<String>,
@@ -132,6 +133,8 @@ impl CredentialStore for KeyringCredentialStore {
 pub struct MemoryCredentialStore {
     values: StdMutex<HashMap<String, String>>,
     unavailable: bool,
+    fail_delete: StdMutex<Option<String>>,
+    fail_set: StdMutex<Option<String>>,
 }
 
 #[cfg(test)]
@@ -140,7 +143,17 @@ impl MemoryCredentialStore {
         Self {
             values: StdMutex::new(HashMap::new()),
             unavailable: true,
+            fail_delete: StdMutex::new(None),
+            fail_set: StdMutex::new(None),
         }
+    }
+
+    pub fn fail_delete_for_test(&self, reference: Option<String>) {
+        *self.fail_delete.lock().unwrap() = reference;
+    }
+
+    pub fn fail_set_for_test(&self, reference: Option<String>) {
+        *self.fail_set.lock().unwrap() = reference;
     }
 
     pub fn values_for_test(&self) -> Vec<(String, String)> {
@@ -163,7 +176,7 @@ impl CredentialStore for MemoryCredentialStore {
     }
 
     fn set(&self, reference: &str, value: &str) -> Result<(), String> {
-        if self.unavailable {
+        if self.unavailable || self.fail_set.lock().unwrap().as_deref() == Some(reference) {
             return Err("System credential store is unavailable".into());
         }
         self.values
@@ -174,6 +187,9 @@ impl CredentialStore for MemoryCredentialStore {
     }
 
     fn delete(&self, reference: &str) -> Result<(), String> {
+        if self.fail_delete.lock().unwrap().as_deref() == Some(reference) {
+            return Err("System credential store is unavailable".into());
+        }
         self.values.lock().unwrap().remove(reference);
         Ok(())
     }
@@ -181,19 +197,42 @@ impl CredentialStore for MemoryCredentialStore {
 
 struct OAuthCredentialProvider {
     store: Arc<dyn CredentialStore>,
-    access_token_ref: String,
     authorization: Arc<ServerAuthorization>,
     server_id: String,
+    resource: String,
+    server_url: String,
 }
 
 impl HttpCredentialProvider for OAuthCredentialProvider {
     fn headers(&self) -> BoxFuture<'static, Result<HashMap<String, String>, RequestError>> {
         let store = self.store.clone();
-        let reference = self.access_token_ref.clone();
         let authorization = self.authorization.clone();
         let server_id = self.server_id.clone();
+        let resource = self.resource.clone();
+        let server_url = self.server_url.clone();
         Box::pin(async move {
+            authorization
+                .validate_provider(&server_id, &resource, &server_url)
+                .await?;
             authorization.refresh_if_needed(&server_id).await?;
+            let lifecycle = authorization.lifecycle(&server_id).await;
+            let guard = lifecycle.lock().await;
+            if guard.disabled || guard.deleting {
+                return Err("OAuth authorization required".into());
+            }
+            authorization
+                .ensure_server_url(&server_id, &server_url)
+                .map_err(RequestError::from)?;
+            let record = authorization
+                .load(&server_id)
+                .map_err(RequestError::from)?
+                .filter(|record| {
+                    record.status == "authorized" && record.resource.as_deref() == Some(&resource)
+                })
+                .ok_or("OAuth authorization required")?;
+            let reference = record
+                .access_token_ref
+                .ok_or("OAuth authorization required")?;
             let token = store
                 .get(&reference)
                 .map_err(RequestError::from)?
@@ -208,7 +247,12 @@ impl HttpCredentialProvider for OAuthCredentialProvider {
     fn on_unauthorized(&self) -> BoxFuture<'static, Result<bool, RequestError>> {
         let authorization = self.authorization.clone();
         let server_id = self.server_id.clone();
+        let resource = self.resource.clone();
+        let server_url = self.server_url.clone();
         Box::pin(async move {
+            authorization
+                .validate_provider(&server_id, &resource, &server_url)
+                .await?;
             authorization.refresh(&server_id, true).await?;
             Ok(true)
         })
@@ -220,7 +264,13 @@ impl HttpCredentialProvider for OAuthCredentialProvider {
     ) -> BoxFuture<'static, Result<(), RequestError>> {
         let authorization = self.authorization.clone();
         let server_id = self.server_id.clone();
-        Box::pin(async move { authorization.require_step_up(&server_id, challenge).await })
+        let resource = self.resource.clone();
+        let server_url = self.server_url.clone();
+        Box::pin(async move {
+            authorization
+                .require_step_up(&server_id, &resource, &server_url, challenge)
+                .await
+        })
     }
 }
 
@@ -268,7 +318,15 @@ struct PendingAttempt {
     resource: String,
     scopes: Vec<String>,
     expires_at: chrono::DateTime<Utc>,
+    generation: u64,
     shutdown: oneshot::Sender<()>,
+}
+
+#[derive(Default)]
+pub(crate) struct AuthorizationLifecycle {
+    pub(crate) generation: u64,
+    pub(crate) deleting: bool,
+    disabled: bool,
 }
 
 pub struct ServerAuthorization {
@@ -277,6 +335,8 @@ pub struct ServerAuthorization {
     store: Arc<dyn CredentialStore>,
     client: reqwest::Client,
     attempts: Arc<Mutex<HashMap<String, PendingAttempt>>>,
+    discoveries: Arc<Mutex<HashMap<String, u64>>>,
+    lifecycles: Arc<Mutex<HashMap<String, Arc<Mutex<AuthorizationLifecycle>>>>>,
     refresh_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     refresh_completed: Arc<Mutex<HashMap<String, chrono::DateTime<Utc>>>>,
 }
@@ -297,14 +357,22 @@ impl ServerAuthorization {
             store,
             client: reqwest::Client::new(),
             attempts: Arc::new(Mutex::new(HashMap::new())),
+            discoveries: Arc::new(Mutex::new(HashMap::new())),
+            lifecycles: Arc::new(Mutex::new(HashMap::new())),
             refresh_locks: Arc::new(Mutex::new(HashMap::new())),
             refresh_completed: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub async fn revoke(&self, server_id: &str) -> Result<RevocationResult, String> {
+        let lifecycle = self.lifecycle(server_id).await;
+        let mut guard = lifecycle.lock().await;
+        if guard.deleting {
+            return Err("Server is being deleted".into());
+        }
         let record = self.load(server_id)?;
         let mut warning = None;
+        let mut requests = Vec::new();
         if let Some(record) = record {
             if let Some(endpoint) = record.revocation_endpoint {
                 let endpoint = match Url::parse(&endpoint) {
@@ -319,7 +387,7 @@ impl ServerAuthorization {
                         "Provider revocation failed; local credentials were removed.".to_string(),
                     );
                     return self
-                        .cleanup(server_id)
+                        .cleanup_locked(server_id, &mut guard)
                         .await
                         .map(|snapshot| RevocationResult { snapshot, warning });
                 };
@@ -364,30 +432,46 @@ impl ServerAuthorization {
                     if let Some(secret) = &client_secret {
                         form.insert("client_secret".to_string(), secret.clone());
                     }
-                    let revoked = self.client.post(endpoint.clone()).form(&form).send().await;
-                    if !matches!(revoked, Ok(ref response) if response.status().is_success()) {
-                        warning = Some(
-                            "Provider revocation failed; local credentials were removed."
-                                .to_string(),
-                        );
-                    }
+                    requests.push((endpoint.clone(), form));
                 }
             }
         }
-        let snapshot = self.cleanup(server_id).await?;
+        let snapshot = self.cleanup_locked(server_id, &mut guard).await?;
+        drop(guard);
+        let remote = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut failed = false;
+            for (endpoint, form) in requests {
+                let response = self.client.post(endpoint).form(&form).send().await;
+                if !matches!(response, Ok(ref response) if response.status().is_success()) {
+                    failed = true;
+                }
+            }
+            failed
+        })
+        .await;
+        if !matches!(remote, Ok(false)) {
+            warning =
+                Some("Provider revocation failed; local credentials were removed.".to_string());
+        }
         Ok(RevocationResult { snapshot, warning })
     }
 
-    pub async fn cleanup(&self, server_id: &str) -> Result<AuthorizationSnapshot, String> {
-        for reference in [
-            access_token_ref(server_id),
-            refresh_token_ref(server_id),
-            client_secret_ref(server_id),
-        ] {
-            if let Err(error) = self.store.delete(&reference) {
-                tracing::warn!(server_id, %error, "OAuth credential cleanup failed");
-            }
-        }
+    pub(crate) async fn lifecycle(&self, server_id: &str) -> Arc<Mutex<AuthorizationLifecycle>> {
+        self.lifecycles
+            .lock()
+            .await
+            .entry(server_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(AuthorizationLifecycle::default())))
+            .clone()
+    }
+
+    pub(crate) async fn cleanup_locked(
+        &self,
+        server_id: &str,
+        lifecycle: &mut AuthorizationLifecycle,
+    ) -> Result<AuthorizationSnapshot, String> {
+        lifecycle.generation = lifecycle.generation.wrapping_add(1);
+        lifecycle.disabled = true;
         let stale = {
             let mut attempts = self.attempts.lock().await;
             let states: Vec<String> = attempts
@@ -403,8 +487,35 @@ impl ServerAuthorization {
         for attempt in stale {
             let _ = attempt.shutdown.send(());
         }
-        self.refresh_locks.lock().await.remove(server_id);
+        self.discoveries.lock().await.remove(server_id);
         self.refresh_completed.lock().await.remove(server_id);
+        let Some(mut record) = self.load(server_id)? else {
+            return self.emit_snapshot(server_id).await;
+        };
+        record.status = "required".into();
+        record.set_error(None);
+        self.save(server_id, &record)?;
+        let mut failed = false;
+        for reference in [
+            &mut record.access_token_ref,
+            &mut record.refresh_token_ref,
+            &mut record.client_secret_ref,
+        ] {
+            if let Some(value) = reference.as_deref() {
+                if let Err(error) = self.store.delete(value) {
+                    tracing::warn!(server_id, %error, "OAuth credential cleanup failed");
+                    failed = true;
+                } else {
+                    *reference = None;
+                }
+            }
+        }
+        if failed {
+            record.set_error(Some("System credential store is unavailable".into()));
+            self.save(server_id, &record)?;
+            self.emit_snapshot(server_id).await?;
+            return Err("System credential store is unavailable".into());
+        }
         self.db.run(
             "DELETE FROM server_authorizations WHERE server_id = ?1",
             &[&server_id],
@@ -416,6 +527,8 @@ impl ServerAuthorization {
     async fn require_step_up(
         &self,
         server_id: &str,
+        resource: &str,
+        server_url: &str,
         challenge: Option<String>,
     ) -> Result<(), RequestError> {
         let required = challenge
@@ -435,10 +548,21 @@ impl ServerAuthorization {
         if required.is_empty() && !is_insufficient_scope {
             return Ok(());
         }
+        let lifecycle = self.lifecycle(server_id).await;
+        let mut guard = lifecycle.lock().await;
+        if guard.disabled || guard.deleting {
+            return Err("OAuth authorization required".into());
+        }
+        self.ensure_server_url(server_id, server_url)
+            .map_err(RequestError::from)?;
         let mut record = self
             .load(server_id)
             .map_err(RequestError::from)?
             .ok_or("OAuth authorization required")?;
+        if record.status != "authorized" || record.resource.as_deref() != Some(resource) {
+            return Err("OAuth authorization required".into());
+        }
+        guard.generation = guard.generation.wrapping_add(1);
         for scope in required {
             if !record.scopes.contains(&scope) {
                 record.scopes.push(scope);
@@ -469,12 +593,21 @@ impl ServerAuthorization {
         self.refresh(server_id, false).await
     }
 
-    async fn require_refresh(&self, server_id: &str, message: &str) -> RequestError {
-        if let Ok(Some(mut record)) = self.load(server_id) {
-            record.status = "required".into();
-            record.set_error(Some(message.to_string()));
-            let _ = self.save(server_id, &record);
-            let _ = self.emit_snapshot(server_id).await;
+    async fn require_refresh(
+        &self,
+        server_id: &str,
+        generation: u64,
+        message: &str,
+    ) -> RequestError {
+        let lifecycle = self.lifecycle(server_id).await;
+        let guard = lifecycle.lock().await;
+        if !guard.deleting && guard.generation == generation {
+            if let Ok(Some(mut record)) = self.load(server_id) {
+                record.status = "required".into();
+                record.set_error(Some(message.to_string()));
+                let _ = self.save(server_id, &record);
+                let _ = self.emit_snapshot(server_id).await;
+            }
         }
         RequestError::from(message)
     }
@@ -488,6 +621,23 @@ impl ServerAuthorization {
                 .clone()
         };
         let _guard = lock.lock().await;
+        let lifecycle = self.lifecycle(server_id).await;
+        let guard = lifecycle.lock().await;
+        let generation = guard.generation;
+        if guard.disabled {
+            return Err("OAuth authorization required".into());
+        }
+        let record = self
+            .load(server_id)
+            .map_err(RequestError::from)?
+            .filter(|record| record.status == "authorized")
+            .ok_or("OAuth authorization required")?;
+        let resource = record
+            .resource
+            .as_deref()
+            .ok_or("OAuth authorization required")?;
+        self.ensure_current(server_id, resource, &guard, generation)
+            .map_err(RequestError::from)?;
         if self
             .refresh_completed
             .lock()
@@ -497,10 +647,6 @@ impl ServerAuthorization {
         {
             return Ok(());
         }
-        let record = self
-            .load(server_id)
-            .map_err(RequestError::from)?
-            .ok_or("OAuth authorization required")?;
         if !force {
             let Some(expires_at) = record.expires_at.as_deref() else {
                 return Ok(());
@@ -511,16 +657,25 @@ impl ServerAuthorization {
                 return Ok(());
             }
         }
-        let Some(refresh_ref) = record.refresh_token_ref.clone() else {
+        let refresh_ref = record.refresh_token_ref.clone();
+        let refresh_token = refresh_ref
+            .as_ref()
+            .and_then(|reference| self.store.get(reference).ok().flatten());
+        let client_secret = match &record.client_secret_ref {
+            Some(reference) => self.store.get(reference).map_err(RequestError::from)?,
+            None => None,
+        };
+        drop(guard);
+        let Some(refresh_ref) = refresh_ref else {
             return Err(self
-                .require_refresh(server_id, "OAuth refresh token is unavailable")
+                .require_refresh(server_id, generation, "OAuth refresh token is unavailable")
                 .await);
         };
-        let refresh_token = match self.store.get(&refresh_ref) {
-            Ok(Some(token)) => token,
-            _ => {
+        let refresh_token = match refresh_token {
+            Some(token) => token,
+            None => {
                 return Err(self
-                    .require_refresh(server_id, "OAuth refresh token is unavailable")
+                    .require_refresh(server_id, generation, "OAuth refresh token is unavailable")
                     .await);
             }
         };
@@ -528,18 +683,19 @@ impl ServerAuthorization {
             return Err(self
                 .require_refresh(
                     server_id,
+                    generation,
                     "OAuth token endpoint is unavailable; reauthorize the Server",
                 )
                 .await);
         };
         let Some(client_id) = record.client_id.clone() else {
             return Err(self
-                .require_refresh(server_id, "OAuth client registration is unavailable")
+                .require_refresh(
+                    server_id,
+                    generation,
+                    "OAuth client registration is unavailable",
+                )
                 .await);
-        };
-        let client_secret = match &record.client_secret_ref {
-            Some(reference) => self.store.get(reference).map_err(RequestError::from)?,
-            None => None,
         };
         let mut form = HashMap::from([
             ("grant_type".to_string(), "refresh_token".to_string()),
@@ -564,6 +720,7 @@ impl ServerAuthorization {
             return Err(self
                 .require_refresh(
                     server_id,
+                    generation,
                     "OAuth refresh was rejected; reauthorize the Server",
                 )
                 .await);
@@ -575,6 +732,14 @@ impl ServerAuthorization {
         if token.access_token.is_empty() {
             return Err(RequestError::from("Invalid OAuth refresh response"));
         }
+        let guard = lifecycle.lock().await;
+        self.ensure_current(
+            server_id,
+            record.resource.as_deref().unwrap_or_default(),
+            &guard,
+            generation,
+        )
+        .map_err(RequestError::from)?;
         let access_ref = access_token_ref(server_id);
         self.store
             .set(&access_ref, &token.access_token)
@@ -597,35 +762,78 @@ impl ServerAuthorization {
             .lock()
             .await
             .insert(server_id.to_string(), Utc::now());
-        drop(_guard);
         self.emit_snapshot(server_id)
             .await
             .map_err(RequestError::from)?;
+        drop(guard);
+        drop(_guard);
         Ok(())
     }
 
-    pub fn credential_provider(
+    async fn validate_provider(
         &self,
         server_id: &str,
+        resource: &str,
+        server_url: &str,
+    ) -> Result<(), RequestError> {
+        let lifecycle = self.lifecycle(server_id).await;
+        let guard = lifecycle.lock().await;
+        if guard.disabled || guard.deleting {
+            return Err("OAuth authorization required".into());
+        }
+        self.ensure_server_url(server_id, server_url)
+            .map_err(RequestError::from)?;
+        let record = self
+            .load(server_id)
+            .map_err(RequestError::from)?
+            .ok_or("OAuth authorization required")?;
+        if record.status != "authorized" || record.resource.as_deref() != Some(resource) {
+            return Err("OAuth authorization required".into());
+        }
+        Ok(())
+    }
+
+    pub async fn credential_provider(
+        &self,
+        server_id: &str,
+        server_url: &str,
     ) -> Result<Option<Arc<dyn HttpCredentialProvider>>, String> {
+        let lifecycle = self.lifecycle(server_id).await;
+        let guard = lifecycle.lock().await;
+        if guard.deleting {
+            return Err("Server is being deleted".into());
+        }
         let Some(record) = self.load(server_id)? else {
             return Ok(None);
         };
         if record.status != "authorized" {
             return Ok(None);
         }
-        let access_token_ref = record
-            .access_token_ref
-            .ok_or("OAuth authorization requires a new grant")?;
+        if guard.disabled {
+            return Err("OAuth authorization requires a new grant".into());
+        }
+        let resource =
+            canonical_resource(&Url::parse(server_url).map_err(|_| "Invalid MCP Server URL")?)?;
+        self.ensure_server_url(server_id, server_url)?;
+        if record.resource.as_deref() != Some(&resource) || record.access_token_ref.is_none() {
+            return Err("OAuth authorization requires a new grant".into());
+        }
         Ok(Some(Arc::new(OAuthCredentialProvider {
             store: self.store.clone(),
-            access_token_ref,
             authorization: self.shared(),
             server_id: server_id.to_string(),
+            resource,
+            server_url: server_url.to_string(),
         })))
     }
 
     pub async fn snapshot(&self, server_id: &str) -> Result<AuthorizationSnapshot, String> {
+        let lifecycle = self.lifecycle(server_id).await;
+        let _guard = lifecycle.lock().await;
+        self.snapshot_locked(server_id).await
+    }
+
+    async fn snapshot_locked(&self, server_id: &str) -> Result<AuthorizationSnapshot, String> {
         let expired = {
             let mut attempts = self.attempts.lock().await;
             let expired: Vec<String> = attempts
@@ -656,13 +864,11 @@ impl ServerAuthorization {
         }
         let attempts = self.attempts.lock().await;
         let record = self.load(server_id)?;
-        let snapshot = self.snapshot_with_attempt(
-            server_id,
-            record,
-            attempts
-                .values()
-                .any(|attempt| attempt.server_id == server_id),
-        );
+        let authorizing = attempts
+            .values()
+            .any(|attempt| attempt.server_id == server_id)
+            || self.discoveries.lock().await.contains_key(server_id);
+        let snapshot = self.snapshot_with_attempt(server_id, record, authorizing);
         if has_expired {
             self.event_bus.emit(Evt::ServerAuthorization {
                 snapshot: snapshot.clone(),
@@ -677,6 +883,13 @@ impl ServerAuthorization {
         record: Option<AuthorizationRecord>,
         authorizing: bool,
     ) -> AuthorizationSnapshot {
+        let can_revoke = authorizing
+            || record.as_ref().is_some_and(|record| {
+                record.client_id.is_some()
+                    || record.access_token_ref.is_some()
+                    || record.refresh_token_ref.is_some()
+                    || record.client_secret_ref.is_some()
+            });
         let state = if authorizing {
             "authorizing".to_string()
         } else if record
@@ -699,6 +912,7 @@ impl ServerAuthorization {
         AuthorizationSnapshot {
             server_id: server_id.to_string(),
             state,
+            can_revoke,
             error_code: record.error_code,
             error_message: record.error_message,
             issuer: record.issuer,
@@ -726,16 +940,24 @@ impl ServerAuthorization {
         if client_id.trim().is_empty() {
             return Err("Client ID is required".into());
         }
-        let mut previous_secret = None;
+        let lifecycle = self.lifecycle(server_id).await;
+        let mut guard = lifecycle.lock().await;
+        if guard.deleting {
+            return Err("Server is being deleted".into());
+        }
         if let Some(previous) = self.load(server_id)? {
-            previous_secret = match &previous.client_secret_ref {
+            let previous_secret = match &previous.client_secret_ref {
                 Some(reference) => self.store.get(reference)?,
                 None => None,
             };
             let client_changed = previous.client_id.as_deref() != Some(client_id.trim());
-            let secret_changed = client_secret.is_some_and(|secret| !secret.is_empty());
+            let secret_changed = client_secret
+                .filter(|secret| !secret.is_empty())
+                .is_some_and(|secret| previous_secret.as_deref() != Some(secret));
             if client_changed || secret_changed {
-                self.cleanup(server_id).await?;
+                self.cleanup_locked(server_id, &mut guard).await?;
+            } else {
+                return self.emit_snapshot(server_id).await;
             }
         }
         let mut record = self
@@ -744,10 +966,7 @@ impl ServerAuthorization {
         record.status = "required".into();
         record.set_error(None);
         record.client_id = Some(client_id.trim().to_string());
-        if let Some(secret) = client_secret
-            .filter(|secret| !secret.is_empty())
-            .or(previous_secret.as_deref())
-        {
+        if let Some(secret) = client_secret.filter(|secret| !secret.is_empty()) {
             self.persist_client_secret(&mut record, server_id, secret)?;
         }
         self.save(server_id, &record)?;
@@ -759,6 +978,26 @@ impl ServerAuthorization {
         server_id: &str,
         requested_client_id: Option<&str>,
     ) -> Result<Value, String> {
+        let lifecycle = self.lifecycle(server_id).await;
+        let mut guard = lifecycle.lock().await;
+        if guard.deleting {
+            return Err("Server is being deleted".into());
+        }
+        guard.generation = guard.generation.wrapping_add(1);
+        let mut generation = guard.generation;
+        {
+            let mut attempts = self.attempts.lock().await;
+            let states: Vec<_> = attempts
+                .iter()
+                .filter(|(_, attempt)| attempt.server_id == server_id)
+                .map(|(state, _)| state.clone())
+                .collect();
+            for state in states {
+                if let Some(attempt) = attempts.remove(&state) {
+                    let _ = attempt.shutdown.send(());
+                }
+            }
+        }
         let record = self
             .load(server_id)?
             .unwrap_or_else(AuthorizationRecord::required);
@@ -777,6 +1016,12 @@ impl ServerAuthorization {
             .find_by_id(server_id)?
             .ok_or("Server not found")?;
         let server_url = server.url.ok_or("OAuth requires an HTTP Server URL")?;
+        self.discoveries
+            .lock()
+            .await
+            .insert(server_id.to_string(), generation);
+        self.emit_snapshot(server_id).await?;
+        drop(guard);
         match self
             .start_inner(
                 server_id,
@@ -786,11 +1031,17 @@ impl ServerAuthorization {
                 record.scopes.clone(),
                 record.issuer.clone(),
                 record.resource.clone(),
+                &mut generation,
             )
             .await
         {
             Ok(result) => Ok(result),
             Err(error) => {
+                let guard = lifecycle.lock().await;
+                if guard.deleting || guard.generation != generation {
+                    return Err(error);
+                }
+                self.discoveries.lock().await.remove(server_id);
                 let stale = {
                     let mut attempts = self.attempts.lock().await;
                     let stale = attempts.iter().find_map(|(state, attempt)| {
@@ -817,6 +1068,7 @@ impl ServerAuthorization {
         previous_scopes: Vec<String>,
         previous_issuer: Option<String>,
         previous_resource: Option<String>,
+        generation: &mut u64,
     ) -> Result<Value, String> {
         let mut discovery = self.discover(server_url).await?;
         for scope in previous_scopes {
@@ -838,12 +1090,21 @@ impl ServerAuthorization {
             || previous_resource
                 .as_ref()
                 .is_some_and(|resource| *resource != discovery.resource);
+        let lifecycle = self.lifecycle(server_id).await;
+        let mut guard = lifecycle.lock().await;
+        self.ensure_current(server_id, &discovery.resource, &guard, *generation)?;
         let (client_id, client_secret) = if context_changed {
-            self.cleanup(server_id).await?;
+            self.cleanup_locked(server_id, &mut guard).await?;
+            *generation = guard.generation;
+            self.discoveries
+                .lock()
+                .await
+                .insert(server_id.to_string(), *generation);
             (None, None)
         } else {
             (client_id, client_secret)
         };
+        drop(guard);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|error| format!("Failed to bind OAuth callback: {error}"))?;
@@ -856,6 +1117,8 @@ impl ServerAuthorization {
                 client_id,
                 client_secret,
                 &redirect_uri,
+                &discovery.resource,
+                generation,
             )
             .await?;
         let state = random_url_safe(32)?;
@@ -864,6 +1127,8 @@ impl ServerAuthorization {
         let expires_at = Utc::now() + ChronoDuration::seconds(ATTEMPT_TTL_SECONDS);
         let (shutdown, stopped) = oneshot::channel();
         {
+            let guard = lifecycle.lock().await;
+            self.ensure_current(server_id, &discovery.resource, &guard, *generation)?;
             let mut attempts = self.attempts.lock().await;
             let previous = attempts.iter().find_map(|(state, attempt)| {
                 (attempt.server_id == server_id).then_some(state.clone())
@@ -888,11 +1153,14 @@ impl ServerAuthorization {
                     resource: discovery.resource.clone(),
                     scopes: discovery.scopes.clone(),
                     expires_at,
+                    generation: *generation,
                     shutdown,
                 },
             );
+            drop(attempts);
+            self.discoveries.lock().await.remove(server_id);
+            self.emit_snapshot(server_id).await?;
         }
-        self.emit_snapshot(server_id).await?;
         let authorization = self.shared();
         tokio::spawn(async move {
             let app = Router::new()
@@ -933,6 +1201,8 @@ impl ServerAuthorization {
         client_id: Option<String>,
         client_secret: Option<String>,
         redirect_uri: &str,
+        resource: &str,
+        generation: &mut u64,
     ) -> Result<(String, Option<String>), String> {
         if let Some(client_id) = client_id {
             return Ok((client_id, client_secret));
@@ -966,11 +1236,19 @@ impl ServerAuthorization {
         if registration.client_id.trim().is_empty() {
             return Err("Dynamic client registration returned no client ID".into());
         }
+        let lifecycle = self.lifecycle(server_id).await;
+        let mut guard = lifecycle.lock().await;
+        self.ensure_current(server_id, resource, &guard, *generation)?;
         let mut record = self
             .load(server_id)?
             .unwrap_or_else(AuthorizationRecord::required);
         if record.client_id.is_some() || record.client_secret_ref.is_some() {
-            self.cleanup(server_id).await?;
+            self.cleanup_locked(server_id, &mut guard).await?;
+            *generation = guard.generation;
+            self.discoveries
+                .lock()
+                .await
+                .insert(server_id.to_string(), *generation);
             record = self
                 .load(server_id)?
                 .unwrap_or_else(AuthorizationRecord::required);
@@ -1084,9 +1362,63 @@ impl ServerAuthorization {
             store: self.store.clone(),
             client: self.client.clone(),
             attempts: self.attempts.clone(),
+            discoveries: self.discoveries.clone(),
+            lifecycles: self.lifecycles.clone(),
             refresh_locks: self.refresh_locks.clone(),
             refresh_completed: self.refresh_completed.clone(),
         })
+    }
+
+    fn ensure_current(
+        &self,
+        server_id: &str,
+        resource: &str,
+        lifecycle: &AuthorizationLifecycle,
+        generation: u64,
+    ) -> Result<(), String> {
+        if lifecycle.deleting || lifecycle.generation != generation {
+            return Err("OAuth authorization was superseded".into());
+        }
+        let server = ServerRepository::new(&self.db)
+            .find_by_id(server_id)?
+            .ok_or("Server not found")?;
+        let current = server
+            .url
+            .as_deref()
+            .and_then(|url| Url::parse(url).ok())
+            .and_then(|url| canonical_resource(&url).ok());
+        if current.as_deref() != Some(resource) {
+            return Err("OAuth resource changed".into());
+        }
+        Ok(())
+    }
+
+    fn ensure_server_url(&self, server_id: &str, server_url: &str) -> Result<(), String> {
+        let server = ServerRepository::new(&self.db)
+            .find_by_id(server_id)?
+            .ok_or("Server not found")?;
+        if server.url.as_deref() != Some(server_url) {
+            return Err("OAuth resource changed".into());
+        }
+        Ok(())
+    }
+
+    async fn set_attempt_error(&self, attempt: &PendingAttempt, message: String) {
+        let lifecycle = self.lifecycle(&attempt.server_id).await;
+        let guard = lifecycle.lock().await;
+        if self
+            .ensure_current(
+                &attempt.server_id,
+                &attempt.resource,
+                &guard,
+                attempt.generation,
+            )
+            .is_ok()
+        {
+            let _ = self
+                .set_status(&attempt.server_id, "error", Some(message))
+                .await;
+        }
     }
 
     async fn set_status(
@@ -1107,7 +1439,7 @@ impl ServerAuthorization {
     }
 
     async fn emit_snapshot(&self, server_id: &str) -> Result<AuthorizationSnapshot, String> {
-        let snapshot = self.snapshot(server_id).await?;
+        let snapshot = self.snapshot_locked(server_id).await?;
         self.event_bus.emit(Evt::ServerAuthorization {
             snapshot: snapshot.clone(),
         });
@@ -1183,13 +1515,28 @@ async fn oauth_callback(
     let Some(attempt) = authorization.attempts.lock().await.remove(&state) else {
         return (StatusCode::BAD_REQUEST, "Invalid or expired OAuth callback").into_response();
     };
+    {
+        let lifecycle = authorization.lifecycle(&attempt.server_id).await;
+        let guard = lifecycle.lock().await;
+        if authorization
+            .ensure_current(
+                &attempt.server_id,
+                &attempt.resource,
+                &guard,
+                attempt.generation,
+            )
+            .is_err()
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                "OAuth authorization was superseded",
+            )
+                .into_response();
+        }
+    }
     if Utc::now() > attempt.expires_at {
         let _ = authorization
-            .set_status(
-                &attempt.server_id,
-                "error",
-                Some("OAuth attempt expired".into()),
-            )
+            .set_attempt_error(&attempt, "OAuth attempt expired".into())
             .await;
         return (StatusCode::BAD_REQUEST, "OAuth attempt expired").into_response();
     }
@@ -1197,21 +1544,13 @@ async fn oauth_callback(
         && (attempt.issuer_parameter_required || query.iss.is_some())
     {
         let _ = authorization
-            .set_status(
-                &attempt.server_id,
-                "error",
-                Some("OAuth issuer mismatch".into()),
-            )
+            .set_attempt_error(&attempt, "OAuth issuer mismatch".into())
             .await;
         return (StatusCode::BAD_REQUEST, "OAuth issuer mismatch").into_response();
     }
     if query.error.is_some() {
         let _ = authorization
-            .set_status(
-                &attempt.server_id,
-                "error",
-                Some("Authorization was denied".into()),
-            )
+            .set_attempt_error(&attempt, "Authorization was denied".into())
             .await;
         return (StatusCode::BAD_REQUEST, "Authorization was denied").into_response();
     }
@@ -1240,21 +1579,13 @@ async fn oauth_callback(
         Ok(response) => {
             let status = response.status();
             let _ = authorization
-                .set_status(
-                    &attempt.server_id,
-                    "error",
-                    Some(format!("Token exchange failed: {status}")),
-                )
+                .set_attempt_error(&attempt, format!("Token exchange failed: {status}"))
                 .await;
             return (StatusCode::BAD_REQUEST, "Token exchange failed").into_response();
         }
         Err(_) => {
             let _ = authorization
-                .set_status(
-                    &attempt.server_id,
-                    "error",
-                    Some("Token endpoint is unavailable".into()),
-                )
+                .set_attempt_error(&attempt, "Token endpoint is unavailable".into())
                 .await;
             return (StatusCode::BAD_REQUEST, "Token endpoint is unavailable").into_response();
         }
@@ -1263,30 +1594,27 @@ async fn oauth_callback(
         Ok(token) if !token.access_token.is_empty() => token,
         _ => {
             let _ = authorization
-                .set_status(
-                    &attempt.server_id,
-                    "error",
-                    Some("Invalid token response".into()),
-                )
+                .set_attempt_error(&attempt, "Invalid token response".into())
                 .await;
             return (StatusCode::BAD_REQUEST, "Invalid token response").into_response();
         }
     };
-    let access_ref = access_token_ref(&attempt.server_id);
-    let refresh_ref = refresh_token_ref(&attempt.server_id);
-    if let Err(error) = authorization.store.set(&access_ref, &token.access_token) {
-        let _ = authorization
-            .set_status(&attempt.server_id, "error", Some(error.clone()))
-            .await;
-        return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
-    }
-    if let Some(refresh) = &token.refresh_token {
-        if let Err(error) = authorization.store.set(&refresh_ref, refresh) {
-            let _ = authorization
-                .set_status(&attempt.server_id, "error", Some(error.clone()))
-                .await;
-            return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
-        }
+    let lifecycle = authorization.lifecycle(&attempt.server_id).await;
+    let mut guard = lifecycle.lock().await;
+    if authorization
+        .ensure_current(
+            &attempt.server_id,
+            &attempt.resource,
+            &guard,
+            attempt.generation,
+        )
+        .is_err()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "OAuth authorization was superseded",
+        )
+            .into_response();
     }
     let mut record = match authorization.load(&attempt.server_id) {
         Ok(Some(record)) => record,
@@ -1295,9 +1623,39 @@ async fn oauth_callback(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Authorization record not found",
             )
-                .into_response();
+                .into_response()
         }
     };
+    let access_ref = access_token_ref(&attempt.server_id);
+    let refresh_ref = refresh_token_ref(&attempt.server_id);
+    let previous_refresh = if token.refresh_token.is_none() {
+        record.refresh_token_ref.clone()
+    } else {
+        record.refresh_token_ref = Some(refresh_ref.clone());
+        None
+    };
+    record.access_token_ref = Some(access_ref.clone());
+    if let Err(error) = authorization.save(&attempt.server_id, &record) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+    let write_result = (|| -> Result<(), String> {
+        if let Some(reference) = previous_refresh.as_deref() {
+            authorization.store.delete(reference)?;
+        }
+        authorization.store.set(&access_ref, &token.access_token)?;
+        if let Some(refresh) = &token.refresh_token {
+            authorization.store.set(&refresh_ref, refresh)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        guard.disabled = true;
+        record.status = "required".into();
+        record.set_error(Some(error.clone()));
+        let _ = authorization.save(&attempt.server_id, &record);
+        let _ = authorization.emit_snapshot(&attempt.server_id).await;
+        return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
     record.status = "authorized".into();
     record.issuer = Some(attempt.expected_issuer);
     record.resource = Some(attempt.resource);
@@ -1316,6 +1674,7 @@ async fn oauth_callback(
     if let Err(error) = authorization.save(&attempt.server_id, &record) {
         return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
     }
+    guard.disabled = false;
     let _ = authorization.emit_snapshot(&attempt.server_id).await;
     (
         StatusCode::OK,

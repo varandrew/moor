@@ -8,6 +8,7 @@ export type AuthorizationState =
 export interface ServerAuthorization {
   serverId: string;
   state: AuthorizationState;
+  canRevoke?: boolean;
   errorCode?: string | null;
   errorMessage?: string | null;
   issuer?: string | null;

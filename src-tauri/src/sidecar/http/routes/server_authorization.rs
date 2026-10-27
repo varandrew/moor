@@ -46,7 +46,7 @@ async fn revoke(
         .revoke(&id)
         .await
         .map(Json)
-        .map_err(AppError::internal)
+        .map_err(AppError::credential_cleanup)
 }
 
 #[derive(Deserialize)]

@@ -2,6 +2,9 @@ pub mod app_error;
 mod auth;
 pub mod routes;
 
+#[cfg(test)]
+mod oauth_regression_tests;
+
 use crate::sidecar::db::Database;
 use crate::sidecar::mcp::transport::mcp_session::McpSessionStore;
 use crate::sidecar::services::event_bus::EventBus;
@@ -347,6 +350,22 @@ mod tests {
         let (revocations, mut revocation_forms) = mpsc::unbounded_channel();
         let revoke_offline = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let revocation_offline = revoke_offline.clone();
+        let revoke_hang = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let revocation_hang = revoke_hang.clone();
+        let revoke_waiting = Arc::new(tokio::sync::Notify::new());
+        let revocation_waiting = revoke_waiting.clone();
+        let token_waiting = Arc::new(tokio::sync::Notify::new());
+        let token_continue = Arc::new(tokio::sync::Notify::new());
+        let hold_refresh = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hold_discovery = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let discovery_waiting = Arc::new(tokio::sync::Notify::new());
+        let discovery_continue = Arc::new(tokio::sync::Notify::new());
+        let upstream_hold_discovery = hold_discovery.clone();
+        let upstream_discovery_waiting = discovery_waiting.clone();
+        let upstream_discovery_continue = discovery_continue.clone();
+        let handler_waiting = token_waiting.clone();
+        let handler_continue = token_continue.clone();
+        let handler_hold_refresh = hold_refresh.clone();
         let authorization_server = Router::new()
             .route(
                 "/.well-known/oauth-authorization-server",
@@ -382,8 +401,14 @@ mod tests {
                     move |axum::Form(form): axum::Form<HashMap<String, String>>| {
                         let revocations = revocations.clone();
                         let offline = revocation_offline.clone();
+                        let hang = revocation_hang.clone();
+                        let waiting = revocation_waiting.clone();
                         async move {
                             revocations.send(form).unwrap();
+                            if hang.load(std::sync::atomic::Ordering::SeqCst) {
+                                waiting.notify_one();
+                                std::future::pending::<()>().await;
+                            }
                             if offline.load(std::sync::atomic::Ordering::SeqCst) {
                                 StatusCode::SERVICE_UNAVAILABLE.into_response()
                             } else {
@@ -398,8 +423,18 @@ mod tests {
                 post(
                     move |axum::Form(form): axum::Form<HashMap<String, String>>| {
                         let token_requests = token_requests.clone();
+                        let waiting = handler_waiting.clone();
+                        let resume = handler_continue.clone();
+                        let hold_refresh = handler_hold_refresh.clone();
                         async move {
                             token_requests.send(form.clone()).unwrap();
+                            if form.get("code").map(String::as_str) == Some("hold-code")
+                                || (form["grant_type"] == "refresh_token"
+                                    && hold_refresh.load(std::sync::atomic::Ordering::SeqCst))
+                            {
+                                waiting.notify_one();
+                                resume.notified().await;
+                            }
                             if form.get("refresh_token").map(String::as_str)
                                 == Some("rotated-refresh-token")
                             {
@@ -461,6 +496,9 @@ mod tests {
                 "/mcp",
                 post(move |headers: HeaderMap, Json(body): Json<Value>| {
                     let upstream_requests = upstream_requests.clone();
+                    let hold_discovery = upstream_hold_discovery.clone();
+                    let discovery_waiting = upstream_discovery_waiting.clone();
+                    let discovery_continue = upstream_discovery_continue.clone();
                     async move {
                         let authorization = headers
                             .get("authorization")
@@ -491,6 +529,10 @@ mod tests {
                             return StatusCode::UNAUTHORIZED.into_response();
                         }
                         if authorization.is_empty() {
+                            if hold_discovery.load(std::sync::atomic::Ordering::SeqCst) {
+                                discovery_waiting.notify_one();
+                                discovery_continue.notified().await;
+                            }
                             let host = headers.get("host").unwrap().to_str().unwrap();
                             let challenge = format!(
                                 "Bearer resource_metadata=\"http://{host}/custom-resource-metadata\", scope=\"mcp.read\""
@@ -613,6 +655,19 @@ mod tests {
         assert_eq!(authorization["state"], "authorized");
         assert!(!authorization.to_string().contains("oauth-access-token"));
         assert!(!authorization.to_string().contains("client-secret"));
+        let unchanged_client = client
+            .put(format!(
+                "{gateway}/api/servers/{server_id}/authorization/client"
+            ))
+            .header("x-moor-token", "test-token")
+            .json(&json!({ "clientId": "moor-test-client", "clientSecret": "client-secret" }))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(unchanged_client["state"], "authorized");
         let event = loop {
             let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
                 .await
@@ -1102,6 +1157,22 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("mcp.write")));
+        let unchanged_step_up = client
+            .put(format!(
+                "{gateway}/api/servers/{dynamic_id}/authorization/client"
+            ))
+            .header("x-moor-token", "test-token")
+            .json(&json!({ "clientId": "dynamic-client-id", "clientSecret": "dynamic-client-secret" }))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert!(unchanged_step_up["scopes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("mcp.write")));
         let step_up_start = client
             .post(format!(
                 "{gateway}/api/servers/{dynamic_id}/authorization/start"
@@ -1271,6 +1342,35 @@ mod tests {
                 }),
             );
         let (new_addr, new_server) = spawn_router(new_resource).await;
+        let pending = client
+            .post(format!(
+                "{gateway}/api/servers/{server_id}/authorization/start"
+            ))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let pending_url =
+            reqwest::Url::parse(pending["authorizationUrl"].as_str().unwrap()).unwrap();
+        let pending_query: HashMap<String, String> =
+            pending_url.query_pairs().into_owned().collect();
+        let mut pending_callback = reqwest::Url::parse(&pending_query["redirect_uri"]).unwrap();
+        pending_callback
+            .query_pairs_mut()
+            .append_pair("code", "hold-code")
+            .append_pair("state", &pending_query["state"])
+            .append_pair("iss", &issuer);
+        let callback_client = client.clone();
+        let pending_callback =
+            tokio::spawn(
+                async move { callback_client.get(pending_callback).send().await.unwrap() },
+            );
+        tokio::time::timeout(Duration::from_secs(2), token_waiting.notified())
+            .await
+            .unwrap();
         let changed = client
             .put(format!("{gateway}/api/servers/{server_id}"))
             .header("x-moor-token", "test-token")
@@ -1279,6 +1379,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(changed.status(), StatusCode::OK);
+        token_continue.notify_one();
+        assert_eq!(
+            pending_callback.await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
         let invalidated = client
             .get(format!("{gateway}/api/servers/{server_id}/authorization"))
             .header("x-moor-token", "test-token")
@@ -1355,8 +1460,245 @@ mod tests {
         .contains(&value.as_str())));
         assert!(current_credentials
             .iter()
-            .any(|(_, value)| value == "dynamic-client-secret"));
+            .all(|(_, value)| value != "dynamic-client-secret"));
 
+        let refresh_start = client
+            .post(format!(
+                "{gateway}/api/servers/{dynamic_id}/authorization/start"
+            ))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let refresh_url =
+            reqwest::Url::parse(refresh_start["authorizationUrl"].as_str().unwrap()).unwrap();
+        let refresh_query: HashMap<String, String> =
+            refresh_url.query_pairs().into_owned().collect();
+        let mut refresh_callback = reqwest::Url::parse(&refresh_query["redirect_uri"]).unwrap();
+        refresh_callback
+            .query_pairs_mut()
+            .append_pair("code", "refresh-race")
+            .append_pair("state", &refresh_query["state"])
+            .append_pair("iss", &issuer);
+        assert_eq!(
+            client.get(refresh_callback).send().await.unwrap().status(),
+            StatusCode::OK
+        );
+        let failed_reference = format!("server:{dynamic_id}:oauth:refresh");
+        credentials.fail_delete_for_test(Some(failed_reference.clone()));
+        let partial = client
+            .delete(format!("{gateway}/api/servers/{dynamic_id}/authorization"))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap();
+        assert!(!partial.status().is_success());
+        let partial_state = client
+            .get(format!("{gateway}/api/servers/{dynamic_id}/authorization"))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(partial_state["state"], "required");
+        assert_eq!(partial_state["canRevoke"], true);
+        let remaining_credentials = credentials.values_for_test();
+        assert!(remaining_credentials
+            .iter()
+            .any(|(reference, _)| reference == &failed_reference));
+        assert!(!remaining_credentials
+            .iter()
+            .any(|(reference, _)| reference == &format!("server:{dynamic_id}:oauth:access")));
+        let disabled = client
+            .post(format!("{gateway}/api/servers/{dynamic_id}/tools/refresh"))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap();
+        assert!(!disabled.status().is_success());
+        credentials.fail_delete_for_test(None);
+        let retry = client
+            .delete(format!("{gateway}/api/servers/{dynamic_id}/authorization"))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        let refresh_start = client
+            .post(format!(
+                "{gateway}/api/servers/{dynamic_id}/authorization/start"
+            ))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let refresh_url =
+            reqwest::Url::parse(refresh_start["authorizationUrl"].as_str().unwrap()).unwrap();
+        let refresh_query: HashMap<String, String> =
+            refresh_url.query_pairs().into_owned().collect();
+        let mut refresh_callback = reqwest::Url::parse(&refresh_query["redirect_uri"]).unwrap();
+        refresh_callback
+            .query_pairs_mut()
+            .append_pair("code", "refresh-race")
+            .append_pair("state", &refresh_query["state"])
+            .append_pair("iss", &issuer);
+        assert_eq!(
+            client.get(refresh_callback).send().await.unwrap().status(),
+            StatusCode::OK
+        );
+        hold_refresh.store(true, std::sync::atomic::Ordering::SeqCst);
+        reject_oauth.store(true, std::sync::atomic::Ordering::SeqCst);
+        let refresh_client = client.clone();
+        let refresh_endpoint = format!("{gateway}/api/servers/{dynamic_id}/tools/refresh");
+        let running_refresh = tokio::spawn(async move {
+            refresh_client
+                .post(refresh_endpoint)
+                .header("x-moor-token", "test-token")
+                .send()
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(2), token_waiting.notified())
+            .await
+            .unwrap();
+        let revoked_during_refresh = client
+            .delete(format!("{gateway}/api/servers/{dynamic_id}/authorization"))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(revoked_during_refresh.status(), StatusCode::OK);
+        token_continue.notify_one();
+        assert!(!running_refresh.await.unwrap().status().is_success());
+        let after_refresh = client
+            .get(format!("{gateway}/api/servers/{dynamic_id}/authorization"))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(after_refresh["state"], "required");
+        assert!(credentials
+            .values_for_test()
+            .iter()
+            .all(|(reference, _)| !reference.starts_with(&format!("server:{dynamic_id}:"))));
+        hold_refresh.store(false, std::sync::atomic::Ordering::SeqCst);
+        reject_oauth.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let timeout_start = client
+            .post(format!(
+                "{gateway}/api/servers/{dynamic_id}/authorization/start"
+            ))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let timeout_url =
+            reqwest::Url::parse(timeout_start["authorizationUrl"].as_str().unwrap()).unwrap();
+        let timeout_query: HashMap<String, String> =
+            timeout_url.query_pairs().into_owned().collect();
+        let mut timeout_callback = reqwest::Url::parse(&timeout_query["redirect_uri"]).unwrap();
+        timeout_callback
+            .query_pairs_mut()
+            .append_pair("code", "timeout-seed")
+            .append_pair("state", &timeout_query["state"])
+            .append_pair("iss", &issuer);
+        assert_eq!(
+            client.get(timeout_callback).send().await.unwrap().status(),
+            StatusCode::OK
+        );
+        revoke_hang.store(true, std::sync::atomic::Ordering::SeqCst);
+        let revoke_client = client.clone();
+        let revoke_endpoint = format!("{gateway}/api/servers/{dynamic_id}/authorization");
+        let hanging_revoke = tokio::spawn(async move {
+            revoke_client
+                .delete(revoke_endpoint)
+                .header("x-moor-token", "test-token")
+                .send()
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(2), revoke_waiting.notified())
+            .await
+            .unwrap();
+        let local_state = client
+            .get(format!("{gateway}/api/servers/{dynamic_id}/authorization"))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(local_state["state"], "required");
+        assert!(!local_state["canRevoke"].as_bool().unwrap());
+        assert!(credentials
+            .values_for_test()
+            .iter()
+            .all(|(reference, _)| !reference.starts_with(&format!("server:{dynamic_id}:"))));
+        let timed_out = tokio::time::timeout(Duration::from_secs(6), hanging_revoke)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(timed_out.status(), StatusCode::OK);
+        assert_eq!(
+            timed_out.json::<Value>().await.unwrap()["warning"],
+            "Provider revocation failed; local credentials were removed."
+        );
+        revoke_hang.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let deletion_start = client
+            .post(format!(
+                "{gateway}/api/servers/{dynamic_id}/authorization/start"
+            ))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let deletion_url =
+            reqwest::Url::parse(deletion_start["authorizationUrl"].as_str().unwrap()).unwrap();
+        let deletion_query: HashMap<String, String> =
+            deletion_url.query_pairs().into_owned().collect();
+        let mut deletion_callback = reqwest::Url::parse(&deletion_query["redirect_uri"]).unwrap();
+        deletion_callback
+            .query_pairs_mut()
+            .append_pair("code", "hold-code")
+            .append_pair("state", &deletion_query["state"])
+            .append_pair("iss", &issuer);
+        let deletion_client = client.clone();
+        let deletion_callback =
+            tokio::spawn(
+                async move { deletion_client.get(deletion_callback).send().await.unwrap() },
+            );
+        tokio::time::timeout(Duration::from_secs(2), token_waiting.notified())
+            .await
+            .unwrap();
+        let in_flight = client
+            .get(format!("{gateway}/api/servers/{dynamic_id}/authorization"))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(in_flight["canRevoke"], true);
         let deleted = client
             .delete(format!("{gateway}/api/servers/{dynamic_id}"))
             .header("x-moor-token", "test-token")
@@ -1364,6 +1706,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(deleted.status(), StatusCode::OK);
+        token_continue.notify_one();
+        assert_eq!(
+            deletion_callback.await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
         assert!(credentials
             .values_for_test()
             .iter()
@@ -1374,6 +1721,256 @@ mod tests {
             |row| row.get::<_, i64>(0),
         );
         assert_eq!(remaining, Ok(Some(0)));
+
+        let discovering = client.post(format!("{gateway}/api/servers"))
+            .header("x-moor-token", "test-token")
+            .json(&json!({ "name": "discovering", "connectionType": "http", "url": format!("http://{upstream_addr}/mcp") }))
+            .send().await.unwrap().json::<Value>().await.unwrap();
+        let discovering_id = discovering["id"].as_str().unwrap();
+        let registered = client
+            .put(format!(
+                "{gateway}/api/servers/{discovering_id}/authorization/client"
+            ))
+            .header("x-moor-token", "test-token")
+            .json(
+                &json!({ "clientId": "discovering-client", "clientSecret": "discovering-secret" }),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(registered.status(), StatusCode::OK);
+        hold_discovery.store(true, std::sync::atomic::Ordering::SeqCst);
+        let discovery_client = client.clone();
+        let discovery_endpoint =
+            format!("{gateway}/api/servers/{discovering_id}/authorization/start");
+        let discovery = tokio::spawn(async move {
+            discovery_client
+                .post(discovery_endpoint)
+                .header("x-moor-token", "test-token")
+                .send()
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(2), discovery_waiting.notified())
+            .await
+            .unwrap();
+        let deleted = client
+            .delete(format!("{gateway}/api/servers/{discovering_id}"))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+        discovery_continue.notify_one();
+        assert!(!discovery.await.unwrap().status().is_success());
+        assert!(credentials
+            .values_for_test()
+            .iter()
+            .all(|(reference, _)| !reference.starts_with(&format!("server:{discovering_id}:"))));
+        let discovering_dynamic = client.post(format!("{gateway}/api/servers"))
+            .header("x-moor-token", "test-token")
+            .json(&json!({ "name": "discovering-dynamic", "connectionType": "http", "url": format!("http://{upstream_addr}/mcp") }))
+            .send().await.unwrap().json::<Value>().await.unwrap();
+        let discovering_dynamic_id = discovering_dynamic["id"].as_str().unwrap();
+        let discovery_client = client.clone();
+        let discovery_endpoint =
+            format!("{gateway}/api/servers/{discovering_dynamic_id}/authorization/start");
+        let discovery = tokio::spawn(async move {
+            discovery_client
+                .post(discovery_endpoint)
+                .header("x-moor-token", "test-token")
+                .send()
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(2), discovery_waiting.notified())
+            .await
+            .unwrap();
+        let pending = client
+            .get(format!(
+                "{gateway}/api/servers/{discovering_dynamic_id}/authorization"
+            ))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(pending["state"], "authorizing");
+        assert_eq!(pending["canRevoke"], true);
+        let cancelled = client
+            .delete(format!(
+                "{gateway}/api/servers/{discovering_dynamic_id}/authorization"
+            ))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        discovery_continue.notify_one();
+        assert!(!discovery.await.unwrap().status().is_success());
+        hold_discovery.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let query_server = client.post(format!("{gateway}/api/servers"))
+            .header("x-moor-token", "test-token")
+            .json(&json!({ "name": "query-resource", "connectionType": "http", "url": format!("http://{upstream_addr}/mcp?tenant=one") }))
+            .send().await.unwrap().json::<Value>().await.unwrap();
+        let query_id = query_server["id"].as_str().unwrap();
+        let registered = client
+            .put(format!(
+                "{gateway}/api/servers/{query_id}/authorization/client"
+            ))
+            .header("x-moor-token", "test-token")
+            .json(&json!({ "clientId": "query-client" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(registered.status(), StatusCode::OK);
+        let query_start = client
+            .post(format!(
+                "{gateway}/api/servers/{query_id}/authorization/start"
+            ))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let query_url =
+            reqwest::Url::parse(query_start["authorizationUrl"].as_str().unwrap()).unwrap();
+        let query_params: HashMap<String, String> = query_url.query_pairs().into_owned().collect();
+        let mut query_callback = reqwest::Url::parse(&query_params["redirect_uri"]).unwrap();
+        query_callback
+            .query_pairs_mut()
+            .append_pair("code", "query-code")
+            .append_pair("state", &query_params["state"])
+            .append_pair("iss", &issuer);
+        assert_eq!(
+            client.get(query_callback).send().await.unwrap().status(),
+            StatusCode::OK
+        );
+        let query_started = client
+            .post(format!("{gateway}/api/servers/{query_id}/start"))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(query_started.status(), StatusCode::OK);
+        let changed_query = client
+            .put(format!("{gateway}/api/servers/{query_id}"))
+            .header("x-moor-token", "test-token")
+            .json(&json!({ "url": format!("http://{upstream_addr}/mcp?tenant=two") }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(changed_query.status(), StatusCode::OK);
+        let invalidated_query = client
+            .get(format!("{gateway}/api/servers/{query_id}/authorization"))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(invalidated_query["state"], "required");
+        assert!(credentials
+            .values_for_test()
+            .iter()
+            .all(|(reference, _)| !reference.starts_with(&format!("server:{query_id}:"))));
+        let query_reauth = client
+            .post(format!(
+                "{gateway}/api/servers/{query_id}/authorization/start"
+            ))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let query_reauth_url =
+            reqwest::Url::parse(query_reauth["authorizationUrl"].as_str().unwrap()).unwrap();
+        let query_reauth_params: HashMap<String, String> =
+            query_reauth_url.query_pairs().into_owned().collect();
+        let mut query_reauth_callback =
+            reqwest::Url::parse(&query_reauth_params["redirect_uri"]).unwrap();
+        query_reauth_callback
+            .query_pairs_mut()
+            .append_pair("code", "query-reauth")
+            .append_pair("state", &query_reauth_params["state"])
+            .append_pair("iss", &issuer);
+        assert_eq!(
+            client
+                .get(query_reauth_callback)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let stale_session = client
+            .post(format!("{gateway}/api/servers/{query_id}/tools/refresh"))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap();
+        assert!(!stale_session.status().is_success());
+
+        let write_failure = client.post(format!("{gateway}/api/servers"))
+            .header("x-moor-token", "test-token")
+            .json(&json!({ "name": "write-failure", "connectionType": "http", "url": format!("http://{upstream_addr}/mcp") }))
+            .send().await.unwrap().json::<Value>().await.unwrap();
+        let write_id = write_failure["id"].as_str().unwrap();
+        let registered = client
+            .put(format!(
+                "{gateway}/api/servers/{write_id}/authorization/client"
+            ))
+            .header("x-moor-token", "test-token")
+            .json(&json!({ "clientId": "write-client" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(registered.status(), StatusCode::OK);
+        credentials.fail_set_for_test(Some(format!("server:{write_id}:oauth:refresh")));
+        let write_start = client
+            .post(format!(
+                "{gateway}/api/servers/{write_id}/authorization/start"
+            ))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let write_url =
+            reqwest::Url::parse(write_start["authorizationUrl"].as_str().unwrap()).unwrap();
+        let write_query: HashMap<String, String> = write_url.query_pairs().into_owned().collect();
+        let mut write_callback = reqwest::Url::parse(&write_query["redirect_uri"]).unwrap();
+        write_callback
+            .query_pairs_mut()
+            .append_pair("code", "write-failure")
+            .append_pair("state", &write_query["state"])
+            .append_pair("iss", &issuer);
+        assert_eq!(
+            client.get(write_callback).send().await.unwrap().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        credentials.fail_set_for_test(None);
+        let write_deleted = client
+            .delete(format!("{gateway}/api/servers/{write_id}"))
+            .header("x-moor-token", "test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(write_deleted.status(), StatusCode::OK);
+        assert!(credentials
+            .values_for_test()
+            .iter()
+            .all(|(reference, _)| !reference.starts_with(&format!("server:{write_id}:"))));
 
         new_server.abort();
         restarted_gateway.abort();

@@ -468,7 +468,6 @@ mod tests {
             duration_ms,
             None,
             "direct",
-
             None,
         )
         .expect("insert log");
@@ -595,7 +594,6 @@ mod tests {
             5,
             None,
             "direct",
-
             None,
         )
         .expect("insert");
@@ -611,7 +609,6 @@ mod tests {
             9,
             None,
             "direct",
-
             None,
         )
         .expect("insert");
@@ -644,7 +641,6 @@ mod tests {
                 *duration,
                 None,
                 "direct",
-
                 None,
             )
             .expect("insert");
@@ -692,8 +688,7 @@ mod tests {
             ("end", "2026-01-01T00:00:02Z"),
         ] {
             repo.insert(
-                id, timestamp, None, None, "search", None, None, None, 10, None, "direct",
- None,
+                id, timestamp, None, None, "search", None, None, None, 10, None, "direct", None,
             )
             .expect("insert");
         }
@@ -715,7 +710,7 @@ mod tests {
         assert!(repo
             .insert(
                 "invalid", "garbage", None, None, "search", None, None, None, 10, None, "direct",
- None,
+                None,
             )
             .is_err());
         assert_eq!(repo.purge_before("2026-01-01T08:00:01+08:00").unwrap(), 1);
@@ -738,7 +733,6 @@ mod tests {
             1,
             None,
             "direct",
-
             None,
         )
         .expect("insert");
@@ -754,7 +748,6 @@ mod tests {
             2,
             None,
             "direct",
-
             None,
         )
         .expect("insert");

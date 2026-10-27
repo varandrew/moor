@@ -46,6 +46,17 @@ impl AppError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", msg)
     }
 
+    pub fn credential_cleanup(msg: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "OAUTH_CREDENTIAL_CLEANUP_FAILED",
+            msg,
+        )
+        .with_client_message(
+            "Failed to remove OAuth credentials. Check your system credential store and try again.",
+        )
+    }
+
     pub fn internal_public(msg: impl Into<String>, client_msg: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", msg)
             .with_client_message(client_msg)

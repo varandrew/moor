@@ -1,6 +1,5 @@
 use crate::sidecar::db::server_repo::{Server, ServerInsertInput, ServerRepository};
 use crate::sidecar::db::Database;
-use crate::sidecar::services::server_authorization::canonical_resource;
 use crate::sidecar::services::server_manager::ServerManager;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -117,6 +116,7 @@ pub enum ServerServiceError {
     NotFound(String),
     Validation(String),
     InvalidOrder(String),
+    CredentialCleanup(String),
     Internal(String),
 }
 
@@ -127,6 +127,7 @@ impl From<ServerServiceError> for crate::sidecar::http::app_error::AppError {
             ServerServiceError::NotFound(m) => Self::not_found(m),
             ServerServiceError::Validation(m) => Self::validation(m),
             ServerServiceError::InvalidOrder(m) => Self::order_invalid(m),
+            ServerServiceError::CredentialCleanup(m) => Self::credential_cleanup(m),
             ServerServiceError::Internal(m) => Self::internal(m),
         }
     }
@@ -213,6 +214,14 @@ impl ServerService {
         id: &str,
         body: &UpdateServerInput,
     ) -> Result<Server, ServerServiceError> {
+        let authorization = server_manager.authorization();
+        let lifecycle = authorization.lifecycle(id).await;
+        let mut guard = lifecycle.lock().await;
+        if guard.deleting {
+            return Err(ServerServiceError::Internal(
+                "Server is being deleted".into(),
+            ));
+        }
         let (new_name, new_auto_start) = {
             let repo = ServerRepository::new(db);
             let existing = repo
@@ -221,23 +230,15 @@ impl ServerService {
                 .ok_or_else(|| ServerServiceError::NotFound("Server not found".into()))?;
             body.validate_for(&existing.connection_type)
                 .map_err(ServerServiceError::Validation)?;
-            let resource_changed = body.url.as_ref().is_some_and(|url| {
-                let next = reqwest::Url::parse(url)
-                    .ok()
-                    .and_then(|url| canonical_resource(&url).ok());
-                let previous = existing.url.as_deref().and_then(|url| {
-                    reqwest::Url::parse(url)
-                        .ok()
-                        .and_then(|url| canonical_resource(&url).ok())
-                });
-                next != previous
-            });
+            let resource_changed = body
+                .url
+                .as_deref()
+                .is_some_and(|url| existing.url.as_deref() != Some(url));
             if resource_changed {
-                server_manager
-                    .authorization()
-                    .cleanup(id)
+                authorization
+                    .cleanup_locked(id, &mut guard)
                     .await
-                    .map_err(ServerServiceError::Internal)?;
+                    .map_err(ServerServiceError::CredentialCleanup)?;
             }
 
             let mut set_clauses = Vec::new();
@@ -308,6 +309,7 @@ impl ServerService {
 
             (new_name, new_auto_start)
         };
+        drop(guard);
 
         server_manager
             .update_server_memory(id, new_name.as_deref(), new_auto_start)
@@ -330,12 +332,23 @@ impl ServerService {
             .find_by_id(id)
             .map_err(ServerServiceError::Internal)?
             .ok_or_else(|| ServerServiceError::NotFound("Server not found".into()))?;
-        server_manager
-            .authorization()
-            .cleanup(id)
-            .await
-            .map_err(ServerServiceError::Internal)?;
+        let authorization = server_manager.authorization();
+        let lifecycle = authorization.lifecycle(id).await;
+        {
+            let mut guard = lifecycle.lock().await;
+            if guard.deleting {
+                return Err(ServerServiceError::Internal(
+                    "Server is being deleted".into(),
+                ));
+            }
+            guard.deleting = true;
+            if let Err(error) = authorization.cleanup_locked(id, &mut guard).await {
+                guard.deleting = false;
+                return Err(ServerServiceError::CredentialCleanup(error));
+            }
+        }
         if !server_manager.remove_server(id).await {
+            lifecycle.lock().await.deleting = false;
             return Err(ServerServiceError::Internal(
                 "Failed to delete server".into(),
             ));

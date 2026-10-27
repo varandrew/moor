@@ -158,7 +158,10 @@ impl StdioHttpConnector {
             server_name: config.name.clone(),
             url: url.to_string(),
             headers,
-            credential_provider: self.authorization.credential_provider(&config.id)?,
+            credential_provider: self
+                .authorization
+                .credential_provider(&config.id, url)
+                .await?,
             request_timeout_ms: timeouts.start_ms,
         })
         .await?;

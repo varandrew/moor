@@ -19,6 +19,7 @@ export const API_ERROR_SUMMARIES: Record<string, string> = {
   SERVER_BUSY: "The server is busy. Try again after the current request.",
   SERVER_CHANGED: "The server changed during the check. Try again.",
   TOOL_DISCOVERY_FAILED: "Unable to refresh the server tools.",
+  OAUTH_CREDENTIAL_CLEANUP_FAILED: "Unable to remove OAuth credentials.",
   UPDATE_CHECK_FAILED: "Unable to check for updates.",
   ORDER_INVALID: "Unable to save the server order.",
   PAYLOAD_TOO_LARGE: "The configuration is too large.",

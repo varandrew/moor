@@ -70,6 +70,17 @@ describe("server health events", () => {
 });
 
 describe("server authorization events", () => {
+  it("validates whether the authorization can be revoked", () => {
+    const snapshot = { serverId: "demo", state: "required", scopes: [], canRevoke: true };
+    expect(parseMoorSSEEvent("server:authorization", snapshot)).toEqual({
+      type: "server:authorization",
+      data: snapshot,
+    });
+    expect(
+      parseMoorSSEEvent("server:authorization", { ...snapshot, canRevoke: "yes" }, () => undefined),
+    ).toBeNull();
+  });
+
   it("accepts authorization snapshots and rejects unknown states", () => {
     const snapshot = {
       serverId: "demo",
