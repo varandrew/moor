@@ -1,7 +1,8 @@
 use super::request_error::RequestError;
 use crate::sidecar::db::tool_discovery_repo::ToolInsert;
 use crate::sidecar::mcp::transport::http_client::{
-    HttpClientTransport, HttpCredentialProvider, HTTP_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION,
+    is_supported_protocol_version, HttpClientTransport, HttpCredentialProvider,
+    LEGACY_PROTOCOL_VERSION,
 };
 use crate::sidecar::mcp::transport::stdio_client::StdioClientTransport;
 use crate::sidecar::services::server_log::DiagnosticAttempt;
@@ -191,8 +192,7 @@ impl McpClient {
                                 .get("protocolVersion")
                                 .and_then(Value::as_str)
                                 .ok_or("MCP initialize response is missing protocolVersion")?;
-                            if ![HTTP_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION].contains(&version)
-                            {
+                            if !is_supported_protocol_version(version) {
                                 return Err(format!(
                                     "Unsupported negotiated MCP protocol version: {version}"
                                 )

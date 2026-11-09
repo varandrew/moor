@@ -10,8 +10,24 @@ use super::request_error::{parse_response, RequestError};
 static ENV_PATTERN: OnceLock<regex_lite::Regex> = OnceLock::new();
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 const REMOTE_MCP_ERROR_PREFIX: &str = "Remote MCP server error: ";
-pub const HTTP_PROTOCOL_VERSION: &str = "2025-03-26";
+/// Preferred protocol version advertised during HTTP initialize.
+/// Keep this aligned with the latest MCP revision we accept.
+pub const HTTP_PROTOCOL_VERSION: &str = "2025-11-25";
 pub const LEGACY_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Protocol versions Moor can continue a session with after negotiation.
+/// Newer servers may reply with a later revision than the one we requested;
+/// older servers may reply with an earlier one. Accept the full set we know.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    LEGACY_PROTOCOL_VERSION,
+];
+
+pub fn is_supported_protocol_version(version: &str) -> bool {
+    SUPPORTED_PROTOCOL_VERSIONS.contains(&version)
+}
 
 pub trait HttpCredentialProvider: Send + Sync {
     fn headers(
@@ -1167,6 +1183,131 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "resolve-library-id");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn handshake_accepts_newer_negotiated_protocol_versions() {
+        for version in ["2025-11-25", "2025-06-18", "2025-03-26"] {
+            let negotiated = version.to_string();
+            let app = Router::new().route(
+                "/mcp",
+                post(move |Json(body): Json<Value>| {
+                    let negotiated = negotiated.clone();
+                    async move {
+                        let method = body["method"].as_str().unwrap_or_default();
+                        let result = match method {
+                            "initialize" => serde_json::json!({
+                                "protocolVersion": negotiated,
+                                "capabilities": { "tools": {} },
+                                "serverInfo": { "name": "version-test", "version": "1.0.0" }
+                            }),
+                            "tools/list" => serde_json::json!({ "tools": [] }),
+                            _ => serde_json::json!({}),
+                        };
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": body["id"],
+                                "result": result
+                            })),
+                        )
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("failed to bind test server");
+            let addr = listener.local_addr().expect("failed to read local addr");
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("test server failed");
+            });
+
+            let client = McpClient::connect_http(HttpConnectConfig {
+                server_name: format!("version-{version}"),
+                url: format!("http://{addr}/mcp"),
+                headers: HashMap::new(),
+                credential_provider: None,
+                request_timeout_ms: 5_000,
+            })
+            .await
+            .unwrap_or_else(|error| {
+                panic!("handshake should accept negotiated version {version}: {error}")
+            });
+            client
+                .list_tools()
+                .await
+                .unwrap_or_else(|error| panic!("tools/list should succeed for {version}: {error}"));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_unknown_negotiated_protocol_version() {
+        let app = Router::new().route(
+            "/mcp",
+            post(|Json(body): Json<Value>| async move {
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"],
+                    "result": {
+                        "protocolVersion": "2099-01-01",
+                        "capabilities": { "tools": {} },
+                        "serverInfo": { "name": "future", "version": "1.0.0" }
+                    }
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test server");
+        let addr = listener.local_addr().expect("failed to read local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server failed");
+        });
+
+        let error = match McpClient::connect_http(HttpConnectConfig {
+            server_name: "future".to_string(),
+            url: format!("http://{addr}/mcp"),
+            headers: HashMap::new(),
+            credential_provider: None,
+            request_timeout_ms: 5_000,
+        })
+        .await
+        {
+            Ok(_) => panic!("unknown negotiated protocol version should fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .message
+                .contains("Unsupported negotiated MCP protocol version: 2099-01-01"),
+            "unexpected error: {}",
+            error.message
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn supported_protocol_versions_include_current_revisions() {
+        for version in [
+            "2025-11-25",
+            "2025-06-18",
+            "2025-03-26",
+            LEGACY_PROTOCOL_VERSION,
+        ] {
+            assert!(
+                is_supported_protocol_version(version),
+                "{version} should be supported"
+            );
+        }
+        assert!(!is_supported_protocol_version("2099-01-01"));
+        assert_eq!(HTTP_PROTOCOL_VERSION, "2025-11-25");
     }
 
     #[tokio::test]
