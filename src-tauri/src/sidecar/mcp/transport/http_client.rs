@@ -10,24 +10,8 @@ use super::request_error::{parse_response, RequestError};
 static ENV_PATTERN: OnceLock<regex_lite::Regex> = OnceLock::new();
 const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 const REMOTE_MCP_ERROR_PREFIX: &str = "Remote MCP server error: ";
-/// Preferred protocol version advertised during HTTP initialize.
-/// Keep this aligned with the latest MCP revision we accept.
-pub const HTTP_PROTOCOL_VERSION: &str = "2025-11-25";
+pub const HTTP_PROTOCOL_VERSION: &str = "2025-03-26";
 pub const LEGACY_PROTOCOL_VERSION: &str = "2024-11-05";
-
-/// Protocol versions Moor can continue a session with after negotiation.
-/// Newer servers may reply with a later revision than the one we requested;
-/// older servers may reply with an earlier one. Accept the full set we know.
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
-    "2025-11-25",
-    "2025-06-18",
-    "2025-03-26",
-    LEGACY_PROTOCOL_VERSION,
-];
-
-pub fn is_supported_protocol_version(version: &str) -> bool {
-    SUPPORTED_PROTOCOL_VERSIONS.contains(&version)
-}
 
 pub trait HttpCredentialProvider: Send + Sync {
     fn headers(
@@ -1187,31 +1171,61 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_accepts_newer_negotiated_protocol_versions() {
-        for version in ["2025-11-25", "2025-06-18", "2025-03-26"] {
+        for (version, use_sse) in ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
+            .into_iter()
+            .flat_map(|version| [false, true].map(|use_sse| (version, use_sse)))
+        {
             let negotiated = version.to_string();
+            let methods = Arc::new(Mutex::new(Vec::new()));
+            let received = methods.clone();
             let app = Router::new().route(
                 "/mcp",
-                post(move |Json(body): Json<Value>| {
+                post(move |headers: HeaderMap, Json(body): Json<Value>| {
                     let negotiated = negotiated.clone();
+                    let received = received.clone();
                     async move {
                         let method = body["method"].as_str().unwrap_or_default();
+                        received.lock().await.push(method.to_string());
+                        if method == "initialize" {
+                            assert_eq!(body["params"]["protocolVersion"], "2025-03-26");
+                            assert_eq!(headers["mcp-protocol-version"], "2025-03-26");
+                        } else {
+                            assert_eq!(headers["mcp-protocol-version"], negotiated);
+                            assert_eq!(headers["mcp-session-id"], "version-session");
+                        }
                         let result = match method {
                             "initialize" => serde_json::json!({
                                 "protocolVersion": negotiated,
                                 "capabilities": { "tools": {} },
                                 "serverInfo": { "name": "version-test", "version": "1.0.0" }
                             }),
-                            "tools/list" => serde_json::json!({ "tools": [] }),
-                            _ => serde_json::json!({}),
+                            "notifications/initialized" => {
+                                return StatusCode::ACCEPTED.into_response();
+                            }
+                            "tools/list" => serde_json::json!({
+                                "tools": [{ "name": "echo", "inputSchema": { "type": "object" } }]
+                            }),
+                            "tools/call" => {
+                                assert_eq!(body["params"]["name"], "echo");
+                                assert_eq!(body["params"]["arguments"], serde_json::json!({}));
+                                serde_json::json!({ "content": [{ "type": "text", "text": "ok" }] })
+                            }
+                            _ => panic!("unexpected request: {method}"),
                         };
-                        (
-                            StatusCode::OK,
-                            Json(serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": body["id"],
-                                "result": result
-                            })),
-                        )
+                        let response = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": body["id"],
+                            "result": result
+                        });
+                        let response = if use_sse {
+                            Sse::new(futures::stream::once(async move {
+                                Ok::<_, Infallible>(Event::default().data(response.to_string()))
+                            }))
+                            .into_response()
+                        } else {
+                            Json(response).into_response()
+                        };
+                        ([("mcp-session-id", "version-session")], response).into_response()
                     }
                 }),
             );
@@ -1236,78 +1250,160 @@ mod tests {
             .unwrap_or_else(|error| {
                 panic!("handshake should accept negotiated version {version}: {error}")
             });
-            client
+            let tools = client
                 .list_tools()
                 .await
                 .unwrap_or_else(|error| panic!("tools/list should succeed for {version}: {error}"));
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].name, "echo");
+            let result = client
+                .call_tool("echo", serde_json::json!({}))
+                .await
+                .expect("tools/call should use the negotiated session");
+            assert_eq!(result["content"][0]["text"], "ok");
+            assert_eq!(
+                *methods.lock().await,
+                [
+                    "initialize",
+                    "notifications/initialized",
+                    "tools/list",
+                    "tools/call"
+                ]
+            );
             server.abort();
         }
     }
 
     #[tokio::test]
     async fn handshake_rejects_unknown_negotiated_protocol_version() {
-        let app = Router::new().route(
-            "/mcp",
-            post(|Json(body): Json<Value>| async move {
-                Json(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": body["id"],
-                    "result": {
-                        "protocolVersion": "2099-01-01",
-                        "capabilities": { "tools": {} },
-                        "serverInfo": { "name": "future", "version": "1.0.0" }
+        for result in [
+            serde_json::json!({ "protocolVersion": "2099-01-01" }),
+            serde_json::json!({ "protocolVersion": 20251125 }),
+            serde_json::json!({}),
+        ] {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let received = requests.clone();
+            let app = Router::new().route(
+                "/mcp",
+                post(move |Json(body): Json<Value>| {
+                    let result = result.clone();
+                    let received = received.clone();
+                    async move {
+                        received.lock().await.push(body["method"].clone());
+                        Json(serde_json::json!({
+                            "jsonrpc": "2.0", "id": body["id"], "result": result
+                        }))
                     }
-                }))
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("failed to bind test server");
-        let addr = listener.local_addr().expect("failed to read local addr");
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app)
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
-                .expect("test server failed");
-        });
+                .expect("failed to bind test server");
+            let addr = listener.local_addr().expect("failed to read local addr");
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("test server failed");
+            });
 
-        let error = match McpClient::connect_http(HttpConnectConfig {
-            server_name: "future".to_string(),
-            url: format!("http://{addr}/mcp"),
-            headers: HashMap::new(),
-            credential_provider: None,
-            request_timeout_ms: 5_000,
-        })
-        .await
-        {
-            Ok(_) => panic!("unknown negotiated protocol version should fail"),
-            Err(error) => error,
-        };
+            let error = match McpClient::connect_http(HttpConnectConfig {
+                server_name: "future".to_string(),
+                url: format!("http://{addr}/mcp"),
+                headers: HashMap::new(),
+                credential_provider: None,
+                request_timeout_ms: 5_000,
+            })
+            .await
+            {
+                Ok(_) => panic!("unknown negotiated protocol version should fail"),
+                Err(error) => error,
+            };
 
-        assert!(
-            error
-                .message
-                .contains("Unsupported negotiated MCP protocol version: 2099-01-01"),
-            "unexpected error: {}",
-            error.message
-        );
-        server.abort();
+            assert!(
+                error.message.contains("protocolVersion")
+                    || error
+                        .message
+                        .contains("Unsupported negotiated MCP protocol version")
+            );
+            assert_eq!(*requests.lock().await, [serde_json::json!("initialize")]);
+            server.abort();
+        }
     }
 
-    #[test]
-    fn supported_protocol_versions_include_current_revisions() {
-        for version in [
-            "2025-11-25",
-            "2025-06-18",
-            "2025-03-26",
-            LEGACY_PROTOCOL_VERSION,
-        ] {
-            assert!(
-                is_supported_protocol_version(version),
-                "{version} should be supported"
-            );
+    #[tokio::test]
+    async fn handshake_retries_only_explicit_protocol_version_errors() {
+        for (version_error, fallback_fails) in [(true, false), (true, true), (false, false)] {
+            let versions = Arc::new(Mutex::new(Vec::new()));
+            let received = versions.clone();
+            let app = Router::new().route("/mcp", post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let received = received.clone();
+                async move {
+                    assert_eq!(headers["x-client-token"], "test-token");
+                    let method = body["method"].as_str().unwrap();
+                    if method == "notifications/initialized" {
+                        assert_eq!(headers["mcp-protocol-version"], "2024-11-05");
+                        return StatusCode::ACCEPTED.into_response();
+                    }
+                    assert_eq!(method, "initialize");
+                    assert!(headers.get("mcp-session-id").is_none());
+                    let version = body["params"]["protocolVersion"].as_str().unwrap();
+                    assert_eq!(headers["mcp-protocol-version"], version);
+                    let mut versions = received.lock().await;
+                    versions.push(version.to_string());
+                    let result = if versions.len() == 1 {
+                        serde_json::json!({ "error": {
+                            "code": -32602,
+                            "message": if version_error { "Unsupported protocol version" } else { "Invalid parameters" }
+                        } })
+                    } else if fallback_fails {
+                        serde_json::json!({ "error": {
+                            "code": -32001, "message": "Legacy initialization failed", "data": { "attempt": "legacy" }
+                        } })
+                    } else {
+                        serde_json::json!({ "result": {
+                            "protocolVersion": "2024-11-05", "capabilities": {},
+                            "serverInfo": { "name": "legacy", "version": "1" }
+                        } })
+                    };
+                    let mut response = result;
+                    response["jsonrpc"] = "2.0".into();
+                    response["id"] = body["id"].clone();
+                    ([("mcp-session-id", "attempt-session")], Json(response)).into_response()
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let result = McpClient::connect_http(HttpConnectConfig {
+                server_name: "fallback-test".to_string(),
+                url: format!("http://{addr}/mcp"),
+                headers: HashMap::from([("x-client-token".to_string(), "test-token".to_string())]),
+                credential_provider: None,
+                request_timeout_ms: 5_000,
+            })
+            .await;
+            if version_error && !fallback_fails {
+                assert!(result.is_ok(), "legacy fallback should succeed");
+            } else {
+                let error = result.err().expect("initialization should fail");
+                assert_eq!(
+                    error.code,
+                    Some(if fallback_fails { -32001 } else { -32602 })
+                );
+                if fallback_fails {
+                    assert!(error.message.contains("Legacy initialization failed"));
+                    assert!(error.message.contains("initial version attempt failed"));
+                    assert_eq!(error.data, Some(serde_json::json!({ "attempt": "legacy" })));
+                }
+            }
+            let expected = if version_error {
+                vec!["2025-03-26", "2024-11-05"]
+            } else {
+                vec!["2025-03-26"]
+            };
+            assert_eq!(*versions.lock().await, expected);
+            server.abort();
         }
-        assert!(!is_supported_protocol_version("2099-01-01"));
-        assert_eq!(HTTP_PROTOCOL_VERSION, "2025-11-25");
     }
 
     #[tokio::test]
