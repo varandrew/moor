@@ -214,6 +214,7 @@ for await (const line of readline.createInterface({ input: process.stdin })) {
                 std::fs::write(dir.join("npx.bat"), "@echo off\r\nnode %*\r\n").unwrap();
             }
             let config = StoredServerConfig {
+                id: "windows".into(),
                 name: "windows".into(),
                 connection_type: "stdio".into(),
                 command: Some(command.clone()),
