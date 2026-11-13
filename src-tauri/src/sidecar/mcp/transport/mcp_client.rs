@@ -191,7 +191,13 @@ impl McpClient {
                                 .get("protocolVersion")
                                 .and_then(Value::as_str)
                                 .ok_or("MCP initialize response is missing protocolVersion")?;
-                            if ![HTTP_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION].contains(&version)
+                            if ![
+                                HTTP_PROTOCOL_VERSION,
+                                LEGACY_PROTOCOL_VERSION,
+                                "2025-06-18",
+                                "2025-11-25",
+                            ]
+                            .contains(&version)
                             {
                                 return Err(format!(
                                     "Unsupported negotiated MCP protocol version: {version}"
